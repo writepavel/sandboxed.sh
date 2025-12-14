@@ -44,8 +44,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/task", post(create_task))
-        .route("/api/task/{id}", get(get_task))
-        .route("/api/task/{id}/stream", get(stream_task))
+        .route("/api/task/:id", get(get_task))
+        .route("/api/task/:id/stream", get(stream_task))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
