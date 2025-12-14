@@ -19,8 +19,12 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-use crate::agent::Agent;
+use crate::agents::{Agent, AgentContext, AgentRef};
+use crate::agents::orchestrator::RootAgent;
+use crate::budget::ModelPricing;
 use crate::config::Config;
+use crate::llm::OpenRouterClient;
+use crate::tools::ToolRegistry;
 
 use super::types::*;
 
@@ -28,17 +32,36 @@ use super::types::*;
 pub struct AppState {
     pub config: Config,
     pub tasks: RwLock<HashMap<Uuid, TaskState>>,
-    pub agent: Agent,
+    /// The hierarchical root agent
+    pub root_agent: AgentRef,
+    /// Shared context for agent execution
+    pub agent_context: AgentContext,
 }
 
 /// Start the HTTP server.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let agent = Agent::new(config.clone());
+    // Create the root agent (hierarchical)
+    let root_agent: AgentRef = Arc::new(RootAgent::new());
+    
+    // Create shared agent context
+    let llm = Arc::new(OpenRouterClient::new(config.api_key.clone()));
+    let tools = ToolRegistry::new();
+    let pricing = Arc::new(ModelPricing::new());
+    let workspace = config.workspace_path.clone();
+    
+    let agent_context = AgentContext::new(
+        config.clone(),
+        llm,
+        tools,
+        pricing,
+        workspace,
+    );
     
     let state = Arc::new(AppState {
         config: config.clone(),
         tasks: RwLock::new(HashMap::new()),
-        agent,
+        root_agent,
+        agent_context,
     });
 
     let app = Router::new()
@@ -112,8 +135,8 @@ async fn create_task(
 async fn run_agent_task(
     state: Arc<AppState>,
     task_id: Uuid,
-    task: String,
-    model: String,
+    task_description: String,
+    _model: String,
     workspace_path: std::path::PathBuf,
 ) {
     // Update status to running
@@ -124,23 +147,76 @@ async fn run_agent_task(
         }
     }
     
-    // Run the agent
-    let result = state.agent.run_task(&task, &model, &workspace_path).await;
+    // Create a Task object for the hierarchical agent
+    let budget = crate::budget::Budget::new(1000); // $10 default budget
+    let verification = crate::task::VerificationCriteria::None;
+    
+    let task_result = crate::task::Task::new(
+        task_description.clone(),
+        verification,
+        budget,
+    );
+
+    let mut task = match task_result {
+        Ok(t) => t,
+        Err(e) => {
+            let mut tasks = state.tasks.write().await;
+            if let Some(task_state) = tasks.get_mut(&task_id) {
+                task_state.status = TaskStatus::Failed;
+                task_state.result = Some(format!("Failed to create task: {}", e));
+            }
+            return;
+        }
+    };
+
+    // Create context with the specified workspace
+    let llm = Arc::new(OpenRouterClient::new(state.config.api_key.clone()));
+    let tools = ToolRegistry::new();
+    let pricing = Arc::new(ModelPricing::new());
+    
+    let ctx = AgentContext::new(
+        state.config.clone(),
+        llm,
+        tools,
+        pricing,
+        workspace_path,
+    );
+
+    // Run the hierarchical agent
+    let result = state.root_agent.execute(&mut task, &ctx).await;
     
     // Update task with result
     {
         let mut tasks = state.tasks.write().await;
         if let Some(task_state) = tasks.get_mut(&task_id) {
-            match result {
-                Ok((response, log)) => {
-                    task_state.status = TaskStatus::Completed;
-                    task_state.result = Some(response);
-                    task_state.log = log;
+            // Add log entries from result data
+            if let Some(data) = &result.data {
+                if let Some(tools_used) = data.get("tools_used") {
+                    if let Some(arr) = tools_used.as_array() {
+                        for tool in arr {
+                            task_state.log.push(TaskLogEntry {
+                                timestamp: "0".to_string(),
+                                entry_type: LogEntryType::ToolCall,
+                                content: tool.as_str().unwrap_or("").to_string(),
+                            });
+                        }
+                    }
                 }
-                Err(e) => {
-                    task_state.status = TaskStatus::Failed;
-                    task_state.result = Some(format!("Error: {}", e));
-                }
+            }
+            
+            // Add final response log
+            task_state.log.push(TaskLogEntry {
+                timestamp: "0".to_string(),
+                entry_type: LogEntryType::Response,
+                content: result.output.clone(),
+            });
+
+            if result.success {
+                task_state.status = TaskStatus::Completed;
+                task_state.result = Some(result.output);
+            } else {
+                task_state.status = TaskStatus::Failed;
+                task_state.result = Some(format!("Error: {}", result.output));
             }
         }
     }
@@ -217,4 +293,3 @@ async fn stream_task(
     
     Ok(Sse::new(stream))
 }
-
