@@ -163,7 +163,7 @@ GET  /api/memory/search     - Semantic search across memory
 
 ```
 OPENROUTER_API_KEY       - Required. Your OpenRouter API key
-DEFAULT_MODEL            - Optional. Default: openai/gpt-5-mini
+DEFAULT_MODEL            - Optional. Default: openai/gpt-4.1-mini
 WORKSPACE_PATH           - Optional. Default: current directory
 HOST                     - Optional. Default: 127.0.0.1
 PORT                     - Optional. Default: 3000

@@ -98,7 +98,7 @@ impl Config {
             .map_err(|_| ConfigError::MissingEnvVar("OPENROUTER_API_KEY".to_string()))?;
         
         let default_model = std::env::var("DEFAULT_MODEL")
-            .unwrap_or_else(|_| "openai/gpt-5-mini".to_string());
+            .unwrap_or_else(|_| "openai/gpt-4.1-mini".to_string());
         
         let workspace_path = std::env::var("WORKSPACE_PATH")
             .map(PathBuf::from)

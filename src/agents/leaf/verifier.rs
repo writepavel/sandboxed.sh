@@ -170,7 +170,7 @@ Respond ONLY with the JSON object."#,
             },
         ];
 
-        let model = "openai/gpt-4.1-mini";
+        let model = "openai/gpt-4o-mini";
         
         match ctx.llm.chat_completion(model, &messages, None).await {
             Ok(response) => {
