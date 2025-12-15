@@ -133,7 +133,7 @@ Respond ONLY with the JSON object."#,
         ];
 
         let response = ctx.llm
-            .chat_completion("openai/gpt-4.1-mini", &messages, None)
+            .chat_completion("anthropic/claude-sonnet-4.5", &messages, None)
             .await
             .map_err(|e| AgentResult::failure(format!("LLM error: {}", e), 1))?;
 

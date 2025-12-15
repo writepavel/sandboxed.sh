@@ -162,13 +162,21 @@ impl ModelPricing {
     fn default_pricing(&self, model_id: &str) -> Option<PricingInfo> {
         // Hardcoded defaults for when API is unavailable
         // All these models support tool calling
+        // Pricing in $ per 1M tokens
         let defaults = [
-            ("openai/gpt-4.1-mini", 0.40, 1.60, 1_000_000),
-            ("openai/gpt-4.1", 2.50, 10.00, 1_000_000),
+            // Claude 4.x family (newest, recommended)
+            ("anthropic/claude-sonnet-4.5", 3.00, 15.00, 1_000_000),
+            ("anthropic/claude-sonnet-4", 3.00, 15.00, 1_000_000),
+            ("anthropic/claude-haiku-4.5", 0.80, 4.00, 200_000),
+            // Claude 3.x family
+            ("anthropic/claude-3.7-sonnet", 3.00, 15.00, 200_000),
+            ("anthropic/claude-3.5-sonnet", 6.00, 30.00, 200_000),
+            ("anthropic/claude-3.5-haiku", 0.80, 4.00, 200_000),
+            ("anthropic/claude-3-haiku", 0.25, 1.25, 200_000),
+            // OpenAI
             ("openai/gpt-4o", 2.50, 10.00, 128_000),
             ("openai/gpt-4o-mini", 0.15, 0.60, 128_000),
-            ("anthropic/claude-3.5-sonnet", 3.00, 15.00, 200_000),
-            ("anthropic/claude-3-haiku", 0.25, 1.25, 200_000),
+            // Google
             ("google/gemini-2.0-flash-001", 0.10, 0.40, 1_000_000),
         ];
 

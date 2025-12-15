@@ -221,7 +221,7 @@ impl Agent for ComplexityEstimator {
         ];
 
         // Use a fast, cheap model for complexity estimation
-        let model = "anthropic/claude-3.5-sonnet";
+        let model = "anthropic/claude-sonnet-4.5";
         
         let pricing = ctx.pricing.get_pricing(model).await;
         let options = ChatOptions {

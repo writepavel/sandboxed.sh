@@ -287,11 +287,11 @@ impl Agent for ModelSelector {
                 0,
             )
             .with_data(json!({
-                "model_id": "openai/gpt-4.1-mini",
+                "model_id": "anthropic/claude-sonnet-4.5",
                 "expected_cost_cents": 10,
                 "confidence": 0.5,
                 "reasoning": "Fallback to default model",
-                "fallbacks": ["openai/gpt-4o-mini", "anthropic/claude-3-haiku"],
+                "fallbacks": ["anthropic/claude-sonnet-4", "anthropic/claude-3.5-haiku"],
             }));
         }
 

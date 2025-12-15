@@ -98,7 +98,7 @@ impl Config {
             .map_err(|_| ConfigError::MissingEnvVar("OPENROUTER_API_KEY".to_string()))?;
         
         let default_model = std::env::var("DEFAULT_MODEL")
-            .unwrap_or_else(|_| "anthropic/claude-3.5-sonnet".to_string());
+            .unwrap_or_else(|_| "anthropic/claude-sonnet-4.5".to_string());
         
         let workspace_path = std::env::var("WORKSPACE_PATH")
             .map(PathBuf::from)

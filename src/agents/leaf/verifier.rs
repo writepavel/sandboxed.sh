@@ -170,7 +170,7 @@ Respond ONLY with the JSON object."#,
             },
         ];
 
-        let model = "anthropic/claude-3.5-sonnet";
+        let model = "anthropic/claude-sonnet-4.5";
         
         match ctx.llm.chat_completion(model, &messages, None).await {
             Ok(response) => {
