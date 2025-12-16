@@ -905,22 +905,25 @@ function saveTabs(tabs: Tab[], activeTabId: string) {
   }
 }
 
+// Compute initial tabs state once to avoid multiple loadSavedTabs() calls
+// and fix the dependency issue where activeTabId initializer referenced tabs
+function getInitialTabsState(): { tabs: Tab[]; activeTabId: string } {
+  const saved = loadSavedTabs();
+  if (saved) {
+    return { tabs: saved.tabs, activeTabId: saved.activeTabId };
+  }
+  const defaultTabs: Tab[] = [
+    { id: generateTabId(), type: "terminal", title: "Terminal 1" },
+    { id: generateTabId(), type: "files", title: "Files 1" },
+  ];
+  return { tabs: defaultTabs, activeTabId: defaultTabs[0].id };
+}
+
 export default function ConsoleClient() {
-  // Initialize with saved tabs or default tabs
-  const [tabs, setTabs] = useState<Tab[]>(() => {
-    const saved = loadSavedTabs();
-    if (saved) {
-      return saved.tabs;
-    }
-    return [
-      { id: generateTabId(), type: "terminal", title: "Terminal 1" },
-      { id: generateTabId(), type: "files", title: "Files 1" },
-    ];
-  });
-  const [activeTabId, setActiveTabId] = useState<string>(() => {
-    const saved = loadSavedTabs();
-    return saved?.activeTabId ?? tabs[0]?.id ?? '';
-  });
+  // Initialize tabs and activeTabId from a single source to avoid race conditions
+  const [{ tabs: initialTabs, activeTabId: initialActiveTabId }] = useState(getInitialTabsState);
+  const [tabs, setTabs] = useState<Tab[]>(initialTabs);
+  const [activeTabId, setActiveTabId] = useState<string>(initialActiveTabId);
   const [showNewTabMenu, setShowNewTabMenu] = useState(false);
 
   // Save tabs to localStorage whenever they change
