@@ -17,6 +17,111 @@ pub enum McpStatus {
     Disabled,
 }
 
+// ==================== JSON-RPC 2.0 Types ====================
+
+/// JSON-RPC 2.0 request
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRpcRequest {
+    pub jsonrpc: &'static str,
+    pub id: u64,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+impl JsonRpcRequest {
+    pub fn new(id: u64, method: impl Into<String>, params: Option<serde_json::Value>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+/// JSON-RPC 2.0 response
+#[derive(Debug, Clone, Deserialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: String,
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<JsonRpcError>,
+}
+
+/// JSON-RPC 2.0 error
+#[derive(Debug, Clone, Deserialize)]
+pub struct JsonRpcError {
+    pub code: i32,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+/// MCP Initialize request params
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeParams {
+    pub protocol_version: String,
+    pub capabilities: ClientCapabilities,
+    pub client_info: ClientInfo,
+}
+
+/// Client capabilities for MCP
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ClientCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roots: Option<RootsCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<serde_json::Value>,
+}
+
+/// Roots capability
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootsCapability {
+    pub list_changed: bool,
+}
+
+/// Client info for MCP
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientInfo {
+    pub name: String,
+    pub version: String,
+}
+
+/// MCP Initialize response result
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeResult {
+    pub protocol_version: String,
+    #[serde(default)]
+    pub capabilities: ServerCapabilities,
+    #[serde(default)]
+    pub server_info: Option<ServerInfo>,
+}
+
+/// Server capabilities from MCP
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ServerCapabilities {
+    #[serde(default)]
+    pub tools: Option<serde_json::Value>,
+    #[serde(default)]
+    pub resources: Option<serde_json::Value>,
+    #[serde(default)]
+    pub prompts: Option<serde_json::Value>,
+}
+
+/// Server info from MCP
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerInfo {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -148,14 +253,16 @@ pub struct McpCallToolRequest {
 
 /// Response from calling an MCP tool.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpCallToolResponse {
     pub content: Vec<McpContent>,
     #[serde(default)]
-    pub isError: bool,
+    pub is_error: bool,
 }
 
 /// Content item from MCP response.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpContent {
     #[serde(rename = "type")]
     pub content_type: String,
@@ -164,5 +271,5 @@ pub struct McpContent {
     #[serde(default)]
     pub data: Option<String>,
     #[serde(default)]
-    pub mimeType: Option<String>,
+    pub mime_type: Option<String>,
 }

@@ -178,12 +178,14 @@ function McpDetailPanel({
   onClose,
   onToggle,
   onRefresh,
+  onConfigure,
   onDelete,
 }: {
   mcp: McpServerState;
   onClose: () => void;
   onToggle: () => void;
   onRefresh: () => void;
+  onConfigure: () => void;
   onDelete: () => void;
 }) {
   const accuracy =
@@ -192,160 +194,175 @@ function McpDetailPanel({
       : "100.0";
 
   return (
-    <div className="flex h-full flex-col glass-panel border-l border-white/[0.06] animate-slide-in-right">
-      {/* Header */}
-      <div className="flex items-start justify-between border-b border-white/[0.06] p-4">
-        <div className="flex items-center gap-3">
+    <>
+      {/* Backdrop */}
+      <div
+        className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm animate-fade-in"
+        onClick={onClose}
+      />
+      {/* Panel */}
+      <div className="fixed right-0 top-0 z-50 h-full w-96 flex flex-col glass-panel border-l border-white/[0.06] animate-slide-in-right">
+        {/* Header */}
+        <div className="flex items-start justify-between border-b border-white/[0.06] p-4">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onClose}
+              className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
+            >
+              <ChevronLeft className="h-5 w-5" />
+            </button>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-semibold text-white">{mcp.name}</h2>
+                {mcp.version && <span className="tag">v{mcp.version}</span>}
+              </div>
+              <p className="text-xs text-white/40">{mcp.endpoint}</p>
+            </div>
+          </div>
           <button
             onClick={onClose}
             className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
           >
-            <ChevronLeft className="h-5 w-5" />
+            <X className="h-5 w-5" />
           </button>
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-lg font-semibold text-white">{mcp.name}</h2>
-              {mcp.version && <span className="tag">v{mcp.version}</span>}
-            </div>
-            <p className="text-xs text-white/40">{mcp.endpoint}</p>
-          </div>
         </div>
-        <button
-          onClick={onClose}
-          className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
-        >
-          <X className="h-5 w-5" />
-        </button>
-      </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-6">
-        {/* Active toggle */}
-        <div className="flex items-center justify-between rounded-xl bg-white/[0.02] border border-white/[0.04] p-4">
-          <div className="flex items-center gap-3">
-            <div
-              className={cn(
-                "flex h-10 w-10 items-center justify-center rounded-xl",
-                mcp.enabled ? "bg-emerald-500/10" : "bg-white/[0.04]"
-              )}
-            >
-              <Power
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-6">
+          {/* Active toggle */}
+          <div className="flex items-center justify-between rounded-xl bg-white/[0.02] border border-white/[0.04] p-4">
+            <div className="flex items-center gap-3">
+              <div
                 className={cn(
-                  "h-5 w-5",
-                  mcp.enabled ? "text-emerald-400" : "text-white/40"
+                  "flex h-10 w-10 items-center justify-center rounded-xl",
+                  mcp.enabled ? "bg-emerald-500/10" : "bg-white/[0.04]"
                 )}
-              />
+              >
+                <Power
+                  className={cn(
+                    "h-5 w-5",
+                    mcp.enabled ? "text-emerald-400" : "text-white/40"
+                  )}
+                />
+              </div>
+              <div>
+                <p className="font-medium text-white">
+                  {mcp.enabled ? "Module Active" : "Module Inactive"}
+                </p>
+                <p className="text-xs text-white/40">
+                  {mcp.enabled ? "Running and monitoring" : "Paused"}
+                </p>
+              </div>
             </div>
-            <div>
-              <p className="font-medium text-white">
-                {mcp.enabled ? "Module Active" : "Module Inactive"}
+            <Toggle checked={mcp.enabled} onChange={onToggle} />
+          </div>
+
+          {/* Stats */}
+          <div className="grid grid-cols-3 gap-3">
+            <div className="stat-panel text-center">
+              <p className="stat-label flex items-center justify-center gap-1">
+                <AlertTriangle className="h-3 w-3" />
+                CALLS
               </p>
-              <p className="text-xs text-white/40">
-                {mcp.enabled ? "Running and monitoring" : "Paused"}
+              <p className="text-2xl font-light text-white tabular-nums">
+                {mcp.tool_calls}
+              </p>
+            </div>
+            <div className="stat-panel text-center">
+              <p className="stat-label flex items-center justify-center gap-1 text-red-400">
+                <XCircle className="h-3 w-3" />
+                ERRORS
+              </p>
+              <p className="text-2xl font-light text-white tabular-nums">
+                {mcp.tool_errors}
+              </p>
+            </div>
+            <div className="stat-panel text-center">
+              <p className="stat-label flex items-center justify-center gap-1 text-emerald-400">
+                <CheckCircle className="h-3 w-3" />
+                ACCURACY
+              </p>
+              <p className="text-2xl font-light text-emerald-400 tabular-nums">
+                {accuracy}%
               </p>
             </div>
           </div>
-          <Toggle checked={mcp.enabled} onChange={onToggle} />
-        </div>
 
-        {/* Stats */}
-        <div className="grid grid-cols-3 gap-3">
-          <div className="stat-panel text-center">
-            <p className="stat-label flex items-center justify-center gap-1">
-              <AlertTriangle className="h-3 w-3" />
-              CALLS
+          {/* About */}
+          <div>
+            <h3 className="text-[10px] uppercase tracking-wider text-white/40 mb-2">
+              About
+            </h3>
+            <p className="text-sm text-white/80">
+              {mcp.description || `Module running at ${mcp.endpoint}`}
             </p>
-            <p className="text-2xl font-light text-white tabular-nums">
-              {mcp.tool_calls}
-            </p>
-          </div>
-          <div className="stat-panel text-center">
-            <p className="stat-label flex items-center justify-center gap-1 text-red-400">
-              <XCircle className="h-3 w-3" />
-              ERRORS
-            </p>
-            <p className="text-2xl font-light text-white tabular-nums">
-              {mcp.tool_errors}
-            </p>
-          </div>
-          <div className="stat-panel text-center">
-            <p className="stat-label flex items-center justify-center gap-1 text-emerald-400">
-              <CheckCircle className="h-3 w-3" />
-              ACCURACY
-            </p>
-            <p className="text-2xl font-light text-emerald-400 tabular-nums">
-              {accuracy}%
-            </p>
-          </div>
-        </div>
-
-        {/* About */}
-        <div>
-          <h3 className="text-[10px] uppercase tracking-wider text-white/40 mb-2">
-            About
-          </h3>
-          <p className="text-sm text-white/80">
-            {mcp.description || `Module running at ${mcp.endpoint}`}
-          </p>
-          {mcp.last_connected_at && (
-            <p className="mt-2 text-xs text-white/40">
-              Last updated: {new Date(mcp.last_connected_at).toLocaleString()}
-            </p>
-          )}
-          {mcp.error && (
-            <div className="mt-2 rounded-lg bg-red-500/10 border border-red-500/20 p-3">
-              <p className="text-xs text-red-400">Error: {mcp.error}</p>
-            </div>
-          )}
-        </div>
-
-        {/* Active tools */}
-        <div>
-          <h3 className="text-[10px] uppercase tracking-wider text-white/40 mb-2">
-            Active Checks ({mcp.tools.length})
-          </h3>
-          <div className="space-y-2">
-            {mcp.tools.length === 0 ? (
-              <p className="text-sm text-white/40">No tools discovered</p>
-            ) : (
-              mcp.tools.map((tool) => (
-                <div
-                  key={tool}
-                  className="flex items-center justify-between rounded-lg bg-white/[0.02] border border-white/[0.04] px-3 py-2.5"
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                    <span className="text-sm text-white">{tool}</span>
-                  </div>
-                  <span className="text-xs text-white/40">Active</span>
-                </div>
-              ))
+            {mcp.last_connected_at && (
+              <p className="mt-2 text-xs text-white/40">
+                Last updated: {new Date(mcp.last_connected_at).toLocaleString()}
+              </p>
+            )}
+            {mcp.error && (
+              <div className="mt-2 rounded-lg bg-red-500/10 border border-red-500/20 p-3">
+                <p className="text-xs text-red-400">Error: {mcp.error}</p>
+              </div>
             )}
           </div>
-        </div>
-      </div>
 
-      {/* Footer */}
-      <div className="flex items-center justify-between border-t border-white/[0.06] p-4">
-        <span className="text-xs text-white/30">Last updated recently</span>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onRefresh}
-            className="flex items-center gap-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-3 py-1.5 text-xs text-white/80 transition-colors"
-          >
-            <Settings className="h-3 w-3" />
-            Configure
-          </button>
-          <button
-            onClick={onDelete}
-            className="flex items-center gap-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 px-3 py-1.5 text-xs text-red-400 transition-colors"
-          >
-            <Trash2 className="h-3 w-3" />
-            Remove
-          </button>
+          {/* Active tools */}
+          <div>
+            <h3 className="text-[10px] uppercase tracking-wider text-white/40 mb-2">
+              Active Checks ({mcp.tools.length})
+            </h3>
+            <div className="space-y-2">
+              {mcp.tools.length === 0 ? (
+                <p className="text-sm text-white/40">No tools discovered</p>
+              ) : (
+                mcp.tools.map((tool) => (
+                  <div
+                    key={tool}
+                    className="flex items-center justify-between rounded-lg bg-white/[0.02] border border-white/[0.04] px-3 py-2.5"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                      <span className="text-sm text-white">{tool}</span>
+                    </div>
+                    <span className="text-xs text-white/40">Active</span>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-between border-t border-white/[0.06] p-4">
+          <span className="text-xs text-white/30">Last updated recently</span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onRefresh}
+              className="flex items-center gap-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-3 py-1.5 text-xs text-white/80 transition-colors"
+            >
+              <RefreshCw className="h-3 w-3" />
+              Refresh
+            </button>
+            <button
+              onClick={onConfigure}
+              className="flex items-center gap-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-3 py-1.5 text-xs text-white/80 transition-colors"
+            >
+              <Settings className="h-3 w-3" />
+              Configure
+            </button>
+            <button
+              onClick={onDelete}
+              className="flex items-center gap-1.5 rounded-lg bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 px-3 py-1.5 text-xs text-red-400 transition-colors"
+            >
+              <Trash2 className="h-3 w-3" />
+              Remove
+            </button>
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -472,6 +489,156 @@ function AddMcpModal({
   );
 }
 
+function ConfigureMcpModal({
+  mcp,
+  onClose,
+  onSave,
+}: {
+  mcp: McpServerState;
+  onClose: () => void;
+  onSave: (data: {
+    name: string;
+    endpoint: string;
+    description?: string;
+  }) => Promise<void>;
+}) {
+  const [name, setName] = useState(mcp.name);
+  const [endpoint, setEndpoint] = useState(mcp.endpoint);
+  const [description, setDescription] = useState(mcp.description || "");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim() || !endpoint.trim()) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      await onSave({
+        name: name.trim(),
+        endpoint: endpoint.trim(),
+        description: description.trim() || undefined,
+      });
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update MCP");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in">
+      <div className="w-full max-w-md rounded-2xl glass-panel border border-white/[0.08] p-6 animate-slide-up">
+        <div className="mb-6 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-white">
+            Configure {mcp.name}
+          </h2>
+          <button
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          <div className="space-y-4">
+            <div>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">
+                Name
+              </label>
+              <input
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="e.g., Supabase MCP"
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">
+                Endpoint URL
+              </label>
+              <input
+                type="url"
+                value={endpoint}
+                onChange={(e) => setEndpoint(e.target.value)}
+                placeholder="https://mcp.supabase.com/mcp"
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-white/60 mb-1.5">
+                Description (optional)
+              </label>
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="What does this MCP do?"
+                rows={2}
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors resize-none"
+              />
+            </div>
+
+            {/* Connection status info */}
+            <div className="rounded-lg bg-white/[0.02] border border-white/[0.04] p-3">
+              <p className="text-xs text-white/60 mb-2">Connection Status</p>
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    "h-2 w-2 rounded-full",
+                    mcp.status === "connected"
+                      ? "bg-emerald-400"
+                      : mcp.status === "error"
+                      ? "bg-red-400"
+                      : "bg-white/40"
+                  )}
+                />
+                <span className="text-sm text-white capitalize">
+                  {mcp.status}
+                </span>
+              </div>
+              {mcp.error && (
+                <p className="mt-2 text-xs text-red-400">{mcp.error}</p>
+              )}
+            </div>
+
+            {error && (
+              <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3">
+                <p className="text-sm text-red-400">{error}</p>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-6 flex justify-end gap-3">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-4 py-2.5 text-sm text-white/80 transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={loading || !name.trim() || !endpoint.trim()}
+              className="rounded-lg bg-indigo-500 hover:bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loading ? "Saving..." : "Save Changes"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function ToolsTab({
   tools,
   onToggle,
@@ -480,7 +647,9 @@ function ToolsTab({
   onToggle: (name: string, enabled: boolean) => void;
 }) {
   const builtinTools = tools.filter((t) => t.source === "builtin");
-  const mcpTools = tools.filter((t) => typeof t.source === "object" && "mcp" in t.source);
+  const mcpTools = tools.filter(
+    (t) => typeof t.source === "object" && "mcp" in t.source
+  );
 
   return (
     <div className="space-y-6">
@@ -565,6 +734,7 @@ export default function ModulesPage() {
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [selectedMcp, setSelectedMcp] = useState<McpServerState | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showConfigureModal, setShowConfigureModal] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const fetchData = useCallback(async () => {
@@ -600,6 +770,20 @@ export default function ModulesPage() {
     description?: string;
   }) => {
     await addMcp(data);
+    await fetchData();
+  };
+
+  const handleConfigureMcp = async (data: {
+    name: string;
+    endpoint: string;
+    description?: string;
+  }) => {
+    if (!selectedMcp) return;
+    // For now, we'll remove and re-add since there's no update endpoint
+    // In a full implementation, you'd have an updateMcp API endpoint
+    await removeMcp(selectedMcp.id);
+    const newMcp = await addMcp(data);
+    setSelectedMcp(newMcp);
     await fetchData();
   };
 
@@ -655,105 +839,101 @@ export default function ModulesPage() {
   };
 
   return (
-    <div className="flex h-screen">
-      {/* Main content */}
-      <div className={cn("flex-1 overflow-auto p-6", selectedMcp && "pr-0")}>
-        {/* Header */}
-        <div className="mb-6 flex items-start justify-between">
-          <div>
-            <h1 className="text-xl font-semibold text-white">Modules</h1>
-            <p className="mt-1 text-sm text-white/50">
-              Manage and discover check modules
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleRefreshAll}
-              className="flex items-center gap-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-3 py-2 text-sm text-white/80 transition-colors"
-            >
-              <RefreshCw className="h-4 w-4" />
-              Refresh
-            </button>
-            <button
-              onClick={() => setShowAddModal(true)}
-              className="flex items-center gap-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors"
-            >
-              <Plus className="h-4 w-4" />
-              Add MCP
-            </button>
-          </div>
+    <div className="h-screen overflow-auto p-6">
+      {/* Header */}
+      <div className="mb-6 flex items-start justify-between">
+        <div>
+          <h1 className="text-xl font-semibold text-white">Modules</h1>
+          <p className="mt-1 text-sm text-white/50">
+            Manage and discover check modules
+          </p>
         </div>
-
-        {/* Tabs */}
-        <div className="mb-6 inline-flex rounded-lg bg-white/[0.02] border border-white/[0.04] p-1">
+        <div className="flex items-center gap-2">
           <button
-            onClick={() => setActiveTab("installed")}
-            className={cn(
-              "px-4 py-2 rounded-md text-sm font-medium transition-colors",
-              activeTab === "installed"
-                ? "bg-white/[0.08] text-white"
-                : "text-white/40 hover:text-white/60"
-            )}
+            onClick={handleRefreshAll}
+            className="flex items-center gap-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-3 py-2 text-sm text-white/80 transition-colors"
           >
-            Installed
+            <RefreshCw className="h-4 w-4" />
+            Refresh
           </button>
           <button
-            onClick={() => setActiveTab("tools")}
-            className={cn(
-              "px-4 py-2 rounded-md text-sm font-medium transition-colors",
-              activeTab === "tools"
-                ? "bg-white/[0.08] text-white"
-                : "text-white/40 hover:text-white/60"
-            )}
+            onClick={() => setShowAddModal(true)}
+            className="flex items-center gap-2 rounded-lg bg-indigo-500 hover:bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition-colors"
           >
-            Tools
+            <Plus className="h-4 w-4" />
+            Add MCP
           </button>
         </div>
-
-        {/* Content */}
-        {loading ? (
-          <div className="py-12 text-center">
-            <RefreshCw className="h-8 w-8 animate-spin text-indigo-400 mx-auto" />
-          </div>
-        ) : activeTab === "installed" ? (
-          mcps.length === 0 ? (
-            <div className="flex flex-col items-center py-16 text-center">
-              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white/[0.02] mb-4">
-                <Plug className="h-8 w-8 text-white/30" />
-              </div>
-              <p className="text-white/80">No MCP servers configured</p>
-              <p className="mt-1 text-sm text-white/40">
-                Click "Add MCP" to connect to an MCP server
-              </p>
-            </div>
-          ) : (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {mcps.map((mcp) => (
-                <McpCard
-                  key={mcp.id}
-                  mcp={mcp}
-                  onSelect={setSelectedMcp}
-                  isSelected={selectedMcp?.id === mcp.id}
-                />
-              ))}
-            </div>
-          )
-        ) : (
-          <ToolsTab tools={tools} onToggle={handleToggleTool} />
-        )}
       </div>
 
-      {/* Detail panel */}
-      {selectedMcp && (
-        <div className="w-96">
-          <McpDetailPanel
-            mcp={selectedMcp}
-            onClose={() => setSelectedMcp(null)}
-            onToggle={() => handleToggleMcp(selectedMcp)}
-            onRefresh={() => handleRefreshMcp(selectedMcp)}
-            onDelete={() => handleDeleteMcp(selectedMcp)}
-          />
+      {/* Tabs */}
+      <div className="mb-6 inline-flex rounded-lg bg-white/[0.02] border border-white/[0.04] p-1">
+        <button
+          onClick={() => setActiveTab("installed")}
+          className={cn(
+            "px-4 py-2 rounded-md text-sm font-medium transition-colors",
+            activeTab === "installed"
+              ? "bg-white/[0.08] text-white"
+              : "text-white/40 hover:text-white/60"
+          )}
+        >
+          Installed
+        </button>
+        <button
+          onClick={() => setActiveTab("tools")}
+          className={cn(
+            "px-4 py-2 rounded-md text-sm font-medium transition-colors",
+            activeTab === "tools"
+              ? "bg-white/[0.08] text-white"
+              : "text-white/40 hover:text-white/60"
+          )}
+        >
+          Tools
+        </button>
+      </div>
+
+      {/* Content */}
+      {loading ? (
+        <div className="py-12 text-center">
+          <RefreshCw className="h-8 w-8 animate-spin text-indigo-400 mx-auto" />
         </div>
+      ) : activeTab === "installed" ? (
+        mcps.length === 0 ? (
+          <div className="flex flex-col items-center py-16 text-center">
+            <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-white/[0.02] mb-4">
+              <Plug className="h-8 w-8 text-white/30" />
+            </div>
+            <p className="text-white/80">No MCP servers configured</p>
+            <p className="mt-1 text-sm text-white/40">
+              Click &quot;Add MCP&quot; to connect to an MCP server
+            </p>
+          </div>
+        ) : (
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {mcps.map((mcp) => (
+              <McpCard
+                key={mcp.id}
+                mcp={mcp}
+                onSelect={setSelectedMcp}
+                isSelected={selectedMcp?.id === mcp.id}
+              />
+            ))}
+          </div>
+        )
+      ) : (
+        <ToolsTab tools={tools} onToggle={handleToggleTool} />
+      )}
+
+      {/* Detail panel (overlay) */}
+      {selectedMcp && (
+        <McpDetailPanel
+          mcp={selectedMcp}
+          onClose={() => setSelectedMcp(null)}
+          onToggle={() => handleToggleMcp(selectedMcp)}
+          onRefresh={() => handleRefreshMcp(selectedMcp)}
+          onConfigure={() => setShowConfigureModal(true)}
+          onDelete={() => handleDeleteMcp(selectedMcp)}
+        />
       )}
 
       {/* Add modal */}
@@ -761,6 +941,15 @@ export default function ModulesPage() {
         <AddMcpModal
           onClose={() => setShowAddModal(false)}
           onAdd={handleAddMcp}
+        />
+      )}
+
+      {/* Configure modal */}
+      {showConfigureModal && selectedMcp && (
+        <ConfigureMcpModal
+          mcp={selectedMcp}
+          onClose={() => setShowConfigureModal(false)}
+          onSave={handleConfigureMcp}
         />
       )}
     </div>

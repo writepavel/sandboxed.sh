@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::RwLock;
@@ -10,6 +11,9 @@ use uuid::Uuid;
 
 use super::config::McpConfigStore;
 use super::types::*;
+
+/// MCP protocol version we support
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Runtime registry for MCP servers.
 pub struct McpRegistry {
@@ -21,6 +25,8 @@ pub struct McpRegistry {
     client: reqwest::Client,
     /// Disabled tools (by name)
     disabled_tools: RwLock<std::collections::HashSet<String>>,
+    /// Request ID counter for JSON-RPC
+    request_id: AtomicU64,
 }
 
 impl McpRegistry {
@@ -45,7 +51,70 @@ impl McpRegistry {
             states: RwLock::new(states),
             client,
             disabled_tools: RwLock::new(std::collections::HashSet::new()),
+            request_id: AtomicU64::new(1),
         }
+    }
+    
+    /// Get the next request ID for JSON-RPC
+    fn next_request_id(&self) -> u64 {
+        self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+    
+    /// Send a JSON-RPC request to an MCP server
+    async fn send_jsonrpc(&self, endpoint: &str, method: &str, params: Option<serde_json::Value>) -> anyhow::Result<serde_json::Value> {
+        let request = JsonRpcRequest::new(self.next_request_id(), method, params);
+        
+        let response = self.client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            anyhow::bail!("HTTP {}", response.status());
+        }
+        
+        let json_response: JsonRpcResponse = response.json().await?;
+        
+        if let Some(error) = json_response.error {
+            anyhow::bail!("JSON-RPC error {}: {}", error.code, error.message);
+        }
+        
+        json_response.result.ok_or_else(|| anyhow::anyhow!("No result in response"))
+    }
+    
+    /// Initialize connection with an MCP server
+    async fn initialize_mcp(&self, endpoint: &str) -> anyhow::Result<InitializeResult> {
+        let params = InitializeParams {
+            protocol_version: MCP_PROTOCOL_VERSION.to_string(),
+            capabilities: ClientCapabilities::default(),
+            client_info: ClientInfo {
+                name: "open-agent".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+        };
+        
+        let result = self.send_jsonrpc(
+            endpoint, 
+            "initialize", 
+            Some(serde_json::to_value(params)?)
+        ).await?;
+        
+        let init_result: InitializeResult = serde_json::from_value(result)?;
+        
+        // Send initialized notification (no response expected, but some servers require it)
+        let _ = self.client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }))
+            .send()
+            .await;
+        
+        Ok(init_result)
     }
 
     /// List all MCP servers with their current state.
@@ -139,58 +208,66 @@ impl McpRegistry {
             return Ok(state);
         }
         
-        let endpoint = &state.config.endpoint;
+        let endpoint = state.config.endpoint.trim_end_matches('/');
         
-        // Try to list tools from the MCP server
-        let tools_url = format!("{}/tools/list", endpoint.trim_end_matches('/'));
+        // Step 1: Initialize the MCP connection with JSON-RPC
+        let init_result = match self.initialize_mcp(endpoint).await {
+            Ok(result) => result,
+            Err(e) => {
+                let mut states = self.states.write().await;
+                if let Some(state) = states.get_mut(&id) {
+                    state.status = McpStatus::Error;
+                    state.error = Some(format!("Initialize failed: {}", e));
+                }
+                return self.get(id).await.ok_or_else(|| anyhow::anyhow!("MCP not found"));
+            }
+        };
         
-        match self.client.post(&tools_url).json(&serde_json::json!({})).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    match response.json::<McpToolsResponse>().await {
-                        Ok(tools_response) => {
-                            let tool_names: Vec<String> = tools_response
-                                .tools
-                                .iter()
-                                .map(|t| t.name.clone())
-                                .collect();
-                            
-                            // Update config with discovered tools
-                            let _ = self.config_store.update(id, |c| {
-                                c.tools = tool_names.clone();
-                                c.last_connected_at = Some(chrono::Utc::now());
-                            }).await;
-                            
-                            // Update state
-                            let mut states = self.states.write().await;
-                            if let Some(state) = states.get_mut(&id) {
-                                state.config.tools = tool_names;
-                                state.config.last_connected_at = Some(chrono::Utc::now());
-                                state.status = McpStatus::Connected;
-                                state.error = None;
-                            }
-                        }
-                        Err(e) => {
-                            let mut states = self.states.write().await;
-                            if let Some(state) = states.get_mut(&id) {
-                                state.status = McpStatus::Error;
-                                state.error = Some(format!("Failed to parse tools: {}", e));
-                            }
+        // Extract server version if available
+        let server_version = init_result.server_info.as_ref().and_then(|s| s.version.clone());
+        
+        // Step 2: List tools using JSON-RPC
+        match self.send_jsonrpc(endpoint, "tools/list", None).await {
+            Ok(result) => {
+                match serde_json::from_value::<McpToolsResponse>(result) {
+                    Ok(tools_response) => {
+                        let tool_names: Vec<String> = tools_response
+                            .tools
+                            .iter()
+                            .map(|t| t.name.clone())
+                            .collect();
+                        
+                        // Update config with discovered tools
+                        let _ = self.config_store.update(id, |c| {
+                            c.tools = tool_names.clone();
+                            c.version = server_version.clone();
+                            c.last_connected_at = Some(chrono::Utc::now());
+                        }).await;
+                        
+                        // Update state
+                        let mut states = self.states.write().await;
+                        if let Some(state) = states.get_mut(&id) {
+                            state.config.tools = tool_names;
+                            state.config.version = server_version;
+                            state.config.last_connected_at = Some(chrono::Utc::now());
+                            state.status = McpStatus::Connected;
+                            state.error = None;
                         }
                     }
-                } else {
-                    let mut states = self.states.write().await;
-                    if let Some(state) = states.get_mut(&id) {
-                        state.status = McpStatus::Error;
-                        state.error = Some(format!("HTTP {}", response.status()));
+                    Err(e) => {
+                        let mut states = self.states.write().await;
+                        if let Some(state) = states.get_mut(&id) {
+                            state.status = McpStatus::Error;
+                            state.error = Some(format!("Failed to parse tools: {}", e));
+                        }
                     }
                 }
             }
             Err(e) => {
                 let mut states = self.states.write().await;
                 if let Some(state) = states.get_mut(&id) {
-                    state.status = McpStatus::Disconnected;
-                    state.error = Some(format!("Connection failed: {}", e));
+                    state.status = McpStatus::Error;
+                    state.error = Some(format!("tools/list failed: {}", e));
                 }
             }
         }
@@ -223,36 +300,33 @@ impl McpRegistry {
             anyhow::bail!("MCP {} is not connected", state.config.name);
         }
         
-        let endpoint = &state.config.endpoint;
-        let call_url = format!("{}/tools/call", endpoint.trim_end_matches('/'));
+        let endpoint = state.config.endpoint.trim_end_matches('/');
         
-        let request = McpCallToolRequest {
-            name: tool_name.to_string(),
-            arguments,
+        // Use JSON-RPC tools/call method
+        let params = serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments
+        });
+        
+        let result = match self.send_jsonrpc(endpoint, "tools/call", Some(params)).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Increment error counter
+                let mut states = self.states.write().await;
+                if let Some(state) = states.get_mut(&mcp_id) {
+                    state.tool_errors += 1;
+                }
+                anyhow::bail!("Tool call failed: {}", e);
+            }
         };
         
-        let response = self.client
-            .post(&call_url)
-            .json(&request)
-            .send()
-            .await?;
+        let response: McpCallToolResponse = serde_json::from_value(result)?;
         
-        if !response.status().is_success() {
-            // Increment error counter
-            let mut states = self.states.write().await;
-            if let Some(state) = states.get_mut(&mcp_id) {
-                state.tool_errors += 1;
-            }
-            anyhow::bail!("Tool call failed: HTTP {}", response.status());
-        }
-        
-        let result: McpCallToolResponse = response.json().await?;
-        
-        // Increment success counter
+        // Increment counters
         {
             let mut states = self.states.write().await;
             if let Some(state) = states.get_mut(&mcp_id) {
-                if result.isError {
+                if response.is_error {
                     state.tool_errors += 1;
                 } else {
                     state.tool_calls += 1;
@@ -260,8 +334,8 @@ impl McpRegistry {
             }
         }
         
-        if result.isError {
-            let error_text = result.content
+        if response.is_error {
+            let error_text = response.content
                 .iter()
                 .filter_map(|c| c.text.as_deref())
                 .collect::<Vec<_>>()
@@ -270,7 +344,7 @@ impl McpRegistry {
         }
         
         // Combine text content
-        let output = result.content
+        let output = response.content
             .iter()
             .filter_map(|c| c.text.as_deref())
             .collect::<Vec<_>>()
