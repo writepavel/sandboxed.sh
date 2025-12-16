@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from "react";
 
 export function useLocalStorage<T>(
   key: string,
@@ -6,7 +6,7 @@ export function useLocalStorage<T>(
 ): [T, (value: T | ((prev: T) => T)) => void] {
   // Get value from localStorage or use initial value
   const [storedValue, setStoredValue] = useState<T>(() => {
-    if (typeof window === 'undefined') {
+    if (typeof window === "undefined") {
       return initialValue;
     }
     try {
@@ -26,7 +26,7 @@ export function useLocalStorage<T>(
         try {
           // Allow value to be a function for prev state pattern
           const valueToStore = value instanceof Function ? value(prev) : value;
-          if (typeof window !== 'undefined') {
+          if (typeof window !== "undefined") {
             window.localStorage.setItem(key, JSON.stringify(valueToStore));
           }
           return valueToStore;
@@ -51,8 +51,8 @@ export function useLocalStorage<T>(
       }
     };
 
-    window.addEventListener('storage', handleStorageChange);
-    return () => window.removeEventListener('storage', handleStorageChange);
+    window.addEventListener("storage", handleStorageChange);
+    return () => window.removeEventListener("storage", handleStorageChange);
   }, [key]);
 
   return [storedValue, setValue];
