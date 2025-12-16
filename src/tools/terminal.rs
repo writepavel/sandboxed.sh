@@ -76,7 +76,7 @@ impl Tool for RunCommand {
             ("sh", "-c")
         };
 
-        let output = tokio::time::timeout(
+        let output = match tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             Command::new(shell)
                 .arg(shell_arg)
@@ -86,9 +86,17 @@ impl Tool for RunCommand {
                 .stderr(Stdio::piped())
                 .output(),
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("Command timed out after {} seconds", timeout_secs))?
-        .map_err(|e| anyhow::anyhow!("Failed to execute command: {}", e))?;
+        .await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                tracing::error!("Command execution failed: {}", e);
+                return Err(anyhow::anyhow!("Failed to execute command: {}", e));
+            }
+            Err(_) => {
+                tracing::error!("Command timed out after {} seconds", timeout_secs);
+                return Err(anyhow::anyhow!("Command timed out after {} seconds", timeout_secs));
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
