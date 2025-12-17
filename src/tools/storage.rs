@@ -36,7 +36,7 @@ impl Tool for UploadImage {
     }
 
     fn description(&self) -> &str {
-        "Upload an image file to cloud storage and get a public URL. Use this to share screenshots, diagrams, or other images in your messages. The returned URL can be embedded in markdown using ![description](url) syntax. Supports PNG, JPEG, GIF, and WebP formats."
+        "Upload an image file to cloud storage and get a public URL. Returns a 'markdown' field that you MUST copy into your response text for the image to be visible. Example: if the tool returns {\"markdown\": \"![screenshot](https://...)\"}, include that exact markdown string in your message. Supports PNG, JPEG, GIF, WebP."
     }
 
     fn parameters_schema(&self) -> Value {
