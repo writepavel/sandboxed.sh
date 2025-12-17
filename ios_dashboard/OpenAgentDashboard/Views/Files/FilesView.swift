@@ -213,6 +213,7 @@ struct FilesView: View {
                         isEditingPath = false
                     } label: {
                         Image(systemName: "xmark.circle.fill")
+                            .font(.title3)
                             .foregroundStyle(Theme.textMuted)
                     }
                     
@@ -221,18 +222,20 @@ struct FilesView: View {
                         isEditingPath = false
                     } label: {
                         Image(systemName: "arrow.right.circle.fill")
+                            .font(.title3)
                             .foregroundStyle(Theme.accent)
                     }
                 }
                 .padding(.horizontal, 16)
             } else {
-                // Breadcrumb path
+                // Breadcrumb path using / separators
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 2) {
+                    HStack(spacing: 0) {
                         ForEach(Array(breadcrumbs.enumerated()), id: \.offset) { index, crumb in
-                            if index > 0 {
-                                Image(systemName: "chevron.right")
-                                    .font(.caption2.weight(.semibold))
+                            // Add / separator after first element (which is "/"), not before
+                            if index > 1 {
+                                Text("/")
+                                    .font(.subheadline.weight(.medium))
                                     .foregroundStyle(Theme.textMuted)
                             }
                             
@@ -242,30 +245,31 @@ struct FilesView: View {
                                 Text(crumb.name)
                                     .font(.subheadline.weight(index == breadcrumbs.count - 1 ? .semibold : .medium))
                                     .foregroundStyle(index == breadcrumbs.count - 1 ? Theme.textPrimary : Theme.textTertiary)
-                                    .padding(.horizontal, 8)
+                                    .padding(.horizontal, 4)
                                     .padding(.vertical, 6)
                                     .background(index == breadcrumbs.count - 1 ? Theme.backgroundSecondary : .clear)
                                     .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                             }
                         }
-                        
-                        // Edit button
-                        Button {
-                            editedPath = currentPath
-                            isEditingPath = true
-                            isPathFieldFocused = true
-                        } label: {
-                            Image(systemName: "pencil")
-                                .font(.caption)
-                                .foregroundStyle(Theme.textMuted)
-                                .padding(6)
-                        }
                     }
-                    .padding(.trailing, 16)
+                    .padding(.trailing, 8)
+                }
+                
+                // Edit button - larger tap target
+                Button {
+                    editedPath = currentPath
+                    isEditingPath = true
+                    isPathFieldFocused = true
+                    HapticService.selectionChanged()
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                        .font(.body)
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 44, height: 44)
                 }
             }
         }
-        .padding(.leading, currentPath == "/" && !isEditingPath ? 16 : 0)
+        .padding(.leading, currentPath == "/" && !isEditingPath ? 12 : 0)
         .frame(height: 44)
         .background(.thinMaterial)
     }

@@ -84,21 +84,37 @@ async function generateIcon(size, outputPath) {
     }
 }
 
+async function generateIconsForApp(iconDir, filenameMap, sizes) {
+    if (!fs.existsSync(iconDir)) {
+        console.log(`⚠ Icon directory not found: ${iconDir}`);
+        return;
+    }
+    
+    console.log(`\nGenerating icons in: ${iconDir}`);
+    
+    // Generate all icon sizes
+    for (const size of sizes) {
+        const filename = filenameMap[size];
+        if (!filename) {
+            console.log(`Warning: No filename mapping for size ${size}`);
+            continue;
+        }
+        
+        const outputPath = path.join(iconDir, filename);
+        await generateIcon(size, outputPath);
+    }
+}
+
 async function main() {
     const scriptDir = __dirname;
     const projectRoot = path.resolve(scriptDir, '..');
-    const iconDir = path.join(projectRoot, 'ios_dashboard', 'OpenAgentDashboard', 'Assets.xcassets', 'AppIcon.appiconset');
     
-    if (!fs.existsSync(iconDir)) {
-        console.error(`Error: Icon directory not found: ${iconDir}`);
-        process.exit(1);
-    }
-    
-    console.log(`Generating iOS app icons in: ${iconDir}`);
+    console.log(`Generating iOS app icons`);
     console.log(`Using indigo color: ${INDIGO_COLOR}\n`);
     
-    // Map sizes to filenames
-    const filenameMap = {
+    // OpenAgentDashboard icons
+    const dashboardIconDir = path.join(projectRoot, 'ios_dashboard', 'OpenAgentDashboard', 'Assets.xcassets', 'AppIcon.appiconset');
+    const dashboardFilenameMap = {
         20: 'icon-20.png',
         29: 'icon-29.png',
         40: 'icon-40.png',
@@ -113,18 +129,14 @@ async function main() {
         180: 'icon-180.png',
         1024: 'icon-1024.png',
     };
+    await generateIconsForApp(dashboardIconDir, dashboardFilenameMap, ICON_SIZES);
     
-    // Generate all icon sizes
-    for (const size of ICON_SIZES) {
-        const filename = filenameMap[size];
-        if (!filename) {
-            console.log(`Warning: No filename mapping for size ${size}`);
-            continue;
-        }
-        
-        const outputPath = path.join(iconDir, filename);
-        await generateIcon(size, outputPath);
-    }
+    // Calorily icons (only 1024x1024)
+    const calorilyIconDir = path.join(projectRoot, 'calorily', 'Calorily', 'Assets.xcassets', 'AppIcon.appiconset');
+    const calorilyFilenameMap = {
+        1024: 'icon_1024.png',
+    };
+    await generateIconsForApp(calorilyIconDir, calorilyFilenameMap, [1024]);
     
     console.log('\n✓ All icons generated successfully!');
 }

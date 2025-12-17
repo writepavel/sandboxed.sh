@@ -16,11 +16,13 @@ struct ControlView: View {
     @State private var isLoading = true
     @State private var streamTask: Task<Void, Never>?
     @State private var showMissionMenu = false
+    @State private var shouldScrollToBottom = false
     
     @FocusState private var isInputFocused: Bool
     
     private let api = APIService.shared
     private let nav = NavigationState.shared
+    private let bottomAnchorId = "bottom-anchor"
     
     var body: some View {
         ZStack {
@@ -169,6 +171,11 @@ struct ControlView: View {
                                 .id(message.id)
                         }
                     }
+                    
+                    // Bottom anchor for scrolling past last message
+                    Color.clear
+                        .frame(height: 1)
+                        .id(bottomAnchorId)
                 }
                 .padding()
             }
@@ -177,12 +184,20 @@ struct ControlView: View {
                 isInputFocused = false
             }
             .onChange(of: messages.count) { _, _ in
-                if let lastMessage = messages.last {
-                    withAnimation {
-                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
-                    }
+                scrollToBottom(proxy: proxy)
+            }
+            .onChange(of: shouldScrollToBottom) { _, shouldScroll in
+                if shouldScroll {
+                    scrollToBottom(proxy: proxy)
+                    shouldScrollToBottom = false
                 }
             }
+        }
+    }
+    
+    private func scrollToBottom(proxy: ScrollViewProxy) {
+        withAnimation {
+            proxy.scrollTo(bottomAnchorId, anchor: .bottom)
         }
     }
     
@@ -313,7 +328,7 @@ struct ControlView: View {
     private func loadCurrentMission() async {
         isLoading = true
         defer { isLoading = false }
-        
+
         do {
             if let mission = try await api.getCurrentMission() {
                 currentMission = mission
@@ -324,6 +339,11 @@ struct ControlView: View {
                         content: entry.content
                     )
                 }
+                
+                // Scroll to bottom after loading
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    shouldScrollToBottom = true
+                }
             }
         } catch {
             print("Failed to load mission: \(error)")
@@ -333,7 +353,7 @@ struct ControlView: View {
     private func loadMission(id: String) async {
         isLoading = true
         defer { isLoading = false }
-        
+
         do {
             let missions = try await api.listMissions()
             if let mission = missions.first(where: { $0.id == id }) {
@@ -346,6 +366,11 @@ struct ControlView: View {
                     )
                 }
                 HapticService.success()
+                
+                // Scroll to bottom after loading
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    shouldScrollToBottom = true
+                }
             }
         } catch {
             print("Failed to load mission: \(error)")
