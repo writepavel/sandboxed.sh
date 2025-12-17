@@ -670,3 +670,4 @@ private struct MarkdownImageView: View {
         ControlView()
     }
 }
+
