@@ -660,7 +660,13 @@ When task is complete, provide a clear summary of:
             }
 
             // No tool calls - final response
-            if let Some(content) = response.content {
+            tracing::debug!(
+                "No tool calls, checking content: is_some={}, len={}, preview={}",
+                response.content.is_some(),
+                response.content.as_ref().map(|c| c.len()).unwrap_or(0),
+                response.content.as_ref().map(|c| c.chars().take(100).collect::<String>()).unwrap_or_default()
+            );
+            if let Some(content) = response.content.filter(|c| !c.trim().is_empty()) {
                 let signals = ExecutionSignals {
                     iterations: iterations_completed,
                     max_iterations: ctx.max_iterations as u32,
