@@ -244,6 +244,58 @@ fc-cache -fv
 - Chromium runs with `--no-sandbox` (required for root, but limits isolation)
 - Consider running in a container for additional isolation
 
+## Window Layout with i3-msg
+
+The `desktop_i3_command` tool allows the agent to control window positioning using i3-msg.
+
+### Creating a Multi-Window Layout
+
+Example: Chrome on left, terminal with fastfetch top-right, calculator bottom-right:
+
+```bash
+# Start session
+desktop_start_session
+
+# Launch Chrome (takes left half by default in tiling mode)
+i3-msg exec chromium --no-sandbox
+
+# Prepare to split the right side horizontally
+i3-msg split h
+
+# Split right side vertically for stacked windows
+i3-msg focus right
+i3-msg split v
+
+# Launch terminal with fastfetch (top-right)
+i3-msg exec xterm -e fastfetch
+
+# Launch calculator (bottom-right)
+i3-msg exec xcalc
+```
+
+### Common i3-msg Commands
+
+| Command | Description |
+|---------|-------------|
+| `exec <app>` | Launch an application |
+| `split h` | Next window opens horizontally adjacent |
+| `split v` | Next window opens vertically adjacent |
+| `focus left/right/up/down` | Move focus to adjacent window |
+| `move left/right/up/down` | Move focused window |
+| `resize grow width 100 px` | Make window wider |
+| `resize grow height 100 px` | Make window taller |
+| `layout splitv/splith` | Change container layout |
+| `fullscreen toggle` | Toggle fullscreen |
+| `kill` | Close focused window |
+
+### Pre-installed Applications
+
+These are installed on the production server:
+- `chromium --no-sandbox` - Web browser
+- `xterm` - Terminal emulator
+- `xcalc` - Calculator
+- `fastfetch` - System info display
+
 ## Session Lifecycle
 
 1. **Task starts**: Agent calls `desktop_start_session`
@@ -253,3 +305,17 @@ fc-cache -fv
 5. **Agent works**: Screenshots, clicks, typing via desktop_* tools
 6. **Task ends**: `desktop_stop_session` kills Xvfb and children
 7. **Cleanup**: Any orphaned sessions killed on task failure
+
+## Available Desktop Tools
+
+| Tool | Description |
+|------|-------------|
+| `desktop_start_session` | Start Xvfb + i3 + optional Chromium |
+| `desktop_stop_session` | Stop the desktop session |
+| `desktop_screenshot` | Take screenshot (auto-uploads to Supabase) |
+| `desktop_type` | Send keyboard input (text or keys) |
+| `desktop_click` | Mouse click at coordinates |
+| `desktop_mouse_move` | Move mouse cursor |
+| `desktop_scroll` | Scroll mouse wheel |
+| `desktop_get_text` | Extract visible text (AT-SPI or OCR) |
+| `desktop_i3_command` | Execute i3-msg commands for window control |
