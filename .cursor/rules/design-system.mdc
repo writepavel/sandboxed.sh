@@ -1,8 +1,11 @@
-# Open Agent Design System
-
-This document defines the visual language, component patterns, and design philosophy for the Open Agent web dashboard.
-
 ---
+description: Dashboard UI design system - dark-first, liquid glass aesthetic
+globs: ["dashboard/src/components/**", "dashboard/src/app/**"]
+---
+
+# Design System
+
+**"Quiet Luxury + Liquid Glass"** - Dark-first, Vercel/shadcn inspired.
 
 ## Design Philosophy
 

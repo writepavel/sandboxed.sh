@@ -1,0 +1,90 @@
+---
+description: Core Open Agent architecture - hierarchical agent system with full machine access
+alwaysApply: true
+---
+
+# Open Agent
+
+Minimal autonomous coding agent in Rust with **full machine access** (not sandboxed).
+
+## Quick Reference
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| Backend (Rust) | `src/` | HTTP API + agent system |
+| Dashboard (Next.js) | `dashboard/` | Web UI (Bun, not npm) |
+| MCP configs | `.open_agent/mcp/config.json` | Model Context Protocol servers |
+| Tuning | `.open_agent/tuning.json` | Calibration data |
+
+## Architecture
+
+```
+RootAgent (orchestrator)
+├── ComplexityEstimator (leaf) → estimates task difficulty 0-1
+├── ModelSelector (leaf) → U-curve cost optimization
+├── TaskExecutor (leaf) → runs tools in a loop
+└── Verifier (leaf) → hybrid programmatic + LLM verification
+```
+
+### Module Map
+
+```
+src/
+├── agents/           # Hierarchical agent system
+│   ├── orchestrator/ # RootAgent, NodeAgent
+│   └── leaf/         # ComplexityEstimator, ModelSelector, TaskExecutor, Verifier
+├── budget/           # Cost tracking, pricing, smart retry
+├── memory/           # Supabase + pgvector persistence
+├── mcp/              # MCP server registry + config
+├── llm/              # OpenRouter client
+├── tools/            # File ops, terminal, git, web, search
+├── task/             # Task types + verification
+└── api/              # HTTP routes (axum)
+```
+
+## Agent Rules
+
+1. **Full system access**: Can read/write any file, execute any command, search anywhere
+2. **Working directory**: `WORKING_DIR` env (default: `/root` prod, `.` dev) - paths can be relative or absolute
+3. **Directory structure** (production):
+   - `/root/context/` - user uploads (dashboard file explorer)
+   - `/root/work/` - agent working area (subfolders per task)
+   - `/root/tools/` - reusable scripts (auto-discovered by TaskExecutor)
+
+## API Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/task` | Submit task |
+| `GET` | `/api/task/{id}` | Get status |
+| `GET` | `/api/task/{id}/stream` | SSE progress |
+| `GET` | `/api/health` | Health check |
+| `GET` | `/api/runs` | List archived runs |
+| `GET/POST/DELETE` | `/api/mcp/*` | MCP management |
+
+## Model Selection (U-Curve)
+
+- **Cheap models**: low token cost, high failure rate, more retries
+- **Expensive models**: high token cost, low failure rate
+- **Optimal**: minimizes `E[total_cost] = Σ P(retry_n) × cost_n`
+
+Default ladder: `claude-haiku-4.5` → `claude-3.5-sonnet` → `claude-sonnet-4.5`
+
+## Smart Retry
+
+Analyzes failure signals to decide action:
+
+| Failure Mode | Signals | Action |
+|--------------|---------|--------|
+| Capability insufficient | stuck in loops, repetitive | **Upgrade** model |
+| Budget exhausted + progress | files modified, high tool success | **Continue** or cheaper |
+| External error | API/network issues | **Retry** same config |
+| Infeasible | consistent failures | **Stop** |
+
+## After Significant Changes
+
+When you make architectural changes to this codebase, **update the Cursor rules**:
+- New module → add to module map
+- New API endpoint → add to endpoints table
+- New env var → add to `secrets.mdc`
+- New agent type → update architecture diagram

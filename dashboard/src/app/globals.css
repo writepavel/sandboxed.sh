@@ -105,6 +105,13 @@ select:focus-visible {
   background: rgb(var(--accent) / 0.25);
 }
 
+/* Fix selection visibility on purple/indigo backgrounds */
+.bg-indigo-500::selection,
+.bg-indigo-500 *::selection {
+  background: rgba(255, 255, 255, 0.3);
+  color: white;
+}
+
 /* =========================================================================
    Scrollbars - minimal, subtle
    ========================================================================= */
