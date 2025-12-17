@@ -32,7 +32,7 @@ fn desktop_enabled() -> bool {
 
 /// Get the configured resolution
 fn get_resolution() -> String {
-    std::env::var("DESKTOP_RESOLUTION").unwrap_or_else(|_| "1920x1080".to_string())
+    std::env::var("DESKTOP_RESOLUTION").unwrap_or_else(|_| "1280x720".to_string())
 }
 
 /// Run a command with DISPLAY environment variable set
