@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -44,7 +44,7 @@
 		CD6FB2E54DC07BE7A1EB08F8 /* StatusBadge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBadge.swift; sourceTree = "<group>"; };
 		D4AB47CF121ABA1946A4D879 /* Mission.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mission.swift; sourceTree = "<group>"; };
 		EB5A4720378F06807FDE73E1 /* GlassCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassCard.swift; sourceTree = "<group>"; };
-		F51395D8FB559D3C79AAA0A4 /* OpenAgentDashboard.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = OpenAgentDashboard.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F51395D8FB559D3C79AAA0A4 /* Open Agent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Open Agent.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -75,7 +75,7 @@
 		279F9B8FE97DDCBF76C2E85E /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				F51395D8FB559D3C79AAA0A4 /* OpenAgentDashboard.app */,
+				F51395D8FB559D3C79AAA0A4 /* Open Agent.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -179,7 +179,7 @@
 			packageProductDependencies = (
 			);
 			productName = OpenAgentDashboard;
-			productReference = F51395D8FB559D3C79AAA0A4 /* OpenAgentDashboard.app */;
+			productReference = F51395D8FB559D3C79AAA0A4 /* Open Agent.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -190,11 +190,6 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1600;
-				TargetAttributes = {
-					DD68473111E6CED00E695F44 = {
-						DevelopmentTeam = "";
-					};
-				};
 			};
 			buildConfigurationList = DFB11F92DB10F2E14DD9B35E /* Build configuration list for PBXProject "OpenAgentDashboard" */;
 			compatibilityVersion = "Xcode 14.0";
@@ -206,7 +201,6 @@
 			);
 			mainGroup = AB86DCEEB152D8EA7E8CBD86;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -259,6 +253,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = OpenAgentDashboard/OpenAgentDashboard.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = BQ6Z84B8L5;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = OpenAgentDashboard/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -349,6 +344,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = OpenAgentDashboard/OpenAgentDashboard.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = BQ6Z84B8L5;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = OpenAgentDashboard/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;

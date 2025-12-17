@@ -1,14 +1,49 @@
 //! Web access tools: search and fetch URLs.
+//!
+//! Web search uses Tavily API if TAVILY_API_KEY is set, otherwise falls back to DuckDuckGo HTML.
 
 use std::path::Path;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::Tool;
 
-/// Search the web (placeholder - uses DuckDuckGo HTML).
+/// Search the web using Tavily API (preferred) or DuckDuckGo fallback.
 pub struct WebSearch;
+
+/// Tavily API request body.
+#[derive(Debug, Serialize)]
+struct TavilySearchRequest {
+    api_key: String,
+    query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_results: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_answer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_raw_content: Option<bool>,
+}
+
+/// Tavily API response.
+#[derive(Debug, Deserialize)]
+struct TavilySearchResponse {
+    #[serde(default)]
+    answer: Option<String>,
+    #[serde(default)]
+    results: Vec<TavilyResult>,
+}
+
+/// A single result from Tavily.
+#[derive(Debug, Deserialize)]
+struct TavilyResult {
+    title: String,
+    url: String,
+    content: String,
+    #[serde(default)]
+    score: f64,
+}
 
 #[async_trait]
 impl Tool for WebSearch {
@@ -17,7 +52,7 @@ impl Tool for WebSearch {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Returns search results with titles and snippets. Use for finding documentation, examples, or current information."
+        "Search the web for real-time information. Returns search results with titles, snippets and URLs. Use for finding documentation, current events, examples, or any information you need."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -30,7 +65,7 @@ impl Tool for WebSearch {
                 },
                 "num_results": {
                     "type": "integer",
-                    "description": "Maximum number of results to return (default: 5)"
+                    "description": "Maximum number of results to return (default: 5, max: 10)"
                 }
             },
             "required": ["query"]
@@ -41,27 +76,105 @@ impl Tool for WebSearch {
         let query = args["query"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
-        let _num_results = args["num_results"].as_u64().unwrap_or(5);
+        let num_results = args["num_results"].as_u64().unwrap_or(5).min(10) as u32;
 
-        // Use DuckDuckGo HTML search (no API key needed)
-        let encoded_query = urlencoding::encode(query);
-        let url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
-
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; OpenAgent/1.0)")
-            .build()?;
-
-        let response = client.get(&url).send().await?;
-        let html = response.text().await?;
-
-        // Parse results (simple extraction)
-        let results = extract_ddg_results(&html);
-
-        if results.is_empty() {
-            Ok(format!("No results found for: {}", query))
-        } else {
-            Ok(results.join("\n\n"))
+        // Try Tavily first if API key is available
+        if let Ok(api_key) = std::env::var("TAVILY_API_KEY") {
+            if !api_key.is_empty() {
+                return search_tavily(&api_key, query, num_results).await;
+            }
         }
+
+        // Fallback to DuckDuckGo (may be blocked by CAPTCHA)
+        search_duckduckgo(query).await
+    }
+}
+
+/// Search using Tavily API.
+async fn search_tavily(api_key: &str, query: &str, max_results: u32) -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let request = TavilySearchRequest {
+        api_key: api_key.to_string(),
+        query: query.to_string(),
+        max_results: Some(max_results),
+        include_answer: Some(true),
+        include_raw_content: Some(false),
+    };
+
+    let response = client
+        .post("https://api.tavily.com/search")
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_default();
+        anyhow::bail!("Tavily API error ({}): {}", status, error_text);
+    }
+
+    let tavily_response: TavilySearchResponse = response.json().await?;
+
+    if tavily_response.results.is_empty() {
+        return Ok(format!("No results found for: {}", query));
+    }
+
+    // Format results
+    let mut output = String::new();
+
+    // Include AI-generated answer if available
+    if let Some(answer) = tavily_response.answer {
+        if !answer.is_empty() {
+            output.push_str("## Quick Answer\n\n");
+            output.push_str(&answer);
+            output.push_str("\n\n---\n\n## Sources\n\n");
+        }
+    }
+
+    // Format individual results
+    for (i, result) in tavily_response.results.iter().enumerate() {
+        output.push_str(&format!(
+            "### {}. {}\n**URL:** {}\n\n{}\n\n",
+            i + 1,
+            result.title,
+            result.url,
+            result.content
+        ));
+    }
+
+    Ok(output)
+}
+
+/// Fallback search using DuckDuckGo HTML (may be blocked by CAPTCHA).
+async fn search_duckduckgo(query: &str) -> anyhow::Result<String> {
+    let encoded_query = urlencoding::encode(query);
+    let url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; OpenAgent/1.0)")
+        .build()?;
+
+    let response = client.get(&url).send().await?;
+    let html = response.text().await?;
+
+    // Check for CAPTCHA
+    if html.contains("anomaly-modal") || html.contains("Unfortunately, bots") {
+        return Err(anyhow::anyhow!(
+            "DuckDuckGo blocked the request with CAPTCHA. Please configure TAVILY_API_KEY for reliable web search."
+        ));
+    }
+
+    // Parse results (simple extraction)
+    let results = extract_ddg_results(&html);
+
+    if results.is_empty() {
+        Ok(format!("No results found for: {}", query))
+    } else {
+        Ok(results.join("\n\n"))
     }
 }
 
@@ -277,4 +390,3 @@ fn extract_text_from_html(html: &str) -> String {
 
     html_decode(&result)
 }
-

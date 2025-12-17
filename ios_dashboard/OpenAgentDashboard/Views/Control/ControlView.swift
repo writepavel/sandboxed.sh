@@ -206,7 +206,7 @@ struct ControlView: View {
             Divider()
                 .background(Theme.border)
             
-            HStack(spacing: 12) {
+            HStack(alignment: .bottom, spacing: 12) {
                 // Text input
                 TextField("Message the agent...", text: $inputText, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -214,45 +214,42 @@ struct ControlView: View {
                     .lineLimit(1...5)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
-                    .background(.ultraThinMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .background(Theme.backgroundSecondary)
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(isInputFocused ? Theme.accent.opacity(0.5) : Theme.border, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .stroke(isInputFocused ? Theme.accent.opacity(0.4) : Theme.border, lineWidth: 1)
                     )
                     .focused($isInputFocused)
+                    .submitLabel(.send)
                     .onSubmit {
                         sendMessage()
                     }
                 
                 // Send/Stop button
-                if runState != .idle {
-                    Button {
+                Button {
+                    if runState != .idle {
                         Task { await cancelRun() }
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(width: 44, height: 44)
-                            .background(Theme.error)
-                            .clipShape(Circle())
-                    }
-                } else {
-                    Button {
+                    } else {
                         sendMessage()
-                    } label: {
-                        Image(systemName: "paperplane.fill")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(width: 44, height: 44)
-                            .background(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Theme.accent.opacity(0.5) : Theme.accent)
-                            .clipShape(Circle())
                     }
-                    .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                } label: {
+                    Image(systemName: runState != .idle ? "stop.fill" : "arrow.up")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(
+                            runState != .idle ? Theme.error :
+                            (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Theme.textMuted : Theme.accent)
+                        )
+                        .clipShape(Circle())
                 }
+                .disabled(runState == .idle && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .animation(.easeInOut(duration: 0.15), value: runState)
             }
-            .padding()
-            .background(.ultraThinMaterial)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(.thinMaterial)
         }
     }
     

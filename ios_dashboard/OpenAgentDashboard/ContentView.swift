@@ -95,8 +95,8 @@ struct LoginView: View {
                     
                     // Logo
                     VStack(spacing: 16) {
-                        Image(systemName: "brain.head.profile")
-                            .font(.system(size: 64))
+                        Image(systemName: "brain")
+                            .font(.system(size: 72, weight: .light))
                             .foregroundStyle(Theme.accent)
                             .symbolEffect(.pulse, options: .repeating)
                         
