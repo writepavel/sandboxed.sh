@@ -663,6 +663,39 @@ When task is complete, provide a clear summary of:
                         });
                     }
 
+                    // Special case: if complete_mission was called AND the LLM provided content,
+                    // use that content as the final response instead of continuing the loop.
+                    // This prevents the common pattern where Claude says "I'll complete the mission"
+                    // with actual content, but then returns empty on the next iteration.
+                    let called_complete_mission = tool_calls.iter().any(|tc| tc.function.name == "complete_mission");
+                    if called_complete_mission {
+                        if let Some(content) = response.content.as_ref().filter(|c| !c.trim().is_empty()) {
+                            tracing::info!("complete_mission called with content, returning early with {} chars", content.len());
+                            let signals = ExecutionSignals {
+                                iterations: iterations_completed,
+                                max_iterations: ctx.max_iterations as u32,
+                                successful_tool_calls,
+                                failed_tool_calls,
+                                files_modified,
+                                repetitive_actions,
+                                has_error_messages,
+                                partial_progress: true,
+                                cost_spent_cents: total_cost_cents,
+                                budget_total_cents: task.budget().total_cents(),
+                                final_output: content.clone(),
+                                model_used: model.to_string(),
+                            };
+                            return ExecutionLoopResult {
+                                output: content.clone(),
+                                cost_cents: total_cost_cents,
+                                tool_log,
+                                usage,
+                                signals,
+                                success: true,
+                            };
+                        }
+                    }
+
                     continue;
                 }
             }
