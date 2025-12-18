@@ -175,5 +175,12 @@ impl AgentContext {
             });
         }
     }
+
+    /// Emit an agent tree update event (for real-time tree visualization).
+    pub fn emit_tree(&self, tree: crate::api::control::AgentTreeNode) {
+        if let Some(ref events) = self.control_events {
+            let _ = events.send(crate::api::control::AgentEvent::AgentTree { tree });
+        }
+    }
 }
 

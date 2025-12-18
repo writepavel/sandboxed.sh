@@ -355,6 +355,7 @@ export default function AgentsPage() {
   const [selectedAgent, setSelectedAgent] = useState<AgentNode | null>(null);
   const [loading, setLoading] = useState(true);
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set(['root']));
+  const [realTree, setRealTree] = useState<AgentNode | null>(null);
   const fetchedRef = useRef(false);
   const streamCleanupRef = useRef<null | (() => void)>(null);
 
@@ -378,24 +379,73 @@ export default function AgentsPage() {
     setExpandedNodes(new Set(['root']));
   }, []);
 
-  // Stream control events for real-time status
+  // Convert backend tree node to frontend AgentNode
+  const convertTreeNode = useCallback((node: Record<string, unknown>): AgentNode => {
+    const children = (node['children'] as Record<string, unknown>[] | undefined) ?? [];
+    return {
+      id: String(node['id'] ?? ''),
+      type: (String(node['node_type'] ?? 'Node') as AgentNode['type']),
+      status: (String(node['status'] ?? 'pending') as AgentNode['status']),
+      name: String(node['name'] ?? ''),
+      description: String(node['description'] ?? ''),
+      budgetAllocated: Number(node['budget_allocated'] ?? 0),
+      budgetSpent: Number(node['budget_spent'] ?? 0),
+      complexity: node['complexity'] != null ? Number(node['complexity']) : undefined,
+      selectedModel: node['selected_model'] != null ? String(node['selected_model']) : undefined,
+      children: children.map((c) => convertTreeNode(c)),
+    };
+  }, []);
+
+  // Stream control events for real-time status and tree updates
   useEffect(() => {
     streamCleanupRef.current?.();
-    
+
     const cleanup = streamControl((event) => {
       const data: unknown = event.data;
       if (event.type === 'status' && isRecord(data)) {
         const st = data['state'];
         setControlState(typeof st === 'string' ? (st as ControlRunState) : 'idle');
+        
+        // Clear real tree when idle
+        if (st === 'idle') {
+          setRealTree(null);
+        }
+      }
+      
+      // Handle real-time tree updates
+      if (event.type === 'agent_tree' && isRecord(data)) {
+        const tree = data['tree'];
+        if (isRecord(tree)) {
+          const converted = convertTreeNode(tree);
+          setRealTree(converted);
+          
+          // Auto-expand new nodes
+          const getAllIds = (node: AgentNode): string[] => {
+            const ids = [node.id];
+            if (node.children) {
+              for (const child of node.children) {
+                ids.push(...getAllIds(child));
+              }
+            }
+            return ids;
+          };
+          setExpandedNodes((prev) => {
+            const next = new Set(prev);
+            for (const id of getAllIds(converted)) {
+              next.add(id);
+            }
+            return next;
+          });
+        }
       }
     });
-    
+
     streamCleanupRef.current = cleanup;
     return () => {
       streamCleanupRef.current?.();
       streamCleanupRef.current = null;
     };
-  }, []);
+  }, [convertTreeNode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -555,7 +605,8 @@ export default function AgentsPage() {
     };
   }, [selectedMission, controlState]);
 
-  const agentTree = useMemo(() => buildAgentTree(), [buildAgentTree]);
+  // Use real tree when available, fall back to mock tree
+  const agentTree = useMemo(() => realTree ?? buildAgentTree(), [realTree, buildAgentTree]);
   const treeStats = useMemo(() => countNodes(agentTree), [agentTree]);
   const isActive = controlState !== 'idle';
 

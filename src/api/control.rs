@@ -121,6 +121,72 @@ pub enum AgentEvent {
         /// Agent name (for hierarchical display)
         agent: Option<String>,
     },
+    /// Agent tree update (for real-time tree visualization)
+    AgentTree {
+        /// The full agent tree structure
+        tree: AgentTreeNode,
+    },
+}
+
+/// A node in the agent tree (for visualization)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTreeNode {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub node_type: String, // "Root", "Node", "ComplexityEstimator", "ModelSelector", "TaskExecutor", "Verifier"
+    pub name: String,
+    pub description: String,
+    pub status: String, // "pending", "running", "completed", "failed"
+    pub budget_allocated: u64,
+    pub budget_spent: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_model: Option<String>,
+    #[serde(default)]
+    pub children: Vec<AgentTreeNode>,
+}
+
+impl AgentTreeNode {
+    pub fn new(id: &str, node_type: &str, name: &str, description: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            node_type: node_type.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            status: "pending".to_string(),
+            budget_allocated: 0,
+            budget_spent: 0,
+            complexity: None,
+            selected_model: None,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn with_budget(mut self, allocated: u64, spent: u64) -> Self {
+        self.budget_allocated = allocated;
+        self.budget_spent = spent;
+        self
+    }
+
+    pub fn with_status(mut self, status: &str) -> Self {
+        self.status = status.to_string();
+        self
+    }
+
+    pub fn with_complexity(mut self, complexity: f64) -> Self {
+        self.complexity = Some(complexity);
+        self
+    }
+
+    pub fn with_model(mut self, model: &str) -> Self {
+        self.selected_model = Some(model.to_string());
+        self
+    }
+
+    pub fn add_child(&mut self, child: AgentTreeNode) {
+        self.children.push(child);
+    }
 }
 
 impl AgentEvent {
@@ -135,6 +201,7 @@ impl AgentEvent {
             AgentEvent::Error { .. } => "error",
             AgentEvent::MissionStatusChanged { .. } => "mission_status_changed",
             AgentEvent::AgentPhase { .. } => "agent_phase",
+            AgentEvent::AgentTree { .. } => "agent_tree",
         }
     }
 }

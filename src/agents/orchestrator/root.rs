@@ -299,6 +299,122 @@ Respond ONLY with the JSON object."#,
             }))
         }
     }
+
+    /// Execute subtasks with tree updates for visualization.
+    async fn execute_subtasks_with_tree(
+        &self,
+        subtask_plan: SubtaskPlan,
+        parent_budget: &Budget,
+        child_ctx: &AgentContext,
+        root_tree: &mut crate::api::control::AgentTreeNode,
+        ctx: &AgentContext,
+    ) -> AgentResult {
+        use super::NodeAgent;
+        use crate::api::control::AgentTreeNode;
+        
+        let mut tasks = match subtask_plan.into_tasks(parent_budget) {
+            Ok(t) => t,
+            Err(e) => return AgentResult::failure(format!("Failed to create subtasks: {}", e), 0),
+        };
+
+        let mut results = Vec::new();
+        let mut total_cost = 0u64;
+        let total_subtasks = tasks.len();
+
+        tracing::info!(
+            "RootAgent executing {} subtasks (child depth: {})",
+            total_subtasks,
+            child_ctx.max_split_depth
+        );
+
+        for (i, task) in tasks.iter_mut().enumerate() {
+            let subtask_id = format!("subtask-{}", i + 1);
+            
+            // Update subtask status to running
+            if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == subtask_id) {
+                node.status = "running".to_string();
+            }
+            ctx.emit_tree(root_tree.clone());
+
+            tracing::info!(
+                "RootAgent delegating subtask {}/{}: {}",
+                i + 1,
+                total_subtasks,
+                task.description().chars().take(80).collect::<String>()
+            );
+
+            // Create a NodeAgent and execute
+            let node_agent = NodeAgent::new(subtask_id.clone());
+            let result = node_agent.execute_with_tree(task, child_ctx, &subtask_id, root_tree, ctx).await;
+            total_cost += result.cost_cents;
+
+            // Update subtask status based on result
+            if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == subtask_id) {
+                node.status = if result.success { "completed".to_string() } else { "failed".to_string() };
+                node.budget_spent = result.cost_cents;
+            }
+            ctx.emit_tree(root_tree.clone());
+
+            tracing::info!(
+                "Subtask {}/{} {}: {}",
+                i + 1,
+                total_subtasks,
+                if result.success { "succeeded" } else { "failed" },
+                result.output.chars().take(100).collect::<String>()
+            );
+
+            results.push(result);
+        }
+
+        // Update verifier to running
+        if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "verifier") {
+            node.status = "running".to_string();
+        }
+        ctx.emit_tree(root_tree.clone());
+
+        // Aggregate results
+        let successes = results.iter().filter(|r| r.success).count();
+        let total = results.len();
+
+        // Update verifier to completed
+        if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "verifier") {
+            node.status = if successes == total { "completed".to_string() } else { "failed".to_string() };
+            node.budget_spent = 5;
+        }
+        ctx.emit_tree(root_tree.clone());
+
+        if successes == total {
+            AgentResult::success(
+                format!("All {} subtasks completed successfully", total),
+                total_cost,
+            )
+            .with_data(json!({
+                "subtasks_total": total,
+                "subtasks_succeeded": successes,
+                "recursive_execution": true,
+                "results": results.iter().map(|r| json!({
+                    "success": r.success,
+                    "output": &r.output,
+                    "data": &r.data,
+                })).collect::<Vec<_>>(),
+            }))
+        } else {
+            AgentResult::failure(
+                format!("{}/{} subtasks succeeded", successes, total),
+                total_cost,
+            )
+            .with_data(json!({
+                "subtasks_total": total,
+                "subtasks_succeeded": successes,
+                "recursive_execution": true,
+                "results": results.iter().map(|r| json!({
+                    "success": r.success,
+                    "output": &r.output,
+                    "data": &r.data,
+                })).collect::<Vec<_>>(),
+            }))
+        }
+    }
 }
 
 impl Default for RootAgent {
@@ -322,13 +438,37 @@ impl Agent for RootAgent {
     }
 
     async fn execute(&self, task: &mut Task, ctx: &AgentContext) -> AgentResult {
+        use crate::api::control::AgentTreeNode;
+        
         let mut total_cost = 0u64;
+        let task_desc = task.description().chars().take(60).collect::<String>();
+        let budget_cents = task.budget().total_cents();
+
+        // Build initial tree structure
+        let mut root_tree = AgentTreeNode::new("root", "Root", "Root Agent", &task_desc)
+            .with_budget(budget_cents, 0)
+            .with_status("running");
+
+        // Add child agent nodes
+        root_tree.add_child(
+            AgentTreeNode::new("complexity", "ComplexityEstimator", "Complexity Estimator", "Analyzing task difficulty")
+                .with_budget(10, 0)
+                .with_status("running")
+        );
+        ctx.emit_tree(root_tree.clone());
 
         // Step 1: Estimate complexity
         ctx.emit_phase("estimating_complexity", Some("Analyzing task difficulty..."), Some("RootAgent"));
         let complexity = self.estimate_complexity(task, ctx).await;
-        // Cost already tracked inside ComplexityEstimator; we keep a small constant for now.
         total_cost += 1;
+
+        // Update complexity node
+        if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "complexity") {
+            node.status = "completed".to_string();
+            node.complexity = Some(complexity.score());
+            node.budget_spent = 5;
+        }
+        ctx.emit_tree(root_tree.clone());
 
         tracing::info!(
             "Task complexity: {:.2} (should_split: {})",
@@ -338,15 +478,40 @@ impl Agent for RootAgent {
 
         // Step 2: Decide execution strategy
         if complexity.should_split() && ctx.can_split() {
-            // Complex task: split and delegate
             ctx.emit_phase("splitting_task", Some("Decomposing into subtasks..."), Some("RootAgent"));
             match self.split_task(task, ctx).await {
                 Ok(plan) => {
-                    total_cost += 2; // Splitting cost
+                    total_cost += 2;
                     
-                    // Execute subtasks
+                    // Add subtask nodes to tree
+                    for (i, subtask) in plan.subtasks().iter().enumerate() {
+                        let subtask_node = AgentTreeNode::new(
+                            &format!("subtask-{}", i + 1),
+                            "Node",
+                            &format!("Subtask {}", i + 1),
+                            &subtask.description.chars().take(50).collect::<String>(),
+                        )
+                        .with_budget(budget_cents / plan.subtasks().len() as u64, 0)
+                        .with_status("pending");
+                        root_tree.add_child(subtask_node);
+                    }
+                    
+                    // Add verifier node
+                    root_tree.add_child(
+                        AgentTreeNode::new("verifier", "Verifier", "Verifier", "Verify task completion")
+                            .with_budget(80, 0)
+                            .with_status("pending")
+                    );
+                    ctx.emit_tree(root_tree.clone());
+                    
+                    // Execute subtasks with tree updates
                     let child_ctx = ctx.child_context();
-                    let result = self.execute_subtasks(plan, task.budget(), &child_ctx).await;
+                    let result = self.execute_subtasks_with_tree(plan, task.budget(), &child_ctx, &mut root_tree, ctx).await;
+                    
+                    // Update root status
+                    root_tree.status = if result.success { "completed".to_string() } else { "failed".to_string() };
+                    root_tree.budget_spent = total_cost + result.cost_cents;
+                    ctx.emit_tree(root_tree);
                     
                     return AgentResult {
                         success: result.success,
@@ -357,14 +522,19 @@ impl Agent for RootAgent {
                     };
                 }
                 Err(e) => {
-                    // Couldn't split, fall back to direct execution
                     tracing::warn!("Couldn't split task, executing directly: {}", e.output);
                 }
             }
         }
 
-        // Simple task or failed to split: execute directly
-        // Use ModelSelector when we have benchmark data, otherwise use default model
+        // Simple task: add remaining nodes
+        root_tree.add_child(
+            AgentTreeNode::new("model-selector", "ModelSelector", "Model Selector", "Selecting optimal model")
+                .with_budget(10, 0)
+                .with_status("running")
+        );
+        ctx.emit_tree(root_tree.clone());
+
         ctx.emit_phase("selecting_model", Some("Choosing optimal model..."), Some("RootAgent"));
         
         let has_benchmarks = if let Some(b) = &ctx.benchmarks {
@@ -374,33 +544,66 @@ impl Agent for RootAgent {
             false
         };
         
-        if has_benchmarks {
-            // Use benchmark-informed model selection
+        let selected_model = if has_benchmarks {
             let sel_result = self.model_selector.execute(task, ctx).await;
             total_cost += sel_result.cost_cents;
-            
-            tracing::info!(
-                "ModelSelector used (has benchmarks): {}",
-                task.analysis().selected_model.as_ref().unwrap_or(&"none".to_string())
-            );
+            task.analysis().selected_model.clone().unwrap_or_else(|| ctx.config.default_model.clone())
         } else {
-            // Fall back to default model when no benchmarks available
             let a = task.analysis_mut();
             a.selected_model = Some(ctx.config.default_model.clone());
-            
-            tracing::info!(
-                "Using default model (no benchmarks): {}",
-                ctx.config.default_model
-            );
+            ctx.config.default_model.clone()
+        };
+
+        // Update model selector node
+        if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "model-selector") {
+            node.status = "completed".to_string();
+            node.selected_model = Some(selected_model);
+            node.budget_spent = 3;
         }
+
+        // Add executor and verifier nodes
+        root_tree.add_child(
+            AgentTreeNode::new("executor", "TaskExecutor", "Task Executor", "Executing task")
+                .with_budget(budget_cents - 100, 0)
+                .with_status("running")
+        );
+        root_tree.add_child(
+            AgentTreeNode::new("verifier", "Verifier", "Verifier", "Verify task completion")
+                .with_budget(80, 0)
+                .with_status("pending")
+        );
+        ctx.emit_tree(root_tree.clone());
 
         ctx.emit_phase("executing", Some("Running task..."), Some("RootAgent"));
         let result = self.task_executor.execute(task, ctx).await;
 
-        // Step 3: Verify (if verification criteria specified)
+        // Update executor node
+        if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "executor") {
+            node.status = if result.success { "completed".to_string() } else { "failed".to_string() };
+            node.budget_spent = result.cost_cents;
+        }
+        ctx.emit_tree(root_tree.clone());
+
+        // Step 3: Verify
+        if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "verifier") {
+            node.status = "running".to_string();
+        }
+        ctx.emit_tree(root_tree.clone());
+
         ctx.emit_phase("verifying", Some("Checking results..."), Some("RootAgent"));
         let verification = self.verifier.execute(task, ctx).await;
         total_cost += verification.cost_cents;
+
+        // Update verifier node
+        if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "verifier") {
+            node.status = if verification.success { "completed".to_string() } else { "failed".to_string() };
+            node.budget_spent = verification.cost_cents;
+        }
+
+        // Update root status
+        root_tree.status = if result.success && verification.success { "completed".to_string() } else { "failed".to_string() };
+        root_tree.budget_spent = total_cost + result.cost_cents;
+        ctx.emit_tree(root_tree);
 
         AgentResult {
             success: result.success && verification.success,
