@@ -248,6 +248,81 @@ export default function HistoryPage() {
         </div>
       ) : (
         <div className="space-y-6">
+          {/* Archived Runs - shown first for visibility */}
+          {filteredRuns.length > 0 && (
+            <div>
+              <h2 className="mb-3 text-xs font-medium uppercase tracking-wider text-white/40">
+                Recent Runs ({filteredRuns.length})
+              </h2>
+              <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] overflow-hidden">
+                <table className="w-full">
+                  <thead>
+                    <tr className="border-b border-white/[0.04]">
+                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
+                        Status
+                      </th>
+                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
+                        Input
+                      </th>
+                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
+                        Created
+                      </th>
+                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
+                        Cost
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/[0.04]">
+                    {filteredRuns.map((run) => {
+                      const status = run.status as keyof typeof statusIcons;
+                      const Icon = statusIcons[status] || Clock;
+                      const config =
+                        statusConfig[status] || statusConfig.pending;
+                      return (
+                        <tr
+                          key={run.id}
+                          className="group hover:bg-white/[0.02] transition-colors"
+                        >
+                          <td className="px-4 py-3">
+                            <span
+                              className={cn(
+                                "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-medium",
+                                config.bg,
+                                config.color
+                              )}
+                            >
+                              <Icon className="h-3 w-3" />
+                              {run.status}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-2">
+                              <p className="max-w-md truncate text-sm text-white/80">
+                                {run.input_text}
+                              </p>
+                              <CopyButton text={run.input_text} showOnHover label="Copied input" />
+                            </div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <RelativeTime 
+                              date={run.created_at} 
+                              className="text-xs text-white/40"
+                            />
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className="text-sm text-emerald-400 tabular-nums">
+                              ${(run.total_cost_cents / 100).toFixed(2)}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {/* Missions */}
           {filteredMissions.length > 0 && (
             <div>
@@ -449,80 +524,6 @@ export default function HistoryPage() {
             </div>
           )}
 
-          {/* Archived Runs */}
-          {filteredRuns.length > 0 && (
-            <div>
-              <h2 className="mb-3 text-xs font-medium uppercase tracking-wider text-white/40">
-                Archived Runs ({filteredRuns.length})
-              </h2>
-              <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] overflow-hidden">
-                <table className="w-full">
-                  <thead>
-                    <tr className="border-b border-white/[0.04]">
-                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
-                        Status
-                      </th>
-                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
-                        Input
-                      </th>
-                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
-                        Created
-                      </th>
-                      <th className="px-4 py-3 text-left text-[10px] font-medium uppercase tracking-wider text-white/40">
-                        Cost
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-white/[0.04]">
-                    {filteredRuns.map((run) => {
-                      const status = run.status as keyof typeof statusIcons;
-                      const Icon = statusIcons[status] || Clock;
-                      const config =
-                        statusConfig[status] || statusConfig.pending;
-                      return (
-                        <tr
-                          key={run.id}
-                          className="group hover:bg-white/[0.02] transition-colors"
-                        >
-                          <td className="px-4 py-3">
-                            <span
-                              className={cn(
-                                "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-medium",
-                                config.bg,
-                                config.color
-                              )}
-                            >
-                              <Icon className="h-3 w-3" />
-                              {run.status}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-2">
-                              <p className="max-w-md truncate text-sm text-white/80">
-                                {run.input_text}
-                              </p>
-                              <CopyButton text={run.input_text} showOnHover label="Copied input" />
-                            </div>
-                          </td>
-                          <td className="px-4 py-3">
-                            <RelativeTime 
-                              date={run.created_at} 
-                              className="text-xs text-white/40"
-                            />
-                          </td>
-                          <td className="px-4 py-3">
-                            <span className="text-sm text-emerald-400 tabular-nums">
-                              ${(run.total_cost_cents / 100).toFixed(2)}
-                            </span>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
         </div>
       )}
     </div>
