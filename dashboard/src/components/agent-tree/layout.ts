@@ -1,11 +1,11 @@
 /**
  * Tree Layout Algorithm
- * 
+ *
  * Computes positions for nodes in a tree structure using a modified
  * Reingold-Tilford algorithm for aesthetic tree layouts.
  */
 
-import type { AgentNode, LayoutNode, LayoutEdge, TreeLayout } from './types';
+import type { AgentNode, LayoutNode, LayoutEdge, TreeLayout } from "./types";
 
 const NODE_WIDTH = 140;
 const NODE_HEIGHT = 80;
@@ -34,29 +34,29 @@ export function computeLayout(root: AgentNode | null): TreeLayout {
   // First pass: compute positions recursively (post-order traversal)
   function computePositions(node: AgentNode, depth: number): number {
     const y = depth * (NODE_HEIGHT + VERTICAL_GAP) + 50;
-    
+
     if (!node.children || node.children.length === 0) {
       // Leaf node - assign next available x
       const x = nextLeafX;
       nextLeafX += NODE_WIDTH + HORIZONTAL_GAP;
-      
+
       positions.set(node.id, { id: node.id, x, y, agent: node });
       return x + NODE_WIDTH / 2; // Return center x
     }
-    
+
     // Internal node - first position all children
     const childCenters: number[] = [];
     for (const child of node.children) {
       const childCenter = computePositions(child, depth + 1);
       childCenters.push(childCenter);
     }
-    
+
     // Center this node over its children
     const leftmostCenter = Math.min(...childCenters);
     const rightmostCenter = Math.max(...childCenters);
     const centerX = (leftmostCenter + rightmostCenter) / 2;
     const x = centerX - NODE_WIDTH / 2;
-    
+
     positions.set(node.id, { id: node.id, x, y, agent: node });
     return centerX;
   }
@@ -65,11 +65,11 @@ export function computeLayout(root: AgentNode | null): TreeLayout {
 
   // Second pass: create edges by walking the tree
   const edges: LayoutEdge[] = [];
-  
+
   function createEdges(node: AgentNode) {
     const parentPos = positions.get(node.id);
     if (!parentPos) return;
-    
+
     if (node.children) {
       for (const child of node.children) {
         const childPos = positions.get(child.id);
@@ -98,7 +98,9 @@ export function computeLayout(root: AgentNode | null): TreeLayout {
   const nodes: LayoutNode[] = Array.from(positions.values());
 
   // Compute bounds
-  let minX = Infinity, maxX = -Infinity, maxY = 0;
+  let minX = Infinity,
+    maxX = -Infinity,
+    maxY = 0;
   for (const node of nodes) {
     minX = Math.min(minX, node.x);
     maxX = Math.max(maxX, node.x + NODE_WIDTH);
@@ -126,23 +128,24 @@ export function computeLayout(root: AgentNode | null): TreeLayout {
 /**
  * Get count statistics for a tree
  */
-export function getTreeStats(root: AgentNode | null): { 
-  total: number; 
-  running: number; 
-  completed: number; 
+export function getTreeStats(root: AgentNode | null): {
+  total: number;
+  running: number;
+  completed: number;
   failed: number;
   pending: number;
 } {
-  if (!root) return { total: 0, running: 0, completed: 0, failed: 0, pending: 0 };
-  
+  if (!root)
+    return { total: 0, running: 0, completed: 0, failed: 0, pending: 0 };
+
   let stats = {
     total: 1,
-    running: root.status === 'running' ? 1 : 0,
-    completed: root.status === 'completed' ? 1 : 0,
-    failed: root.status === 'failed' ? 1 : 0,
-    pending: root.status === 'pending' ? 1 : 0,
+    running: root.status === "running" ? 1 : 0,
+    completed: root.status === "completed" ? 1 : 0,
+    failed: root.status === "failed" ? 1 : 0,
+    pending: root.status === "pending" ? 1 : 0,
   };
-  
+
   if (root.children) {
     for (const child of root.children) {
       const childStats = getTreeStats(child);
@@ -153,7 +156,7 @@ export function getTreeStats(root: AgentNode | null): {
       stats.pending += childStats.pending;
     }
   }
-  
+
   return stats;
 }
 
@@ -162,7 +165,7 @@ export function getTreeStats(root: AgentNode | null): {
  */
 export function getAllNodeIds(root: AgentNode | null): Set<string> {
   const ids = new Set<string>();
-  
+
   function walk(node: AgentNode) {
     ids.add(node.id);
     if (node.children) {
@@ -171,7 +174,7 @@ export function getAllNodeIds(root: AgentNode | null): Set<string> {
       }
     }
   }
-  
+
   if (root) walk(root);
   return ids;
 }

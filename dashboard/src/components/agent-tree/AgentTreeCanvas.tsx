@@ -196,11 +196,10 @@ function AnimatedNode({
 
   return (
     <motion.g
-      initial={{ opacity: 0, scale: 0.5, y: y - 20 }}
+      initial={{ opacity: 0, scale: 0.8 }}
       animate={{ 
         opacity: 1, 
-        scale: 1, 
-        y: y,
+        scale: 1,
         transition: { 
           type: 'spring', 
           stiffness: 300, 
@@ -208,7 +207,7 @@ function AnimatedNode({
           delay: index * 0.03,
         }
       }}
-      exit={{ opacity: 0, scale: 0.5 }}
+      exit={{ opacity: 0, scale: 0.8 }}
       style={{ cursor: 'pointer' }}
       onClick={onClick}
     >
