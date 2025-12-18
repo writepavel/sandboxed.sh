@@ -9,8 +9,8 @@ import type { AgentNode, LayoutNode, LayoutEdge, TreeLayout } from './types';
 
 const NODE_WIDTH = 140;
 const NODE_HEIGHT = 80;
-const HORIZONTAL_GAP = 60;
-const VERTICAL_GAP = 120;
+const HORIZONTAL_GAP = 30; // Reduced for more compact layout
+const VERTICAL_GAP = 100; // Slightly reduced for better visibility
 
 interface NodePosition {
   id: string;

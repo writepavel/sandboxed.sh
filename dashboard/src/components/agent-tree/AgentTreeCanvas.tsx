@@ -567,25 +567,31 @@ export function AgentTreeCanvas({
   useEffect(() => {
     if (layout.width > 0 && layout.height > 0 && dimensions.width > 0 && dimensions.height > 0) {
       // Calculate zoom to fit the tree in view with some padding
-      const paddingX = 100;
-      const paddingY = 100;
+      const paddingX = 80;
+      const paddingY = 80;
       const availableWidth = dimensions.width - paddingX;
       const availableHeight = dimensions.height - paddingY;
       
       const scaleX = availableWidth / layout.width;
       const scaleY = availableHeight / layout.height;
       
-      // Use the smaller scale to fit both dimensions, but cap at 1 (don't zoom in)
-      const fitZoom = Math.min(1, Math.min(scaleX, scaleY));
+      // Use the smaller scale to fit both dimensions
+      // Cap between 0.4 (minimum readable) and 1 (don't zoom in past 100%)
+      const MIN_ZOOM = 0.4;
+      const fitZoom = Math.max(MIN_ZOOM, Math.min(1, Math.min(scaleX, scaleY)));
       
-      // Calculate pan to center the tree
+      // Calculate pan to center horizontally, start from top with padding
       const scaledWidth = layout.width * fitZoom;
-      const scaledHeight = layout.height * fitZoom;
       const centerX = (dimensions.width - scaledWidth) / 2;
-      const centerY = (dimensions.height - scaledHeight) / 2;
+      
+      // If tree fits vertically, center it; otherwise start from top
+      const scaledHeight = layout.height * fitZoom;
+      const centerY = scaledHeight < availableHeight 
+        ? (dimensions.height - scaledHeight) / 2 
+        : 30; // Start near top if tree is too tall
       
       setZoom(fitZoom);
-      setPan({ x: centerX, y: Math.max(20, centerY) });
+      setPan({ x: centerX, y: centerY });
     }
   }, [layout.width, layout.height, dimensions.width, dimensions.height]);
   
@@ -612,7 +618,7 @@ export function AgentTreeCanvas({
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
     const delta = e.deltaY > 0 ? 0.97 : 1.03; // Reduced from 0.9/1.1 for smoother zoom
-    setZoom(z => Math.min(2, Math.max(0.2, z * delta)));
+    setZoom(z => Math.min(2, Math.max(0.3, z * delta))); // Min 0.3 to keep nodes readable
   }, []);
   
   if (!tree) {
@@ -691,36 +697,40 @@ export function AgentTreeCanvas({
       {/* Zoom controls */}
       <div className="absolute bottom-4 right-4 flex gap-2">
         <button
-          onClick={() => setZoom(z => Math.min(2, z * 1.2))}
+          onClick={() => setZoom(z => Math.min(2, z * 1.15))}
           className="w-8 h-8 rounded-lg bg-black/40 backdrop-blur-sm border border-white/[0.06] text-white/60 hover:text-white hover:bg-white/[0.04] transition-colors flex items-center justify-center"
         >
           +
         </button>
         <button
-          onClick={() => setZoom(z => Math.max(0.3, z / 1.2))}
+          onClick={() => setZoom(z => Math.max(0.3, z / 1.15))}
           className="w-8 h-8 rounded-lg bg-black/40 backdrop-blur-sm border border-white/[0.06] text-white/60 hover:text-white hover:bg-white/[0.04] transition-colors flex items-center justify-center"
         >
           −
         </button>
         <button
           onClick={() => {
-            // Fit to view
-            const paddingX = 100;
-            const paddingY = 100;
+            // Fit to view with minimum zoom for readability
+            const paddingX = 80;
+            const paddingY = 80;
             const availableWidth = dimensions.width - paddingX;
             const availableHeight = dimensions.height - paddingY;
             
             const scaleX = availableWidth / layout.width;
             const scaleY = availableHeight / layout.height;
-            const fitZoom = Math.min(1, Math.min(scaleX, scaleY));
+            const MIN_ZOOM = 0.4;
+            const fitZoom = Math.max(MIN_ZOOM, Math.min(1, Math.min(scaleX, scaleY)));
             
             const scaledWidth = layout.width * fitZoom;
-            const scaledHeight = layout.height * fitZoom;
             const centerX = (dimensions.width - scaledWidth) / 2;
-            const centerY = (dimensions.height - scaledHeight) / 2;
+            
+            const scaledHeight = layout.height * fitZoom;
+            const centerY = scaledHeight < availableHeight 
+              ? (dimensions.height - scaledHeight) / 2 
+              : 30;
             
             setZoom(fitZoom);
-            setPan({ x: centerX, y: Math.max(20, centerY) });
+            setPan({ x: centerX, y: centerY });
           }}
           className="px-2 h-8 rounded-lg bg-black/40 backdrop-blur-sm border border-white/[0.06] text-white/60 hover:text-white hover:bg-white/[0.04] transition-colors text-xs"
         >
