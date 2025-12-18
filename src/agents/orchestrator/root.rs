@@ -101,17 +101,21 @@ Respond with a JSON object:
         {{
             "description": "What to do",
             "verification": "How to verify it's done",
-            "weight": 1.0
+            "weight": 1.0,
+            "dependencies": []
         }}
     ],
     "reasoning": "Why this breakdown makes sense"
 }}
 
 Guidelines:
-- Each subtask should be independently executable
+- Each subtask should be independently executable once its dependencies are complete
+- The "dependencies" array contains indices (0-based) of subtasks that MUST complete before this one can start
+- For example, if subtask 2 needs subtask 0's output, set "dependencies": [0]
 - Include verification for each subtask
 - Weight indicates relative effort (higher = more work)
 - Keep subtasks focused and specific
+- IMPORTANT: If subtasks have a logical order (e.g., download before analyze), specify dependencies!
 
 Respond ONLY with the JSON object."#,
             task.description()
@@ -184,11 +188,21 @@ Respond ONLY with the JSON object."#,
                         let verification = s["verification"].as_str().unwrap_or("");
                         let weight = s["weight"].as_f64().unwrap_or(1.0);
                         
+                        // Parse dependencies array
+                        let dependencies: Vec<usize> = s["dependencies"]
+                            .as_array()
+                            .map(|deps| {
+                                deps.iter()
+                                    .filter_map(|d| d.as_u64().map(|n| n as usize))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        
                         Subtask::new(
                             desc,
                             VerificationCriteria::llm_based(verification),
                             weight,
-                        )
+                        ).with_dependencies(dependencies)
                     })
                     .collect()
             })

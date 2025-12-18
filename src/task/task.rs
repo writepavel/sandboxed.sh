@@ -29,6 +29,8 @@ pub struct TaskAnalysis {
     /// Estimated total tokens for completing the task (input + output)
     pub estimated_total_tokens: Option<u64>,
 
+    /// User-requested model (if specified) - used as minimum capability floor
+    pub requested_model: Option<String>,
     /// Model chosen for execution (if selected)
     pub selected_model: Option<String>,
     /// Estimated cost in cents (if computed)

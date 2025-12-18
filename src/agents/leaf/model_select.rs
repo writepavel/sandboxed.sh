@@ -229,9 +229,10 @@ impl ModelSelector {
     /// 
     /// # Algorithm
     /// 1. Calculate expected cost for each model using benchmark capabilities when available
-    /// 2. Filter models exceeding budget
-    /// 3. Select model with minimum expected cost
-    /// 4. Include fallbacks in case of failure
+    /// 2. If user requested a specific model, use it as minimum capability floor
+    /// 3. Filter models exceeding budget
+    /// 4. Select model with minimum expected cost
+    /// 5. Include fallbacks in case of failure
     /// 
     /// # Preconditions
     /// - `models` is non-empty
@@ -244,6 +245,7 @@ impl ModelSelector {
         budget_cents: u64,
         task_type: TaskType,
         historical_stats: Option<&HashMap<String, ModelStats>>,
+        requested_model: Option<&str>,
         ctx: &AgentContext,
     ) -> Option<ModelRecommendation> {
         if models.is_empty() {
@@ -284,14 +286,65 @@ impl ModelSelector {
                 .cmp(&b.expected_cost_cents)
         });
 
+        // If user requested a specific model, use it as minimum capability floor
+        // Filter out models with lower capability than the requested one
+        let min_capability = if let Some(req_model) = requested_model {
+            // Find the requested model's capability
+            if let Some(req_cost) = costs.iter().find(|c| c.model_id == req_model) {
+                tracing::info!(
+                    "Using requested model {} as capability floor: {:.3}",
+                    req_model,
+                    req_cost.capability
+                );
+                req_cost.capability
+            } else {
+                // Requested model not found - fall back to looking up its price
+                if let Some(req_pricing) = models.iter().find(|m| m.model_id == req_model) {
+                    let cap = self.estimate_capability_from_price(req_pricing.average_cost_per_token());
+                    tracing::info!(
+                        "Requested model {} not in costs list, using price-based capability: {:.3}",
+                        req_model,
+                        cap
+                    );
+                    cap
+                } else {
+                    // Model not found at all, use a reasonable floor (0.7 = mid-tier)
+                    tracing::warn!(
+                        "Requested model {} not found, using default capability floor 0.7",
+                        req_model
+                    );
+                    0.7
+                }
+            }
+        } else {
+            0.0 // No minimum
+        };
+
+        // Filter to models meeting minimum capability
+        let filtered_costs: Vec<_> = if min_capability > 0.0 {
+            costs.iter()
+                .filter(|c| c.capability >= min_capability * 0.95) // Allow 5% tolerance
+                .cloned()
+                .collect()
+        } else {
+            costs.clone()
+        };
+
+        let costs_to_use = if filtered_costs.is_empty() {
+            tracing::warn!("No models meet minimum capability {:.2}, using all models", min_capability);
+            &costs
+        } else {
+            &filtered_costs
+        };
+
         // Find cheapest model within budget
-        let within_budget: Vec<_> = costs
+        let within_budget: Vec<_> = costs_to_use
             .iter()
             .filter(|c| c.expected_cost_cents <= budget_cents)
             .cloned()
             .collect();
 
-        let selected = within_budget.first().cloned().or_else(|| costs.first().cloned())?;
+        let selected = within_budget.first().cloned().or_else(|| costs_to_use.first().cloned())?;
         
         // Get fallback models (next best options)
         let fallbacks: Vec<String> = costs
@@ -512,6 +565,9 @@ impl Agent for ModelSelector {
             }));
         }
 
+        // Get user-requested model as minimum capability floor
+        let requested_model = task.analysis().requested_model.as_deref();
+
         match self.select_optimal(
             &models,
             complexity,
@@ -519,6 +575,7 @@ impl Agent for ModelSelector {
             budget_cents,
             task_type,
             historical_stats.as_ref(),
+            requested_model,
             ctx,
         ).await {
             Some(rec) => {

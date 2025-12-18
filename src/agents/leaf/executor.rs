@@ -287,6 +287,15 @@ java -jar /root/tools/cfr.jar <jar_file> --outputdir /root/work/java-analysis/ou
 8. **Create reusable tools** — Save useful scripts to /root/tools/ with README
 9. **Verify your work** — Test, run, check outputs when possible
 10. **Iterate** — If first approach fails, try alternatives before giving up
+11. **PREFER CLI OVER DESKTOP** — Always use command-line tools first:
+    - For HTTP: use `curl`, `wget`, `fetch_url` instead of browser automation
+    - For files: use `grep`, `find`, `unzip`, `7z` instead of GUI tools
+    - For downloads: construct URLs and use `curl -L` instead of clicking buttons
+    - Desktop automation (`desktop_*` tools) is a LAST RESORT for:
+      - Testing web applications visually
+      - Interacting with GUI-only applications
+      - When no CLI alternative exists
+    - Chrome extensions can be downloaded directly: `https://clients2.google.com/service/update2/crx?response=redirect&x=id%3D<EXTENSION_ID>%26uc`
 
 ## Response
 When task is complete, provide a clear summary of:

@@ -298,7 +298,7 @@ async fn run_agent_task(
     state: Arc<AppState>,
     task_id: Uuid,
     task_description: String,
-    _model: String,
+    requested_model: String,
     working_dir: std::path::PathBuf,
 ) {
     // Update status to running
@@ -326,6 +326,11 @@ async fn run_agent_task(
             return;
         }
     };
+
+    // Set the user-requested model as minimum capability floor
+    if !requested_model.is_empty() {
+        task.analysis_mut().requested_model = Some(requested_model);
+    }
 
     // Create context with the specified working directory and memory
     let llm = Arc::new(OpenRouterClient::new(state.config.api_key.clone()));
