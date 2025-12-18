@@ -94,14 +94,14 @@ function McpCard({
   isSelected,
 }: {
   mcp: McpServerState;
-  onSelect: (mcp: McpServerState) => void;
+  onSelect: (mcp: McpServerState | null) => void;
   isSelected: boolean;
 }) {
   const status = statusConfig[mcp.status];
 
   return (
     <button
-      onClick={() => onSelect(mcp)}
+      onClick={() => onSelect(isSelected ? null : mcp)}
       className={cn(
         "w-full rounded-xl p-4 text-left transition-all",
         "bg-white/[0.02] border hover:bg-white/[0.04]",
@@ -209,12 +209,15 @@ function McpDetailPanel({
         onClick={onClose}
       />
       {/* Panel */}
-      <div className="fixed right-0 top-0 z-50 h-full w-96 flex flex-col glass-panel border-l border-white/[0.06] animate-slide-in-right">
+      <div 
+        className="fixed right-0 top-0 z-50 h-full w-96 flex flex-col glass-panel border-l border-white/[0.06] animate-slide-in-right"
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div className="flex items-start justify-between border-b border-white/[0.06] p-4">
           <div className="flex items-center gap-3">
             <button
-              onClick={onClose}
+              onClick={(e) => { e.stopPropagation(); onClose(); }}
               className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
             >
               <ChevronLeft className="h-5 w-5" />
@@ -228,7 +231,7 @@ function McpDetailPanel({
             </div>
           </div>
           <button
-            onClick={onClose}
+            onClick={(e) => { e.stopPropagation(); onClose(); }}
             className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.04] hover:text-white transition-colors"
           >
             <X className="h-5 w-5" />
