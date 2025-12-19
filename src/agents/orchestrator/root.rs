@@ -741,11 +741,19 @@ impl Agent for RootAgent {
         }
 
         // Simple task: add remaining nodes
-        root_tree.add_child(
+        // Check if there's a model override - show it immediately on the node
+        let requested_model = task.analysis().requested_model.clone();
+        let model_selector_node = if let Some(ref model) = requested_model {
+            AgentTreeNode::new("model-selector", "ModelSelector", "Model Selector", &format!("Using: {}", model))
+                .with_budget(10, 0)
+                .with_status("running")
+                .with_model(model)
+        } else {
             AgentTreeNode::new("model-selector", "ModelSelector", "Model Selector", "Selecting optimal model")
                 .with_budget(10, 0)
                 .with_status("running")
-        );
+        };
+        root_tree.add_child(model_selector_node);
         ctx.emit_tree(root_tree.clone());
 
         ctx.emit_phase("selecting_model", Some("Choosing optimal model..."), Some("RootAgent"));
@@ -782,10 +790,11 @@ impl Agent for RootAgent {
             default_model
         };
 
-        // Update model selector node
+        // Update model selector node with final selected model
         if let Some(node) = root_tree.children.iter_mut().find(|n| n.id == "model-selector") {
             node.status = "completed".to_string();
-            node.selected_model = Some(selected_model);
+            node.selected_model = Some(selected_model.clone());
+            node.description = format!("Using: {}", selected_model);
             node.budget_spent = 3;
         }
 

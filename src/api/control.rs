@@ -394,7 +394,11 @@ pub async fn post_message(
     state
         .control
         .cmd_tx
-        .send(ControlCommand::UserMessage { id, content, model: req.model })
+        .send(ControlCommand::UserMessage {
+            id,
+            content,
+            model: req.model,
+        })
         .await
         .map_err(|_| {
             (
