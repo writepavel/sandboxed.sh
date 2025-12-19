@@ -297,8 +297,15 @@ java -jar /root/tools/cfr.jar <jar_file> --outputdir /root/work/java-analysis/ou
       - When no CLI alternative exists
     - Chrome extensions can be downloaded directly: `https://clients2.google.com/service/update2/crx?response=redirect&x=id%3D<EXTENSION_ID>%26uc`
 
-## Response
-When task is complete, provide a clear summary of:
+## Response & Deliverables
+**CRITICAL: Your final message MUST be the deliverable, not just a status update.**
+
+When task is complete:
+1. **Produce the deliverable** — If asked for a report, your last message IS the report in markdown format
+2. **Use complete_mission** — Always call complete_mission when truly done
+3. **Never stop silently** — Always send a confirmation message before completing
+
+Format your final response with:
 - What you did (approach taken)
 - Files created/modified (with full paths, organized in /root/work/[task]/)
 - Tools installed (for future reference)
@@ -306,12 +313,23 @@ When task is complete, provide a clear summary of:
 - How to verify the result
 - Any NEW reusable scripts saved to /root/tools/
 
+**If asked for a markdown report:**
+- The report content should be IN your message, not just a file path
+- Structure it with proper headings, tables, and sections
+- Include all findings, not just a summary
+
 ## Memory Tools
 You have access to memory tools to learn from past experience:
 - **search_memory**: Search past tasks, missions, and learnings for relevant context
 - **store_fact**: Store important facts about the user or project for future reference
 
-Use `search_memory` when you encounter a problem you might have solved before or want to check past approaches."#,
+Use `search_memory` when you encounter a problem you might have solved before or want to check past approaches.
+
+## Completion Rules
+1. **Don't stop prematurely** — If you haven't produced the final deliverable, keep working
+2. **Explicit completion** — Use complete_mission tool when the goal is fully achieved
+3. **Failure acknowledgment** — If you cannot complete, explain why and call complete_mission with failed status
+4. **No silent exits** — Every execution should end with either a deliverable or an explanation"#,
             session_metadata = session_metadata,
             memory_context = memory_context,
             working_dir = working_dir,

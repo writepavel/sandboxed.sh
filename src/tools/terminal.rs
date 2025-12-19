@@ -22,6 +22,54 @@ fn resolve_path(path_str: &str, working_dir: &Path) -> PathBuf {
     }
 }
 
+/// Dangerous command patterns that should be blocked.
+/// These patterns cause infinite loops or could damage the system.
+const DANGEROUS_PATTERNS: &[(&str, &str)] = &[
+    ("find /", "Use 'find /root/work/' or a specific directory path"),
+    ("find / ", "Use 'find /root/work/' or a specific directory path"),
+    ("grep -r /", "Use 'grep -r /root/' or a specific directory path"),
+    ("grep -rn /", "Use 'grep -rn /root/' or a specific directory path"),
+    ("grep -R /", "Use 'grep -R /root/' or a specific directory path"),
+    ("ls -laR /", "Use a specific directory path instead of root"),
+    ("du -sh /", "Use a specific directory path instead of root"),
+    ("du -a /", "Use a specific directory path instead of root"),
+    ("rm -rf /", "This would destroy the entire system"),
+    ("rm -rf /*", "This would destroy the entire system"),
+    ("> /dev/", "Writing to device files is blocked"),
+    ("dd if=/dev/", "Direct disk operations are blocked"),
+];
+
+/// Validate a command against dangerous patterns.
+/// Returns Ok(()) if safe, Err with suggestion if blocked.
+fn validate_command(cmd: &str) -> Result<(), String> {
+    let cmd_trimmed = cmd.trim();
+    
+    for (pattern, suggestion) in DANGEROUS_PATTERNS {
+        // Check if command starts with the dangerous pattern
+        if cmd_trimmed.starts_with(pattern) {
+            return Err(format!(
+                "Blocked dangerous command pattern '{}'. {}",
+                pattern, suggestion
+            ));
+        }
+        // Also check for the pattern after common prefixes (sudo, time, etc.)
+        let prefixes = ["sudo ", "time ", "nice ", "nohup "];
+        for prefix in prefixes {
+            if cmd_trimmed.starts_with(prefix) {
+                let after_prefix = &cmd_trimmed[prefix.len()..];
+                if after_prefix.starts_with(pattern) {
+                    return Err(format!(
+                        "Blocked dangerous command pattern '{}'. {}",
+                        pattern, suggestion
+                    ));
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 /// Run a shell command.
 pub struct RunCommand;
 
@@ -60,6 +108,13 @@ impl Tool for RunCommand {
         let command = args["command"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' argument"))?;
+        
+        // Validate command against dangerous patterns
+        if let Err(msg) = validate_command(command) {
+            tracing::warn!("Blocked dangerous command: {}", command);
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+        
         let cwd = args["cwd"]
             .as_str()
             .map(|p| resolve_path(p, working_dir))

@@ -281,6 +281,9 @@ pub struct Mission {
     pub id: Uuid,
     pub status: MissionStatus,
     pub title: Option<String>,
+    /// Model override requested for this mission
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
     pub history: Vec<MissionHistoryEntry>,
     pub created_at: String,
     pub updated_at: String,
@@ -495,6 +498,7 @@ pub async fn list_missions(
                 id: m.id,
                 status,
                 title: m.title,
+                model_override: m.model_override,
                 history,
                 created_at: m.created_at,
                 updated_at: m.updated_at,
@@ -536,6 +540,7 @@ pub async fn get_mission(
         id: db_mission.id,
         status,
         title: db_mission.title,
+        model_override: db_mission.model_override,
         history,
         created_at: db_mission.created_at,
         updated_at: db_mission.updated_at,
@@ -670,6 +675,7 @@ pub async fn get_current_mission(
                         id: m.id,
                         status,
                         title: m.title,
+                        model_override: m.model_override,
                         history,
                         created_at: m.created_at,
                         updated_at: m.updated_at,
@@ -909,6 +915,7 @@ async fn control_actor_loop(
             id: db_mission.id,
             status,
             title: db_mission.title,
+            model_override: db_mission.model_override,
             history,
             created_at: db_mission.created_at,
             updated_at: db_mission.updated_at,
@@ -916,11 +923,11 @@ async fn control_actor_loop(
     }
 
     // Helper to create a new mission
-    async fn create_new_mission(memory: &Option<MemorySystem>) -> Result<Mission, String> {
+    async fn create_new_mission(memory: &Option<MemorySystem>, model_override: Option<&str>) -> Result<Mission, String> {
         let mem = memory.as_ref().ok_or("Memory not configured")?;
         let db_mission = mem
             .supabase
-            .create_mission(None)
+            .create_mission(None, model_override)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -928,6 +935,7 @@ async fn control_actor_loop(
             id: db_mission.id,
             status: MissionStatus::Active,
             title: db_mission.title,
+            model_override: db_mission.model_override,
             history: vec![],
             created_at: db_mission.created_at,
             updated_at: db_mission.updated_at,
@@ -944,9 +952,9 @@ async fn control_actor_loop(
                         {
                             let mission_id = current_mission.read().await.clone();
                             if mission_id.is_none() {
-                                if let Ok(new_mission) = create_new_mission(&memory).await {
+                                if let Ok(new_mission) = create_new_mission(&memory, model.as_deref()).await {
                                     *current_mission.write().await = Some(new_mission.id);
-                                    tracing::info!("Auto-created mission: {}", new_mission.id);
+                                    tracing::info!("Auto-created mission: {} (model: {:?})", new_mission.id, model);
                                 }
                             }
                         }
@@ -1044,8 +1052,8 @@ async fn control_actor_loop(
                         // First persist current mission history
                         persist_mission_history(&memory, &current_mission, &history).await;
 
-                        // Create a new mission
-                        match create_new_mission(&memory).await {
+                        // Create a new mission (no model override for explicit creation)
+                        match create_new_mission(&memory, None).await {
                             Ok(mission) => {
                                 history.clear();
                                 *current_mission.write().await = Some(mission.id);

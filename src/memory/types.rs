@@ -320,6 +320,9 @@ pub struct DbMission {
     pub id: Uuid,
     pub status: String,
     pub title: Option<String>,
+    /// Model override requested for this mission
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
     /// Conversation history as JSON array of {role, content} objects
     pub history: serde_json::Value,
     pub created_at: String,

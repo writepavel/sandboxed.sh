@@ -601,45 +601,54 @@ impl Agent for ModelSelector {
             (None, false)
         };
         
-        // If user explicitly requested a model (possibly upgraded) and it's available, use it directly
+        // If user explicitly requested a model (possibly upgraded), use it directly
+        // This bypasses the allowlist check - user knows what they want
         if let Some(ref req_model) = resolved_model {
-            if models.iter().any(|m| &m.model_id == req_model) {
-                let upgrade_note = if was_upgraded {
-                    format!(" (auto-upgraded from {})", requested_model.as_deref().unwrap_or("unknown"))
-                } else {
-                    String::new()
-                };
-                
-                tracing::info!(
-                    "Using requested model directly: {}{}",
+            let in_allowlist = models.iter().any(|m| &m.model_id == req_model);
+            let upgrade_note = if was_upgraded {
+                format!(" (auto-upgraded from {})", requested_model.as_deref().unwrap_or("unknown"))
+            } else {
+                String::new()
+            };
+            
+            if !in_allowlist {
+                tracing::warn!(
+                    "Requested model {} not in allowlist, but using it anyway (user override){}",
                     req_model,
                     upgrade_note
                 );
-                
-                // Record selection in analysis
-                {
-                    let a = task.analysis_mut();
-                    a.selected_model = Some(req_model.clone());
-                    a.estimated_cost_cents = Some(50); // Default estimate
-                }
-
-                return AgentResult::success(
-                    &format!("Using requested model: {}{}", req_model, upgrade_note),
-                    1,
-                )
-                .with_data(json!({
-                    "model_id": req_model,
-                    "expected_cost_cents": 50,
-                    "confidence": 1.0,
-                    "reasoning": format!("User requested model: {}{}", req_model, upgrade_note),
-                    "fallbacks": [],
-                    "used_historical_data": false,
-                    "used_benchmark_data": false,
-                    "was_upgraded": was_upgraded,
-                    "original_model": requested_model,
-                    "task_type": format!("{:?}", task_type),
-                }));
             }
+            
+            tracing::info!(
+                "Using requested model directly: {}{}",
+                req_model,
+                upgrade_note
+            );
+            
+            // Record selection in analysis
+            {
+                let a = task.analysis_mut();
+                a.selected_model = Some(req_model.clone());
+                a.estimated_cost_cents = Some(50); // Default estimate
+            }
+
+            return AgentResult::success(
+                &format!("Using requested model: {}{}", req_model, upgrade_note),
+                1,
+            )
+            .with_data(json!({
+                "model_id": req_model,
+                "expected_cost_cents": 50,
+                "confidence": 1.0,
+                "reasoning": format!("User requested model: {}{}", req_model, upgrade_note),
+                "fallbacks": [],
+                "used_historical_data": false,
+                "used_benchmark_data": false,
+                "was_upgraded": was_upgraded,
+                "original_model": requested_model,
+                "task_type": format!("{:?}", task_type),
+                "in_allowlist": in_allowlist,
+            }));
         }
 
         match self.select_optimal(

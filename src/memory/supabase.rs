@@ -512,12 +512,17 @@ impl SupabaseClient {
     // ==================== Missions ====================
     
     /// Create a new mission.
-    pub async fn create_mission(&self, title: Option<&str>) -> anyhow::Result<DbMission> {
-        let body = serde_json::json!({
+    pub async fn create_mission(&self, title: Option<&str>, model_override: Option<&str>) -> anyhow::Result<DbMission> {
+        let mut body = serde_json::json!({
             "title": title,
             "status": "active",
             "history": []
         });
+        
+        // Add model_override if provided (column may not exist in older schemas)
+        if let Some(model) = model_override {
+            body["model_override"] = serde_json::Value::String(model.to_string());
+        }
         
         let resp = self.client
             .post(format!("{}/missions", self.rest_url()))
