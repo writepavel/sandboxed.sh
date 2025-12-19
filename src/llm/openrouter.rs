@@ -111,16 +111,19 @@ impl OpenRouterClient {
             .next()
             .ok_or_else(|| LlmError::parse_error("No choices in response".to_string()))?;
 
+        // Get reasoning using the flexible parser that handles both string and array formats
+        let reasoning = choice.message.get_reasoning();
+        
         // Log if we received reasoning blocks (for debugging thinking models)
-        if let Some(ref reasoning) = choice.message.reasoning {
-            let has_thought_sig = reasoning.iter().any(|r| r.thought_signature.is_some());
+        if let Some(ref reasoning_blocks) = reasoning {
+            let has_thought_sig = reasoning_blocks.iter().any(|r| r.thought_signature.is_some());
             tracing::debug!(
                 "Received {} reasoning blocks from model (has_thought_signature: {})",
-                reasoning.len(),
+                reasoning_blocks.len(),
                 has_thought_sig
             );
             // Log thought_signature details for debugging Gemini issues
-            for (i, r) in reasoning.iter().enumerate() {
+            for (i, r) in reasoning_blocks.iter().enumerate() {
                 if r.thought_signature.is_some() {
                     tracing::debug!("Reasoning block {} has thought_signature", i);
                 }
@@ -152,7 +155,7 @@ impl OpenRouterClient {
                 .usage
                 .map(|u| TokenUsage::new(u.prompt_tokens, u.completion_tokens)),
             model: parsed.model.or_else(|| Some(request.model.clone())),
-            reasoning: choice.message.reasoning,
+            reasoning,
         })
     }
 
@@ -313,11 +316,55 @@ struct OpenRouterChoice {
 struct OpenRouterMessage {
     content: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
-    /// Reasoning blocks from "thinking" models (Gemini 3, etc.)
+    /// Reasoning text as a plain string (some models like Kimi return this).
+    /// We'll merge this with reasoning_details if both are present.
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+    /// Reasoning blocks from "thinking" models (Gemini 3, Kimi, etc.)
     /// Contains thought_signature that must be preserved for tool call continuations.
-    /// OpenRouter uses `reasoning` or `reasoning_details` depending on the model/provider.
-    #[serde(default, alias = "reasoning_details")]
-    reasoning: Option<Vec<ReasoningContent>>,
+    #[serde(default)]
+    reasoning_details: Option<Vec<ReasoningContent>>,
+}
+
+impl OpenRouterMessage {
+    /// Get reasoning content, handling both string and array formats.
+    /// Some models (Kimi) return `reasoning` as a string AND `reasoning_details` as an array.
+    /// Other models (Gemini) may put thought_signature in the array.
+    fn get_reasoning(&self) -> Option<Vec<ReasoningContent>> {
+        // Prefer reasoning_details if available (it's the structured format)
+        if let Some(ref details) = self.reasoning_details {
+            if !details.is_empty() {
+                return Some(details.clone());
+            }
+        }
+        
+        // Fall back to reasoning field - could be string or array
+        if let Some(ref reasoning) = self.reasoning {
+            match reasoning {
+                serde_json::Value::String(s) => {
+                    // Single string reasoning - convert to ReasoningContent
+                    return Some(vec![ReasoningContent {
+                        content: Some(s.clone()),
+                        thought_signature: None,
+                        reasoning_type: Some("thinking".to_string()),
+                        format: None,
+                        index: None,
+                    }]);
+                }
+                serde_json::Value::Array(arr) => {
+                    // Array of reasoning blocks - try to parse
+                    if let Ok(blocks) = serde_json::from_value::<Vec<ReasoningContent>>(
+                        serde_json::Value::Array(arr.clone())
+                    ) {
+                        return Some(blocks);
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        None
+    }
 }
 
 /// Usage data (OpenAI-compatible).
