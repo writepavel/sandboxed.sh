@@ -749,4 +749,44 @@ impl McpRegistry {
     pub async fn is_tool_enabled(&self, name: &str) -> bool {
         !self.disabled_tools.read().await.contains(name)
     }
+
+    /// Find a tool by name and return its MCP ID if found.
+    pub async fn find_tool(&self, name: &str) -> Option<McpTool> {
+        let states = self.states.read().await;
+        let disabled = self.disabled_tools.read().await;
+
+        for state in states.values() {
+            if state.config.enabled && state.status == McpStatus::Connected {
+                for descriptor in &state.config.tool_descriptors {
+                    if descriptor.name == name && !disabled.contains(&descriptor.name) {
+                        return Some(McpTool {
+                            name: descriptor.name.clone(),
+                            description: descriptor.description.clone(),
+                            parameters_schema: descriptor.input_schema.clone(),
+                            mcp_id: state.config.id,
+                            enabled: true,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get tool schemas in LLM-compatible format for all connected MCP tools.
+    pub async fn get_tool_schemas(&self) -> Vec<crate::llm::ToolDefinition> {
+        self.list_tools()
+            .await
+            .into_iter()
+            .filter(|t| t.enabled)
+            .map(|t| crate::llm::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: crate::llm::FunctionDefinition {
+                    name: t.name,
+                    description: t.description,
+                    parameters: t.parameters_schema,
+                },
+            })
+            .collect()
+    }
 }

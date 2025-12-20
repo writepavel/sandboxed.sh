@@ -265,6 +265,11 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Check if a tool exists by name.
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     /// Get tool schemas in LLM-compatible format.
     pub fn get_tool_schemas(&self) -> Vec<ToolDefinition> {
         self.tools

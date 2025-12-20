@@ -192,16 +192,23 @@ impl TaskExecutor {
         &self,
         working_dir: &str,
         tools: &ToolRegistry,
+        mcp_tool_descriptions: &str,
         reusable_tools: &str,
         session_metadata: &str,
         memory_context: &str,
     ) -> String {
-        let tool_descriptions = tools
+        let mut tool_descriptions = tools
             .list_tools()
             .iter()
             .map(|t| format!("- **{}**: {}", t.name, t.description))
             .collect::<Vec<_>>()
             .join("\n");
+
+        // Append MCP tool descriptions if any
+        if !mcp_tool_descriptions.is_empty() {
+            tool_descriptions.push_str("\n\n### MCP Tools (External Integrations)\n");
+            tool_descriptions.push_str(mcp_tool_descriptions);
+        }
 
         // Check if we're in mission mode (isolated working directory)
         let is_mission_mode = working_dir.contains("mission-");
@@ -476,17 +483,33 @@ Use `search_memory` when you encounter a problem you might have solved before or
     }
 
     /// Execute a single tool call.
+    /// 
+    /// Routes to built-in tools first, then falls back to MCP tools.
     async fn execute_tool_call(
         &self,
         tool_call: &ToolCall,
         ctx: &AgentContext,
     ) -> anyhow::Result<String> {
+        let tool_name = &tool_call.function.name;
         let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
             .unwrap_or(serde_json::Value::Null);
 
-        ctx.tools
-            .execute(&tool_call.function.name, args, &ctx.working_dir)
-            .await
+        // Try built-in tools first
+        if ctx.tools.has_tool(tool_name) {
+            return ctx.tools
+                .execute(tool_name, args, &ctx.working_dir)
+                .await;
+        }
+
+        // Try MCP tools
+        if let Some(mcp) = &ctx.mcp {
+            if let Some(mcp_tool) = mcp.find_tool(tool_name).await {
+                tracing::debug!("Routing tool call '{}' to MCP server", tool_name);
+                return mcp.call_tool(mcp_tool.mcp_id, tool_name, args).await;
+            }
+        }
+
+        anyhow::bail!("Unknown tool: {}", tool_name)
     }
 
     /// Run the agent loop for a task.
@@ -536,10 +559,32 @@ Use `search_memory` when you encounter a problem you might have solved before or
         // Get tool result truncation limit from config
         let max_tool_result_chars = ctx.config.context.max_tool_result_chars;
 
+        // Get MCP tool descriptions and schemas
+        let (mcp_tool_descriptions, mcp_tool_schemas) = if let Some(mcp) = &ctx.mcp {
+            let mcp_tools = mcp.list_tools().await;
+            let enabled_tools: Vec<_> = mcp_tools.iter().filter(|t| t.enabled).collect();
+            
+            if !enabled_tools.is_empty() {
+                tracing::info!("Discovered {} MCP tools", enabled_tools.len());
+            }
+            
+            let descriptions = enabled_tools
+                .iter()
+                .map(|t| format!("- **{}**: {}", t.name, t.description))
+                .collect::<Vec<_>>()
+                .join("\n");
+            
+            let schemas = mcp.get_tool_schemas().await;
+            (descriptions, schemas)
+        } else {
+            (String::new(), Vec::new())
+        };
+
         // Build initial messages with all context
         let system_prompt = self.build_system_prompt(
             &ctx.working_dir_str(),
             &ctx.tools,
+            &mcp_tool_descriptions,
             &reusable_tools,
             &session_metadata,
             &memory_context,
@@ -549,8 +594,9 @@ Use `search_memory` when you encounter a problem you might have solved before or
             ChatMessage::new(Role::User, task.description().to_string()),
         ];
 
-        // Get tool schemas
-        let tool_schemas = ctx.tools.get_tool_schemas();
+        // Get tool schemas (built-in + MCP)
+        let mut tool_schemas = ctx.tools.get_tool_schemas();
+        tool_schemas.extend(mcp_tool_schemas);
 
         // Agent loop
         for iteration in 0..ctx.max_iterations {

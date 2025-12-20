@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::budget::{ModelPricing, SharedBenchmarkRegistry, SharedModelResolver};
 use crate::config::Config;
 use crate::llm::LlmClient;
+use crate::mcp::McpRegistry;
 use crate::memory::MemorySystem;
 use crate::tools::ToolRegistry;
 use crate::tools::mission::MissionControl;
@@ -77,6 +78,9 @@ pub struct AgentContext {
     
     /// Mission ID for tagging events (used in parallel mission execution).
     pub mission_id: Option<Uuid>,
+    
+    /// MCP registry for dynamic tool discovery and execution.
+    pub mcp: Option<Arc<McpRegistry>>,
 }
 
 impl AgentContext {
@@ -107,6 +111,7 @@ impl AgentContext {
             tree_snapshot: None,
             progress_snapshot: None,
             mission_id: None,
+            mcp: None,
         }
     }
     
@@ -138,6 +143,7 @@ impl AgentContext {
             tree_snapshot: None,
             progress_snapshot: None,
             mission_id: None,
+            mcp: None,
         }
     }
 
@@ -165,6 +171,7 @@ impl AgentContext {
             tree_snapshot: self.tree_snapshot.clone(),
             progress_snapshot: self.progress_snapshot.clone(),
             mission_id: self.mission_id,
+            mcp: self.mcp.clone(),
         }
     }
 

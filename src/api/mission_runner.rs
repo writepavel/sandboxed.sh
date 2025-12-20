@@ -23,6 +23,7 @@ use crate::agents::{AgentContext, AgentRef, AgentResult};
 use crate::budget::{Budget, ModelPricing, SharedBenchmarkRegistry, SharedModelResolver};
 use crate::config::Config;
 use crate::llm::OpenRouterClient;
+use crate::mcp::McpRegistry;
 use crate::memory::{ContextBuilder, MemorySystem};
 use crate::task::{VerificationCriteria, DeliverableSet, extract_deliverables};
 use crate::tools::ToolRegistry;
@@ -224,6 +225,7 @@ impl MissionRunner {
         memory: Option<MemorySystem>,
         benchmarks: SharedBenchmarkRegistry,
         resolver: SharedModelResolver,
+        mcp: Arc<McpRegistry>,
         pricing: Arc<ModelPricing>,
         events_tx: broadcast::Sender<AgentEvent>,
         tool_hub: Arc<FrontendToolHub>,
@@ -275,6 +277,7 @@ impl MissionRunner {
                 memory,
                 benchmarks,
                 resolver,
+                mcp,
                 pricing,
                 events_tx,
                 tool_hub,
@@ -360,6 +363,7 @@ async fn run_mission_turn(
     memory: Option<MemorySystem>,
     benchmarks: SharedBenchmarkRegistry,
     resolver: SharedModelResolver,
+    mcp: Arc<McpRegistry>,
     pricing: Arc<ModelPricing>,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
@@ -477,6 +481,7 @@ async fn run_mission_turn(
     ctx.tree_snapshot = Some(tree_snapshot);
     ctx.progress_snapshot = Some(progress_snapshot);
     ctx.mission_id = Some(mission_id);
+    ctx.mcp = Some(mcp);
 
     root_agent.execute(&mut task, &ctx).await
 }

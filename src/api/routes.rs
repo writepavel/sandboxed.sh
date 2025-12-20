@@ -84,7 +84,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Spawn the single global control session actor.
     let control_state =
-        control::spawn_control_session(config.clone(), Arc::clone(&root_agent), memory.clone(), Arc::clone(&benchmarks), Arc::clone(&resolver));
+        control::spawn_control_session(config.clone(), Arc::clone(&root_agent), memory.clone(), Arc::clone(&benchmarks), Arc::clone(&resolver), Arc::clone(&mcp));
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -365,6 +365,7 @@ async fn run_agent_task(
     );
     ctx.benchmarks = Some(Arc::clone(&state.benchmarks));
     ctx.resolver = Some(Arc::clone(&state.resolver));
+    ctx.mcp = Some(Arc::clone(&state.mcp));
 
     // Create a run in memory if available
     let memory_run_id = if let Some(ref mem) = state.memory {

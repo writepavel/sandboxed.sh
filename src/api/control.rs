@@ -27,6 +27,7 @@ use crate::agents::{AgentContext, AgentRef};
 use crate::budget::{Budget, ModelPricing};
 use crate::config::Config;
 use crate::llm::OpenRouterClient;
+use crate::mcp::McpRegistry;
 use crate::memory::{ContextBuilder, MemorySystem, MissionMessage};
 use crate::task::VerificationCriteria;
 use crate::tools::ToolRegistry;
@@ -949,6 +950,7 @@ pub fn spawn_control_session(
     memory: Option<MemorySystem>,
     benchmarks: crate::budget::SharedBenchmarkRegistry,
     resolver: crate::budget::SharedModelResolver,
+    mcp: Arc<McpRegistry>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
     let (events_tx, _events_rx) = broadcast::channel::<AgentEvent>(1024);
@@ -987,6 +989,7 @@ pub fn spawn_control_session(
         memory.clone(),
         benchmarks,
         resolver,
+        mcp,
         cmd_rx,
         mission_cmd_rx,
         mission_cmd_tx,
@@ -1067,6 +1070,7 @@ async fn control_actor_loop(
     memory: Option<MemorySystem>,
     benchmarks: crate::budget::SharedBenchmarkRegistry,
     resolver: crate::budget::SharedModelResolver,
+    mcp: Arc<McpRegistry>,
     mut cmd_rx: mpsc::Receiver<ControlCommand>,
     mut mission_cmd_rx: mpsc::Receiver<crate::tools::mission::MissionControlCommand>,
     mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
@@ -1257,6 +1261,7 @@ async fn control_actor_loop(
                                 let mem = memory.clone();
                                 let bench = Arc::clone(&benchmarks);
                                 let res = Arc::clone(&resolver);
+                                let mcp_ref = Arc::clone(&mcp);
                                 let events = events_tx.clone();
                                 let tools_hub = Arc::clone(&tool_hub);
                                 let status_ref = Arc::clone(&status);
@@ -1277,6 +1282,7 @@ async fn control_actor_loop(
                                         mem,
                                         bench,
                                         res,
+                                        mcp_ref,
                                         pricing,
                                         events,
                                         tools_hub,
@@ -1410,6 +1416,7 @@ async fn control_actor_loop(
                                 memory.clone(),
                                 Arc::clone(&benchmarks),
                                 Arc::clone(&resolver),
+                                Arc::clone(&mcp),
                                 Arc::clone(&pricing),
                                 events_tx.clone(),
                                 Arc::clone(&tool_hub),
@@ -1582,6 +1589,7 @@ async fn control_actor_loop(
                     let mem = memory.clone();
                     let bench = Arc::clone(&benchmarks);
                     let res = Arc::clone(&resolver);
+                    let mcp_ref = Arc::clone(&mcp);
                     let events = events_tx.clone();
                     let tools_hub = Arc::clone(&tool_hub);
                     let status_ref = Arc::clone(&status);
@@ -1602,6 +1610,7 @@ async fn control_actor_loop(
                             mem,
                             bench,
                             res,
+                            mcp_ref,
                             pricing,
                             events,
                             tools_hub,
@@ -1680,6 +1689,7 @@ async fn run_single_control_turn(
     memory: Option<MemorySystem>,
     benchmarks: crate::budget::SharedBenchmarkRegistry,
     resolver: crate::budget::SharedModelResolver,
+    mcp: Arc<McpRegistry>,
     pricing: Arc<ModelPricing>,
     events_tx: broadcast::Sender<AgentEvent>,
     tool_hub: Arc<FrontendToolHub>,
@@ -1746,6 +1756,7 @@ async fn run_single_control_turn(
     ctx.resolver = Some(resolver);
     ctx.tree_snapshot = Some(tree_snapshot);
     ctx.progress_snapshot = Some(progress_snapshot);
+    ctx.mcp = Some(mcp);
 
     let result = root_agent.execute(&mut task, &ctx).await;
     result
