@@ -12,6 +12,7 @@
 //! This encourages agents to stay within their assigned workspace while preserving
 //! flexibility for tasks that require broader access.
 
+mod browser;
 mod desktop;
 mod directory;
 mod file_ops;
@@ -200,6 +201,50 @@ impl ToolRegistry {
 
         // Storage (image upload - requires Supabase)
         tools.insert("upload_image".to_string(), Arc::new(storage::UploadImage));
+
+        // Browser automation (conditional on BROWSER_ENABLED)
+        if std::env::var("BROWSER_ENABLED")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false)
+        {
+            tracing::info!("Registering browser automation tools (BROWSER_ENABLED=true)");
+            tools.insert(
+                "browser_navigate".to_string(),
+                Arc::new(browser::BrowserNavigate),
+            );
+            tools.insert(
+                "browser_screenshot".to_string(),
+                Arc::new(browser::BrowserScreenshot),
+            );
+            tools.insert(
+                "browser_get_content".to_string(),
+                Arc::new(browser::BrowserGetContent),
+            );
+            tools.insert(
+                "browser_click".to_string(),
+                Arc::new(browser::BrowserClick),
+            );
+            tools.insert(
+                "browser_type".to_string(),
+                Arc::new(browser::BrowserType),
+            );
+            tools.insert(
+                "browser_evaluate".to_string(),
+                Arc::new(browser::BrowserEvaluate),
+            );
+            tools.insert(
+                "browser_wait".to_string(),
+                Arc::new(browser::BrowserWait),
+            );
+            tools.insert(
+                "browser_close".to_string(),
+                Arc::new(browser::BrowserClose),
+            );
+            tools.insert(
+                "browser_list_elements".to_string(),
+                Arc::new(browser::BrowserListElements),
+            );
+        }
 
         // Desktop automation (conditional on DESKTOP_ENABLED)
         if std::env::var("DESKTOP_ENABLED")
