@@ -8,8 +8,10 @@
 //! - Cancellation token
 //! - Deliverable tracking
 //! - Health monitoring
+//! - Working directory (isolated per mission)
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -107,6 +109,22 @@ pub struct MissionRunner {
     
     /// Whether complete_mission was explicitly called
     pub explicitly_completed: bool,
+}
+
+/// Compute the working directory path for a mission.
+/// Format: /root/work/mission-{first 8 chars of UUID}/
+pub fn mission_working_dir(base_work_dir: &std::path::Path, mission_id: Uuid) -> PathBuf {
+    let short_id = &mission_id.to_string()[..8];
+    base_work_dir.join(format!("mission-{}", short_id))
+}
+
+/// Ensure the mission working directory exists with proper structure.
+/// Creates: mission-xxx/, mission-xxx/output/, mission-xxx/temp/
+pub fn ensure_mission_dir(base_work_dir: &std::path::Path, mission_id: Uuid) -> std::io::Result<PathBuf> {
+    let dir = mission_working_dir(base_work_dir, mission_id);
+    std::fs::create_dir_all(dir.join("output"))?;
+    std::fs::create_dir_all(dir.join("temp"))?;
+    Ok(dir)
 }
 
 impl MissionRunner {
@@ -353,11 +371,11 @@ async fn run_mission_turn(
     mission_control: Option<crate::tools::mission::MissionControl>,
     tree_snapshot: Arc<RwLock<Option<AgentTreeNode>>>,
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
-    _mission_id: Uuid,
+    mission_id: Uuid,
 ) -> AgentResult {
-    // Build context with history
-    let working_dir = config.working_dir.to_string_lossy().to_string();
-    let context_builder = ContextBuilder::new(&config.context, &working_dir);
+    // Build context with history (use base working dir for context lookup)
+    let base_working_dir = config.working_dir.to_string_lossy().to_string();
+    let context_builder = ContextBuilder::new(&config.context, &base_working_dir);
     let history_context = context_builder.build_history_context(&history);
 
     // Extract deliverables to include in instructions
@@ -421,6 +439,20 @@ async fn run_mission_turn(
     // Create LLM client
     let llm = Arc::new(OpenRouterClient::new(config.api_key.clone()));
 
+    // Ensure mission working directory exists
+    // This creates /root/work/mission-{short_id}/ with output/ and temp/ subdirs
+    let base_work_dir = config.working_dir.join("work");
+    let mission_work_dir = match ensure_mission_dir(&base_work_dir, mission_id) {
+        Ok(dir) => {
+            tracing::info!("Mission {} working directory: {}", mission_id, dir.display());
+            dir
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create mission directory, using default: {}", e);
+            config.working_dir.clone()
+        }
+    };
+
     // Create shared memory reference for memory tools
     let shared_memory: Option<crate::tools::memory::SharedMemory> = memory
         .as_ref()
@@ -432,7 +464,7 @@ async fn run_mission_turn(
         llm,
         tools,
         pricing,
-        config.working_dir.clone(),
+        mission_work_dir,
         memory,
     );
     ctx.mission_control = mission_control;

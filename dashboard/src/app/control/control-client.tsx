@@ -716,28 +716,27 @@ export default function ControlClient() {
       // Filter events by mission_id - only show events for the mission we're viewing
       const viewingId = viewingMissionIdRef.current;
       const eventMissionId = isRecord(data) && data["mission_id"] ? String(data["mission_id"]) : null;
-      const runningList = runningMissionsRef.current;
       const currentMissionId = currentMissionRef.current?.id;
       
-      // Check if we're viewing a parallel mission (one that's in the running list but not the current main mission)
-      const isViewingParallelMission = viewingId && runningList.some(
-        rm => rm.mission_id === viewingId && currentMissionId !== viewingId
-      );
-      
-      // If viewing a parallel mission, only show events from that specific mission
-      // Events without mission_id are from the main session - skip them when viewing parallel
-      if (isViewingParallelMission) {
-        if (!eventMissionId || eventMissionId !== viewingId) {
-          // Allow status events through for state updates, but not content events
-          if (event.type !== "status") {
-            return;
+      // If we're viewing a specific mission, filter events strictly
+      if (viewingId) {
+        // Event has a mission_id - must match viewing mission
+        if (eventMissionId) {
+          if (eventMissionId !== viewingId) {
+            // Event is from a different mission - only allow status events
+            if (event.type !== "status") {
+              return;
+            }
           }
-        }
-      } else if (eventMissionId && viewingId && eventMissionId !== viewingId) {
-        // We're viewing the main session but got an event from a different mission
-        // Skip non-status events from other missions
-        if (event.type !== "status") {
-          return;
+        } else {
+          // Event has NO mission_id (from main session)
+          // Only show if we're viewing the current/main mission
+          if (viewingId !== currentMissionId) {
+            // We're viewing a parallel mission, skip main session events
+            if (event.type !== "status") {
+              return;
+            }
+          }
         }
       }
 
@@ -1184,94 +1183,79 @@ export default function ControlClient() {
         </div>
       </div>
 
-      {/* Parallel Missions Panel */}
+      {/* Running Missions Panel - Compact horizontal layout */}
       {showParallelPanel && runningMissions.length > 0 && (
-        <div className="mb-4 rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
-          <div className="flex items-center justify-between mb-3">
-            <div className="flex items-center gap-2">
-              <Layers className="h-4 w-4 text-indigo-400" />
-              <h3 className="text-sm font-medium text-white">Running Missions</h3>
-            </div>
+        <div className="mb-4 flex items-center gap-2 overflow-x-auto pb-1">
+          <div className="flex items-center gap-1.5 shrink-0 text-white/40">
+            <Layers className="h-3.5 w-3.5" />
+            <span className="text-xs font-medium">Running Missions</span>
             <button
               onClick={async () => {
                 const running = await getRunningMissions();
                 setRunningMissions(running);
               }}
-              className="p-1 rounded hover:bg-white/[0.04] text-white/40 hover:text-white/70 transition-colors"
+              className="p-0.5 rounded hover:bg-white/[0.04] hover:text-white/70 transition-colors"
               title="Refresh"
             >
-              <RefreshCw className="h-3.5 w-3.5" />
+              <RefreshCw className="h-3 w-3" />
             </button>
           </div>
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {runningMissions.map((mission) => {
-              const isViewingMission = viewingMissionId === mission.mission_id;
-              const isStalled = mission.state === "running" && mission.seconds_since_activity > 60;
-              const isSeverlyStalled = mission.state === "running" && mission.seconds_since_activity > 120;
-              return (
+          
+          {runningMissions.map((mission) => {
+            const isViewingMission = viewingMissionId === mission.mission_id;
+            const isStalled = mission.state === "running" && mission.seconds_since_activity > 60;
+            const isSeverlyStalled = mission.state === "running" && mission.seconds_since_activity > 120;
+            
+            return (
+              <div
+                key={mission.mission_id}
+                onClick={() => handleViewMission(mission.mission_id)}
+                className={cn(
+                  "flex items-center gap-2 rounded-lg border px-2.5 py-1.5 transition-colors cursor-pointer shrink-0",
+                  isViewingMission
+                    ? "border-indigo-500/30 bg-indigo-500/10"
+                    : isSeverlyStalled
+                    ? "border-red-500/30 bg-red-500/10"
+                    : isStalled
+                    ? "border-amber-500/30 bg-amber-500/10"
+                    : "border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04]"
+                )}
+              >
                 <div
-                  key={mission.mission_id}
-                  onClick={() => handleViewMission(mission.mission_id)}
                   className={cn(
-                    "flex items-center justify-between rounded-lg border p-3 transition-colors cursor-pointer",
-                    isViewingMission
-                      ? "border-indigo-500/30 bg-indigo-500/10"
-                      : isSeverlyStalled
-                      ? "border-red-500/30 bg-red-500/10"
-                      : isStalled
-                      ? "border-amber-500/30 bg-amber-500/10"
-                      : "border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04]"
+                    "h-1.5 w-1.5 rounded-full shrink-0",
+                    isSeverlyStalled ? "bg-red-400" :
+                    isStalled ? "bg-amber-400 animate-pulse" :
+                    mission.state === "running" ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
                   )}
+                />
+                <span className="text-xs font-medium text-white truncate max-w-[140px]">
+                  {mission.model_override?.split('/').pop() || "Default"}
+                </span>
+                <span className="text-[10px] text-white/40 tabular-nums">
+                  {mission.mission_id.slice(0, 8)}
+                </span>
+                {isStalled && (
+                  <span className="text-[10px] text-amber-400 tabular-nums">
+                    ⚠️ {Math.floor(mission.seconds_since_activity)}s
+                  </span>
+                )}
+                {isViewingMission && (
+                  <Check className="h-3 w-3 text-indigo-400" />
+                )}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleCancelMission(mission.mission_id);
+                  }}
+                  className="p-0.5 rounded hover:bg-white/[0.08] text-white/30 hover:text-red-400 transition-colors"
+                  title="Cancel mission"
                 >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div
-                      className={cn(
-                        "h-2 w-2 rounded-full shrink-0",
-                        isSeverlyStalled ? "bg-red-400 animate-pulse" :
-                        isStalled ? "bg-amber-400 animate-pulse" :
-                        mission.state === "running" ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
-                      )}
-                    />
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-white truncate">
-                        {mission.model_override || "Default Model"}
-                      </p>
-                      <p className="text-xs text-white/40 truncate">
-                        {mission.mission_id.slice(0, 8)}... • {mission.state}
-                        {isStalled && (
-                          <span className="text-amber-400 ml-1">
-                            • ⚠️ {Math.floor(mission.seconds_since_activity)}s idle
-                          </span>
-                        )}
-                      </p>
-                      {mission.expected_deliverables > 0 && (
-                        <p className="text-xs text-indigo-400 truncate">
-                          📋 {mission.expected_deliverables} expected deliverable{mission.expected_deliverables > 1 ? 's' : ''}
-                        </p>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {isViewingMission ? (
-                      <Check className="h-4 w-4 text-indigo-400" />
-                    ) : (
-                      <span className="text-xs text-white/40">Click to view</span>
-                    )}
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleCancelMission(mission.mission_id);
-                      }}
-                      className="p-1 rounded hover:bg-white/[0.04] text-white/40 hover:text-red-400 transition-colors"
-                      title="Cancel mission"
-                    >
-                      <XCircle className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                  <XCircle className="h-3 w-3" />
+                </button>
+              </div>
+            );
+          })}
         </div>
       )}
 
