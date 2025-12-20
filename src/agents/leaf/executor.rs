@@ -595,7 +595,9 @@ Use `search_memory` when you encounter a problem you might have solved before or
         ];
 
         // Get tool schemas (built-in + MCP)
+        let builtin_count = ctx.tools.get_tool_schemas().len();
         let mut tool_schemas = ctx.tools.get_tool_schemas();
+        tracing::info!("Discovered {} built-in tools, {} MCP tools", builtin_count, mcp_tool_schemas.len());
         tool_schemas.extend(mcp_tool_schemas);
 
         // Agent loop
