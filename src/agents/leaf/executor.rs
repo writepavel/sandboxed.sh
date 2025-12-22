@@ -19,7 +19,7 @@ use serde_json::json;
 use std::path::Path;
 
 use crate::agents::{
-    Agent, AgentContext, AgentId, AgentResult, AgentType, LeafAgent, LeafCapability,
+    Agent, AgentContext, AgentId, AgentResult, AgentType, LeafAgent, LeafCapability, TerminalReason,
 };
 use crate::api::control::{AgentEvent, ControlRunState};
 use crate::budget::ExecutionSignals;
@@ -43,6 +43,8 @@ pub struct ExecutionLoopResult {
     pub signals: ExecutionSignals,
     /// Whether execution succeeded
     pub success: bool,
+    /// Why execution terminated (if not successful completion)
+    pub terminal_reason: Option<TerminalReason>,
 }
 
 /// Agent that executes tasks using tools.
@@ -817,6 +819,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                         usage,
                         signals,
                         success: false,
+                        terminal_reason: Some(TerminalReason::Cancelled),
                     };
                 }
             }
@@ -845,6 +848,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                     usage,
                     signals,
                     success: false,
+                    terminal_reason: Some(TerminalReason::BudgetExhausted),
                 };
             }
 
@@ -880,6 +884,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                         usage,
                         signals,
                         success: false,
+                        terminal_reason: Some(TerminalReason::LlmError),
                     };
                 }
                 Err(_timeout) => {
@@ -917,6 +922,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                         usage,
                         signals,
                         success: false,
+                        terminal_reason: Some(TerminalReason::Stalled),
                     };
                 }
             };
@@ -1032,6 +1038,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                                 usage,
                                 signals,
                                 success: false,
+                                terminal_reason: Some(TerminalReason::InfiniteLoop),
                             };
                         }
                         
@@ -1124,6 +1131,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                                                         usage,
                                                         signals,
                                                         success: false,
+                                                        terminal_reason: Some(TerminalReason::Cancelled),
                                                     };
                                                 }
                                             }
@@ -1351,6 +1359,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                                 usage,
                                 signals,
                                 success: true,
+                                terminal_reason: None,
                             };
                         }
                     }
@@ -1410,6 +1419,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                         usage,
                         signals,
                         success: false,
+                        terminal_reason: Some(TerminalReason::Stalled),
                     };
                 }
                 
@@ -1458,6 +1468,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                     usage,
                     signals,
                     success: true,
+                    terminal_reason: None,
                 };
             }
 
@@ -1484,6 +1495,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                 usage,
                 signals,
                 success: false,
+                terminal_reason: Some(TerminalReason::LlmError),
             };
         }
 
@@ -1509,6 +1521,7 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
             usage,
             signals,
             success: false,
+            terminal_reason: Some(TerminalReason::MaxIterations),
         }
     }
 }
@@ -1571,6 +1584,11 @@ impl Agent for TaskExecutor {
         } else {
             AgentResult::failure(&result.output, result.cost_cents)
         };
+
+        // Propagate terminal reason from execution loop
+        if let Some(reason) = result.terminal_reason {
+            agent_result = agent_result.with_terminal_reason(reason);
+        }
 
         agent_result = agent_result
             .with_model(model)
@@ -1636,6 +1654,11 @@ impl TaskExecutor {
         } else {
             AgentResult::failure(&result.output, result.cost_cents)
         };
+
+        // Propagate terminal reason from execution loop
+        if let Some(reason) = result.terminal_reason {
+            agent_result = agent_result.with_terminal_reason(reason);
+        }
 
         agent_result = agent_result
             .with_model(model)

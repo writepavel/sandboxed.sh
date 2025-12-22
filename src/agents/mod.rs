@@ -27,7 +27,7 @@ mod simple;
 
 pub use simple::SimpleAgent;
 
-pub use types::{AgentId, AgentType, AgentResult, AgentError, Complexity};
+pub use types::{AgentId, AgentType, AgentResult, AgentError, Complexity, TerminalReason};
 pub use context::AgentContext;
 pub use tree::{AgentTree, AgentRef};
 pub use tuning::TuningParams;

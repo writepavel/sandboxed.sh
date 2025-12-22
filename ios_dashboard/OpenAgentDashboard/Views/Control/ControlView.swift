@@ -21,6 +21,12 @@ struct ControlView: View {
     @State private var isAtBottom = true
     @State private var copiedMessageId: String?
     
+    // Parallel missions state
+    @State private var runningMissions: [RunningMissionInfo] = []
+    @State private var viewingMissionId: String?
+    @State private var showRunningMissions = false
+    @State private var pollingTask: Task<Void, Never>?
+    
     @FocusState private var isInputFocused: Bool
     
     private let api = APIService.shared
@@ -36,6 +42,11 @@ struct ControlView: View {
             backgroundGlows
             
             VStack(spacing: 0) {
+                // Running missions bar (when there are parallel missions)
+                if showRunningMissions && (!runningMissions.isEmpty || currentMission != nil) {
+                    runningMissionsBar
+                }
+                
                 // Messages
                 messagesView
                 
@@ -76,6 +87,26 @@ struct ControlView: View {
                 }
             }
             
+            ToolbarItem(placement: .topBarLeading) {
+                // Running missions toggle
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showRunningMissions.toggle()
+                    }
+                    HapticService.selectionChanged()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.stack.3d.up")
+                            .font(.system(size: 14))
+                        if !runningMissions.isEmpty {
+                            Text("\(runningMissions.count)")
+                                .font(.caption2.weight(.semibold))
+                        }
+                    }
+                    .foregroundStyle(showRunningMissions ? Theme.accent : Theme.textSecondary)
+                }
+            }
+            
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
@@ -86,6 +117,15 @@ struct ControlView: View {
                     
                     if let mission = currentMission {
                         Divider()
+                        
+                        // Resume button for interrupted/blocked missions
+                        if mission.canResume {
+                            Button {
+                                Task { await resumeMission() }
+                            } label: {
+                                Label("Resume Mission", systemImage: "play.circle")
+                            }
+                        }
                         
                         Button {
                             Task { await setMissionStatus(.completed) }
@@ -99,7 +139,7 @@ struct ControlView: View {
                             Label("Mark Failed", systemImage: "xmark.circle")
                         }
                         
-                        if mission.status != .active {
+                        if mission.status != .active && !mission.canResume {
                             Button {
                                 Task { await setMissionStatus(.active) }
                             } label: {
@@ -117,10 +157,22 @@ struct ControlView: View {
             // Check if we're being opened with a specific mission from History
             if let pendingId = nav.consumePendingMission() {
                 await loadMission(id: pendingId)
+                viewingMissionId = pendingId
             } else {
                 await loadCurrentMission()
+                viewingMissionId = currentMission?.id
             }
+            
+            // Fetch initial running missions
+            await refreshRunningMissions()
+            
+            // Auto-show bar if there are multiple running missions
+            if runningMissions.count > 1 {
+                showRunningMissions = true
+            }
+            
             startStreaming()
+            startPollingRunningMissions()
         }
         .onChange(of: nav.pendingMissionId) { _, newId in
             // Handle navigation from History while Control is already visible
@@ -128,13 +180,40 @@ struct ControlView: View {
                 nav.pendingMissionId = nil
                 Task {
                     await loadMission(id: missionId)
+                    viewingMissionId = missionId
                 }
             }
-
+        }
+        .onChange(of: currentMission?.id) { _, newId in
+            // Sync viewingMissionId with currentMission when it changes
+            if viewingMissionId == nil, let id = newId {
+                viewingMissionId = id
+            }
         }
         .onDisappear {
             streamTask?.cancel()
+            pollingTask?.cancel()
         }
+    }
+    
+    // MARK: - Running Missions Bar
+    
+    private var runningMissionsBar: some View {
+        RunningMissionsBar(
+            runningMissions: runningMissions,
+            currentMission: currentMission,
+            viewingMissionId: viewingMissionId,
+            onSelectMission: { missionId in
+                Task { await switchToMission(id: missionId) }
+            },
+            onCancelMission: { missionId in
+                Task { await cancelMission(id: missionId) }
+            },
+            onRefresh: {
+                Task { await refreshRunningMissions() }
+            }
+        )
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
     
     // MARK: - Background
@@ -448,6 +527,7 @@ struct ControlView: View {
         do {
             if let mission = try await api.getCurrentMission() {
                 currentMission = mission
+                viewingMissionId = mission.id
                 messages = mission.history.enumerated().map { index, entry in
                     ChatMessage(
                         id: "\(mission.id)-\(index)",
@@ -471,22 +551,21 @@ struct ControlView: View {
         defer { isLoading = false }
 
         do {
-            let missions = try await api.listMissions()
-            if let mission = missions.first(where: { $0.id == id }) {
-                currentMission = mission
-                messages = mission.history.enumerated().map { index, entry in
-                    ChatMessage(
-                        id: "\(mission.id)-\(index)",
-                        type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
-                        content: entry.content
-                    )
-                }
-                HapticService.success()
-                
-                // Scroll to bottom after loading
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    shouldScrollToBottom = true
-                }
+            let mission = try await api.getMission(id: id)
+            currentMission = mission
+            viewingMissionId = mission.id
+            messages = mission.history.enumerated().map { index, entry in
+                ChatMessage(
+                    id: "\(mission.id)-\(index)",
+                    type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
+                    content: entry.content
+                )
+            }
+            HapticService.success()
+            
+            // Scroll to bottom after loading
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                shouldScrollToBottom = true
             }
         } catch {
             print("Failed to load mission: \(error)")
@@ -497,7 +576,19 @@ struct ControlView: View {
         do {
             let mission = try await api.createMission()
             currentMission = mission
+            viewingMissionId = mission.id
             messages = []
+            
+            // Refresh running missions to show the new mission
+            await refreshRunningMissions()
+            
+            // Show the bar when creating new missions
+            if !showRunningMissions && !runningMissions.isEmpty {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showRunningMissions = true
+                }
+            }
+            
             HapticService.success()
         } catch {
             print("Failed to create mission: \(error)")
@@ -514,6 +605,33 @@ struct ControlView: View {
             HapticService.success()
         } catch {
             print("Failed to set status: \(error)")
+            HapticService.error()
+        }
+    }
+    
+    private func resumeMission() async {
+        guard let mission = currentMission, mission.canResume else { return }
+        
+        do {
+            let resumed = try await api.resumeMission(id: mission.id)
+            currentMission = resumed
+            viewingMissionId = resumed.id
+            // Reload messages to get the resume prompt
+            messages = resumed.history.enumerated().map { index, entry in
+                ChatMessage(
+                    id: "\(resumed.id)-\(index)",
+                    type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
+                    content: entry.content
+                )
+            }
+            
+            // Refresh running missions
+            await refreshRunningMissions()
+            
+            HapticService.success()
+            shouldScrollToBottom = true
+        } catch {
+            print("Failed to resume mission: \(error)")
             HapticService.error()
         }
     }
@@ -553,25 +671,109 @@ struct ControlView: View {
         }
     }
     
+    // MARK: - Parallel Missions
+    
+    private func refreshRunningMissions() async {
+        do {
+            runningMissions = try await api.getRunningMissions()
+        } catch {
+            print("Failed to refresh running missions: \(error)")
+        }
+    }
+    
+    private func startPollingRunningMissions() {
+        pollingTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                guard !Task.isCancelled else { break }
+                await refreshRunningMissions()
+            }
+        }
+    }
+    
+    private func switchToMission(id: String) async {
+        guard id != viewingMissionId else { return }
+        
+        isLoading = true
+        defer { isLoading = false }
+        
+        do {
+            // Load the mission from API
+            let mission = try await api.getMission(id: id)
+            
+            // Update state
+            viewingMissionId = id
+            
+            // If this is not a parallel mission, also update currentMission
+            if runningMissions.contains(where: { $0.missionId == id }) {
+                // This is a parallel mission - just load its history
+                messages = mission.history.enumerated().map { index, entry in
+                    ChatMessage(
+                        id: "\(mission.id)-\(index)",
+                        type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
+                        content: entry.content
+                    )
+                }
+            } else {
+                // This is the main mission - load it fully
+                currentMission = mission
+                messages = mission.history.enumerated().map { index, entry in
+                    ChatMessage(
+                        id: "\(mission.id)-\(index)",
+                        type: entry.isUser ? .user : .assistant(success: true, costCents: 0, model: nil),
+                        content: entry.content
+                    )
+                }
+            }
+            
+            HapticService.selectionChanged()
+            shouldScrollToBottom = true
+        } catch {
+            print("Failed to switch mission: \(error)")
+            HapticService.error()
+        }
+    }
+    
+    private func cancelMission(id: String) async {
+        do {
+            try await api.cancelMission(id: id)
+            
+            // Refresh running missions
+            await refreshRunningMissions()
+            
+            // If we were viewing this mission, switch to current
+            if viewingMissionId == id {
+                if let currentId = currentMission?.id {
+                    await switchToMission(id: currentId)
+                }
+            }
+            
+            HapticService.success()
+        } catch {
+            print("Failed to cancel mission: \(error)")
+            HapticService.error()
+        }
+    }
+    
     private func handleStreamEvent(type: String, data: [String: Any]) {
-        // Filter events by mission_id - only show events for the current mission
+        // Filter events by mission_id - only show events for the mission we're viewing
         // This prevents cross-mission contamination when parallel missions are running
         let eventMissionId = data["mission_id"] as? String
-        let currentMissionId = currentMission?.id
+        let viewingId = viewingMissionId
+        let currentId = currentMission?.id
         
         // Only allow status events from any mission (for global state)
-        // All other events must match the current mission
+        // All other events must match the mission we're viewing
         if type != "status" {
             if let eventId = eventMissionId {
-                // Event has a mission_id - must match current mission
-                if eventId != currentMissionId {
+                // Event has a mission_id - must match viewing mission
+                if eventId != viewingId {
                     return // Skip events from other missions
                 }
-            } else if currentMissionId != nil {
+            } else if viewingId != nil && viewingId != currentId {
                 // Event has NO mission_id (from main session)
-                // This is fine if we're on the current/main mission
-                // But we can't verify, so allow it for now
-                // TODO: Backend should always include mission_id
+                // Skip if we're viewing a different (parallel) mission
+                return
             }
         }
         
