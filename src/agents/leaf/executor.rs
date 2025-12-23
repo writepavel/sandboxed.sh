@@ -693,8 +693,9 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
         let mut last_tool_calls: Vec<String> = Vec::new();
         let mut repetitive_actions = false;
         let mut repetition_count: u32 = 0;
-        const LOOP_WARNING_THRESHOLD: u32 = 3;
-        const LOOP_FORCE_COMPLETE_THRESHOLD: u32 = 5;
+        const LOOP_WARNING_THRESHOLD: u32 = 2;  // Warn early
+        const LOOP_FORCE_COMPLETE_THRESHOLD: u32 = 4;  // Stop faster
+        let mut last_tool_result: Option<String> = None;
         let mut has_error_messages = false;
         let mut iterations_completed = 0u32;
         
@@ -1060,10 +1061,27 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                         }
                         
                         // Inject a warning message after threshold to try to break the loop
-                        if repetition_count == LOOP_WARNING_THRESHOLD {
+                        if repetition_count >= LOOP_WARNING_THRESHOLD {
+                            let last_result_hint = last_tool_result
+                                .as_ref()
+                                .map(|r| {
+                                    let preview: String = r.chars().take(200).collect();
+                                    format!("\n\nLast result was: {}", preview)
+                                })
+                                .unwrap_or_default();
+                            
                             messages.push(ChatMessage::new(
                                 Role::User,
-                                "[SYSTEM WARNING] You are repeating the same tool call multiple times. This suggests you may be stuck in a loop. Please either:\n1. Try a different approach\n2. Summarize your findings and complete the task\n3. If you've already found what you need, call complete_mission\n\nDo NOT repeat the same command again.".to_string()
+                                format!(
+                                    "[CRITICAL SYSTEM WARNING] You have repeated the EXACT SAME tool call {} times. \
+                                    This is an infinite loop and you MUST stop.{}\n\n\
+                                    DO NOT call the same command again. Instead:\n\
+                                    1. If the path doesn't exist, try `find` or `ls` to locate the correct path\n\
+                                    2. If you've gathered enough info, call complete_mission with your findings\n\
+                                    3. Try a completely different approach\n\n\
+                                    The next repeated call will terminate this task.",
+                                    repetition_count, last_result_hint
+                                )
                             ));
                         }
                     } else {
@@ -1273,6 +1291,9 @@ If you cannot perform the requested analysis, use `complete_mission(blocked, rea
                         } else {
                             tool_message_content
                         };
+                        
+                        // Track last tool result for loop detection warnings
+                        last_tool_result = Some(truncated_content.clone());
 
                         // Check for vision image marker [VISION_IMAGE:url] and create multimodal content
                         let message_content = if let Some(captures) = extract_vision_image_url(&truncated_content) {
