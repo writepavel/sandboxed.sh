@@ -1281,6 +1281,8 @@ async fn control_actor_loop(
             "completed" => MissionStatus::Completed,
             "failed" => MissionStatus::Failed,
             "interrupted" => MissionStatus::Interrupted,
+            "blocked" => MissionStatus::Blocked,
+            "not_feasible" => MissionStatus::NotFeasible,
             _ => MissionStatus::Active,
         };
 
@@ -1292,7 +1294,7 @@ async fn control_actor_loop(
             history,
             created_at: db_mission.created_at.clone(),
             updated_at: db_mission.updated_at.clone(),
-            interrupted_at: if status == MissionStatus::Interrupted { Some(db_mission.updated_at) } else { None },
+            interrupted_at: if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) { Some(db_mission.updated_at) } else { None },
             resumable: matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked),
         })
     }
