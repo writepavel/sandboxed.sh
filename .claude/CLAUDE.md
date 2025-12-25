@@ -127,11 +127,39 @@ jq -r '.openrouter.api_key' secrets.json
 
 ## Code Conventions
 
-### Rust
+### Rust - Provability-First Design
+
+Code should be written as if we want to **formally prove it correct later**. This means:
+
 1. **Never panic** - always return `Result<T, E>`
-2. **Exhaustive matches** - no `_` catch-all patterns in enums
+2. **Exhaustive matches** - no `_` catch-all patterns in enums (forces handling new variants)
 3. **Document invariants** as `/// Precondition:` and `/// Postcondition:` comments
-4. Costs are in **cents (u64)** - never use floats for money
+4. **Pure functions** - separate pure logic from IO where possible
+5. **Algebraic types** - prefer enums with exhaustive matching over stringly-typed data
+6. Costs are in **cents (u64)** - never use floats for money
+
+```rust
+// Use thiserror for error types
+#[derive(Debug, Error)]
+pub enum MyError {
+    #[error("description: {0}")]
+    Variant(String),
+}
+
+// Propagate with ?
+pub fn do_thing() -> Result<T, MyError> {
+    let x = fallible_op()?;
+    Ok(x)
+}
+```
+
+### Adding a New Leaf Agent
+
+1. Create `src/agents/leaf/your_agent.rs`
+2. Implement `Agent` trait: `id()`, `agent_type()`, `execute()`
+3. Implement `LeafAgent` trait: `capability()` → add to `LeafCapability` enum
+4. Register in `RootAgent::new()` or relevant orchestrator
+5. Document pre/postconditions for provability
 
 ### Dashboard (Next.js + Bun)
 - Package manager: **Bun** (not npm/yarn/pnpm)
@@ -139,12 +167,14 @@ jq -r '.openrouter.api_key' secrets.json
 - API base: `process.env.NEXT_PUBLIC_API_URL ?? 'http://127.0.0.1:3000'`
 - Auth: JWT stored in `sessionStorage`
 
-### Design System
-- **Dark-first** aesthetic
+### Design System - "Quiet Luxury + Liquid Glass"
+- **Dark-first** aesthetic (dark mode is default)
 - No pure black - use deep charcoal (#121214)
+- Elevation via color, not shadows
 - Use `white/[opacity]` for text (e.g., `text-white/80`)
 - Accent color: indigo-500 (#6366F1)
 - Borders: very subtle (0.06-0.08 opacity)
+- No bounce animations, use `ease-out`
 
 ## Production
 
