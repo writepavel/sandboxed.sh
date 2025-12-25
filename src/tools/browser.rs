@@ -804,7 +804,7 @@ impl Tool for BrowserClick {
     }
 
     fn description(&self) -> &str {
-        "Click on an element in the browser. Use CSS selectors like '#id', '.class', 'button', 'a[href*=login]', etc."
+        "Click on an element in the browser. Use standard CSS selectors like '#id', '.class', 'button', 'a[href*=login]', etc. NOTE: jQuery pseudo-selectors like :contains() are NOT supported - use XPath or JavaScript for text matching instead."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -813,7 +813,7 @@ impl Tool for BrowserClick {
             "properties": {
                 "selector": {
                     "type": "string",
-                    "description": "CSS selector for the element to click"
+                    "description": "Standard CSS selector (e.g., '#id', '.class', 'button', 'a[href*=download]'). Do NOT use jQuery :contains() - it's not valid CSS."
                 }
             },
             "required": ["selector"]
@@ -924,7 +924,7 @@ impl Tool for BrowserEvaluate {
     }
 
     fn description(&self) -> &str {
-        "Execute JavaScript code in the browser and return the result. Useful for complex interactions, extracting data, or debugging."
+        "Execute JavaScript code in the browser and return the result. Useful for complex interactions, extracting data, or debugging. NOTE: DevTools-only APIs like getEventListeners() are NOT available - use standard DOM APIs only."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -933,7 +933,7 @@ impl Tool for BrowserEvaluate {
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "JavaScript code to execute. The result of the last expression is returned."
+                    "description": "JavaScript code to execute. Use standard DOM APIs only - DevTools-only functions like getEventListeners() are not available. The result of the last expression is returned."
                 }
             },
             "required": ["script"]
@@ -973,7 +973,7 @@ impl Tool for BrowserWait {
     }
 
     fn description(&self) -> &str {
-        "Wait for an element to appear or a condition to be met. Use after clicking or navigating when content loads dynamically."
+        "Wait for an element to appear or a condition to be met. Use after clicking or navigating when content loads dynamically. NOTE: Use standard CSS selectors only - jQuery pseudo-selectors like :contains() are NOT supported."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -982,7 +982,7 @@ impl Tool for BrowserWait {
             "properties": {
                 "selector": {
                     "type": "string",
-                    "description": "CSS selector to wait for"
+                    "description": "Standard CSS selector to wait for (e.g., '#id', '.class', 'div.loaded'). Do NOT use jQuery :contains()."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -1080,7 +1080,7 @@ impl Tool for BrowserListElements {
     }
 
     fn description(&self) -> &str {
-        "List interactive elements on the current page (links, buttons, inputs, etc.). Useful for understanding page structure before interacting."
+        "List interactive elements on the current page (links, buttons, inputs, etc.). Useful for understanding page structure before interacting. NOTE: Use standard CSS selectors only - jQuery pseudo-selectors like :contains() are NOT supported."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -1089,7 +1089,7 @@ impl Tool for BrowserListElements {
             "properties": {
                 "selector": {
                     "type": "string",
-                    "description": "Optional CSS selector to filter elements (default: 'a, button, input, select, textarea, [onclick]')"
+                    "description": "Standard CSS selector to filter elements (default: 'a, button, input, select, textarea, [onclick]'). Do NOT use jQuery :contains() - it's not valid CSS."
                 },
                 "limit": {
                     "type": "integer",
