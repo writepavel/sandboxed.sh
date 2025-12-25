@@ -397,9 +397,11 @@ export async function setMissionStatus(
 }
 
 // Resume an interrupted mission
-export async function resumeMission(id: string): Promise<Mission> {
+export async function resumeMission(id: string, cleanWorkspace: boolean = false): Promise<Mission> {
   const res = await apiFetch(`/api/control/missions/${id}/resume`, {
     method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clean_workspace: cleanWorkspace }),
   });
   if (!res.ok) {
     const text = await res.text();

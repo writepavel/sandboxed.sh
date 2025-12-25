@@ -216,7 +216,7 @@ struct ControlView: View {
                 Task { await refreshRunningMissions() }
             }
         )
-        .transition(.move(edge: .top).combined(with: .opacity))
+        .transition(AnyTransition.move(edge: .top).combined(with: .opacity))
     }
     
     // MARK: - Background

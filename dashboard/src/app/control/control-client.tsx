@@ -66,6 +66,7 @@ import {
   Globe,
   Code,
   FolderOpen,
+  Trash2,
 } from "lucide-react";
 import {
   OptionList,
@@ -1021,14 +1022,18 @@ export default function ControlClient() {
   };
 
   // Handle resuming an interrupted mission
-  const handleResumeMission = async () => {
+  const handleResumeMission = async (cleanWorkspace: boolean = false) => {
     if (!currentMission || !["interrupted", "blocked"].includes(currentMission.status)) return;
     try {
       setMissionLoading(true);
-      const resumed = await resumeMission(currentMission.id);
+      const resumed = await resumeMission(currentMission.id, cleanWorkspace);
       setCurrentMission(resumed);
       setShowStatusMenu(false);
-      toast.success(currentMission.status === "blocked" ? "Continuing mission" : "Mission resumed");
+      toast.success(
+        cleanWorkspace 
+          ? "Mission resumed with clean workspace" 
+          : (currentMission.status === "blocked" ? "Continuing mission" : "Mission resumed")
+      );
     } catch (err) {
       console.error("Failed to resume mission:", err);
       toast.error("Failed to resume mission");
@@ -1413,14 +1418,25 @@ export default function ControlClient() {
                     Mark Failed
                   </button>
                   {(currentMission.status === "interrupted" || currentMission.status === "blocked") && (
-                    <button
-                      onClick={handleResumeMission}
-                      disabled={missionLoading}
-                      className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
-                    >
-                      <PlayCircle className="h-4 w-4 text-emerald-400" />
-                      {currentMission.status === "blocked" ? "Continue Mission" : "Resume Mission"}
-                    </button>
+                    <>
+                      <button
+                        onClick={() => handleResumeMission(false)}
+                        disabled={missionLoading}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
+                      >
+                        <PlayCircle className="h-4 w-4 text-emerald-400" />
+                        {currentMission.status === "blocked" ? "Continue Mission" : "Resume Mission"}
+                      </button>
+                      <button
+                        onClick={() => handleResumeMission(true)}
+                        disabled={missionLoading}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
+                        title="Delete work folder and start fresh"
+                      >
+                        <Trash2 className="h-4 w-4 text-orange-400" />
+                        Clean & {currentMission.status === "blocked" ? "Continue" : "Resume"}
+                      </button>
+                    </>
                   )}
                   {currentMission.status !== "active" && currentMission.status !== "interrupted" && currentMission.status !== "blocked" && (
                     <button
@@ -1739,18 +1755,29 @@ export default function ControlClient() {
                       )}
                     </p>
                     {currentMission.status === "blocked" && (
-                      <button
-                        onClick={handleResumeMission}
-                        disabled={missionLoading}
-                        className="mt-4 inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
-                      >
-                        {missionLoading ? (
-                          <Loader className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <PlayCircle className="h-4 w-4" />
-                        )}
-                        Continue Mission
-                      </button>
+                      <div className="mt-4 flex gap-2">
+                        <button
+                          onClick={() => handleResumeMission(false)}
+                          disabled={missionLoading}
+                          className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
+                        >
+                          {missionLoading ? (
+                            <Loader className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <PlayCircle className="h-4 w-4" />
+                          )}
+                          Continue Mission
+                        </button>
+                        <button
+                          onClick={() => handleResumeMission(true)}
+                          disabled={missionLoading}
+                          className="inline-flex items-center gap-2 rounded-lg bg-white/10 border border-white/20 px-4 py-2 text-sm font-medium text-white/70 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-50"
+                          title="Delete work folder and start fresh"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                          Clean & Continue
+                        </button>
+                      </div>
                     )}
                   </>
                 ) : (
@@ -2039,7 +2066,7 @@ export default function ControlClient() {
                       <span className="text-white/50 ml-1">— Agent used all {maxIterations} iterations</span>
                     </div>
                     <button
-                      onClick={handleResumeMission}
+                      onClick={() => handleResumeMission(false)}
                       disabled={missionLoading}
                       className="ml-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-black hover:bg-amber-400 transition-colors disabled:opacity-50"
                     >
@@ -2049,6 +2076,15 @@ export default function ControlClient() {
                         <PlayCircle className="h-3.5 w-3.5" />
                       )}
                       Continue
+                    </button>
+                    <button
+                      onClick={() => handleResumeMission(true)}
+                      disabled={missionLoading}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-white/10 border border-white/20 px-3 py-1.5 text-sm font-medium text-white/70 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-50"
+                      title="Delete work folder and start fresh"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Clean & Continue
                     </button>
                   </div>
                 </div>

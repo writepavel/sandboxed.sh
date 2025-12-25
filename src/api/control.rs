@@ -305,6 +305,8 @@ pub enum ControlCommand {
     /// Resume an interrupted mission
     ResumeMission {
         mission_id: Uuid,
+        /// If true, clean the mission's work directory before resuming
+        clean_workspace: bool,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Graceful shutdown - mark running missions as interrupted
@@ -956,12 +958,22 @@ pub async fn cancel_mission(
         .map_err(|e| (StatusCode::NOT_FOUND, e))
 }
 
+/// Request body for resuming a mission
+#[derive(Debug, Deserialize, Default)]
+pub struct ResumeMissionRequest {
+    /// If true, clean the mission's work directory before resuming
+    #[serde(default)]
+    pub clean_workspace: bool,
+}
+
 /// Resume an interrupted mission.
 /// This reconstructs context from history and work directory, then restarts execution.
 pub async fn resume_mission(
     State(state): State<Arc<AppState>>,
     Path(mission_id): Path<Uuid>,
+    body: Option<Json<ResumeMissionRequest>>,
 ) -> Result<Json<Mission>, (StatusCode, String)> {
+    let clean_workspace = body.map(|b| b.clean_workspace).unwrap_or(false);
     let (tx, rx) = oneshot::channel();
     
     state
@@ -969,6 +981,7 @@ pub async fn resume_mission(
         .cmd_tx
         .send(ControlCommand::ResumeMission {
             mission_id,
+            clean_workspace,
             respond: tx,
         })
         .await
@@ -1335,6 +1348,7 @@ async fn control_actor_loop(
         memory: &Option<MemorySystem>,
         config: &Config,
         mission_id: Uuid,
+        clean_workspace: bool,
     ) -> Result<(Mission, String), String> {
         let mission = load_mission_from_db(memory, mission_id).await?;
         
@@ -1346,6 +1360,19 @@ async fn control_actor_loop(
             ));
         }
         
+        // Clean workspace if requested
+        let short_id = &mission_id.to_string()[..8];
+        let mission_dir = config.working_dir.join("work").join(format!("mission-{}", short_id));
+        
+        if clean_workspace && mission_dir.exists() {
+            tracing::info!("Cleaning workspace for mission {} at {:?}", mission_id, mission_dir);
+            if let Err(e) = std::fs::remove_dir_all(&mission_dir) {
+                tracing::warn!("Failed to clean workspace: {}", e);
+            }
+            // Recreate the directory
+            let _ = std::fs::create_dir_all(&mission_dir);
+        }
+        
         // Build resume context
         let mut resume_parts = Vec::new();
         
@@ -1355,13 +1382,19 @@ async fn control_actor_loop(
             _ => "was interrupted",
         };
         
+        let workspace_note = if clean_workspace {
+            " (workspace cleaned)"
+        } else {
+            ""
+        };
+        
         if let Some(interrupted_at) = &mission.interrupted_at {
             resume_parts.push(format!(
-                "**MISSION RESUMED**\nThis mission {} at {} and is now being continued.",
-                resume_reason, interrupted_at
+                "**MISSION RESUMED**{}\nThis mission {} at {} and is now being continued.",
+                workspace_note, resume_reason, interrupted_at
             ));
         } else {
-            resume_parts.push(format!("**MISSION RESUMED**\nThis mission {} and is now being continued.", resume_reason));
+            resume_parts.push(format!("**MISSION RESUMED**{}\nThis mission {} and is now being continued.", workspace_note, resume_reason));
         }
         
         // Add history summary
@@ -1384,10 +1417,7 @@ async fn control_actor_loop(
             }
         }
         
-        // Scan work directory for artifacts
-        let short_id = &mission_id.to_string()[..8];
-        let mission_dir = config.working_dir.join("work").join(format!("mission-{}", short_id));
-        
+        // Scan work directory for artifacts (use mission_dir defined earlier)
         if mission_dir.exists() {
             resume_parts.push("\n## Work Directory Contents".to_string());
             
@@ -1735,9 +1765,9 @@ async fn control_actor_loop(
                         
                         let _ = respond.send(running_list);
                     }
-                    ControlCommand::ResumeMission { mission_id, respond } => {
+                    ControlCommand::ResumeMission { mission_id, clean_workspace, respond } => {
                         // Resume an interrupted mission by building resume context
-                        match resume_mission_impl(&memory, &config, mission_id).await {
+                        match resume_mission_impl(&memory, &config, mission_id, clean_workspace).await {
                             Ok((mission, resume_prompt)) => {
                                 // First persist current mission history (if any)
                                 persist_mission_history(&memory, &current_mission, &history).await;
