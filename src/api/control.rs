@@ -583,7 +583,7 @@ pub async fn list_missions(
                 history,
                 created_at: m.created_at.clone(),
                 updated_at: m.updated_at.clone(),
-                interrupted_at: if status == MissionStatus::Interrupted { Some(m.updated_at) } else { None },
+                interrupted_at: if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) { Some(m.updated_at) } else { None },
                 resumable: matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked),
             }
         })
@@ -630,7 +630,7 @@ pub async fn get_mission(
         history,
         created_at: db_mission.created_at.clone(),
         updated_at: db_mission.updated_at.clone(),
-        interrupted_at: if status == MissionStatus::Interrupted { Some(db_mission.updated_at) } else { None },
+        interrupted_at: if matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked) { Some(db_mission.updated_at) } else { None },
         resumable: matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked),
     }))
 }
