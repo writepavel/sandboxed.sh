@@ -3,10 +3,9 @@
 import { useEffect, useState, useMemo } from "react";
 import { toast } from "sonner";
 import {
-  getStats,
   listMissions,
   listRuns,
-  type StatsResponse,
+  getStats,
   type Mission,
   type Run,
 } from "@/lib/api";
@@ -37,23 +36,23 @@ interface StatusBreakdown {
 }
 
 export default function AnalyticsPage() {
-  const [stats, setStats] = useState<StatsResponse | null>(null);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [totalCostCents, setTotalCostCents] = useState(0);
   const [loading, setLoading] = useState(true);
   const [timeRange, setTimeRange] = useState<"7d" | "30d" | "all">("7d");
 
   useEffect(() => {
     async function fetchData() {
       try {
-        const [statsData, missionsData, runsData] = await Promise.all([
-          getStats(),
+        const [missionsData, runsData, statsData] = await Promise.all([
           listMissions(),
           listRuns(100, 0),
+          getStats(),
         ]);
-        setStats(statsData);
         setMissions(missionsData);
         setRuns(runsData.runs);
+        setTotalCostCents(statsData.total_cost_cents);
       } catch (err) {
         console.error("Failed to fetch analytics:", err);
         toast.error("Failed to load analytics");
@@ -126,6 +125,16 @@ export default function AnalyticsPage() {
     return totalCost / runs.length;
   }, [runs]);
 
+  // Calculate mission stats from actual mission data
+  const missionStats = useMemo(() => {
+    const completed = missions.filter(m => m.status === "completed").length;
+    const failed = missions.filter(m => m.status === "failed" || m.status === "not_feasible").length;
+    const finished = completed + failed;
+    const successRate = finished > 0 ? completed / finished : 1;
+    // Use totalCostCents from stats API (includes ALL runs, not just first 100)
+    return { completed, failed, successRate, totalCost: totalCostCents };
+  }, [missions, totalCostCents]);
+
   // Calculate max single day cost
   const maxDayCost = useMemo(() => {
     return Math.max(...costByDay.map((d) => d.cost), 1);
@@ -193,7 +202,7 @@ export default function AnalyticsPage() {
             <span className="text-xs text-white/50">Total Spent</span>
           </div>
           <div className="text-2xl font-semibold text-white">
-            {formatCents(stats?.total_cost_cents ?? 0)}
+            {formatCents(missionStats.totalCost)}
           </div>
           <div className="text-xs text-white/40 mt-1">
             {formatCents(periodTotalCost)} in selected period
@@ -229,13 +238,13 @@ export default function AnalyticsPage() {
         <div className="bg-white/[0.02] border border-white/[0.06] rounded-xl p-4">
           <div className="flex items-center gap-2 mb-2">
             <CheckCircle className="h-4 w-4 text-emerald-400" />
-            <span className="text-xs text-white/50">Success Rate</span>
+            <span className="text-xs text-white/50">Mission Success Rate</span>
           </div>
           <div className="text-2xl font-semibold text-white">
-            {((stats?.success_rate ?? 1) * 100).toFixed(0)}%
+            {(missionStats.successRate * 100).toFixed(0)}%
           </div>
           <div className="text-xs text-white/40 mt-1">
-            {stats?.completed_tasks ?? 0} completed, {stats?.failed_tasks ?? 0} failed
+            {missionStats.completed} missions completed, {missionStats.failed} failed
           </div>
         </div>
       </div>

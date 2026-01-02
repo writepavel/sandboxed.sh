@@ -1006,11 +1006,144 @@ pub async fn resume_mission(
 /// Get parallel execution configuration.
 pub async fn get_parallel_config(
     State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Query actual running count from the control actor
+    // (the running state is tracked in the actor loop, not in shared state)
+    let (tx, rx) = oneshot::channel();
+    state
+        .control
+        .cmd_tx
+        .send(ControlCommand::ListRunning { respond: tx })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "control session unavailable".to_string(),
+            )
+        })?;
+
+    let running = rx.await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get running missions".to_string(),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
         "max_parallel_missions": state.control.max_parallel,
-        "running_count": state.control.running_missions.read().await.len(),
-    }))
+        "running_count": running.len(),
+    })))
+}
+
+/// Delete a mission by ID.
+/// Only allows deleting missions that are not currently running.
+pub async fn delete_mission(
+    State(state): State<Arc<AppState>>,
+    Path(mission_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Check if mission is currently running by querying the control actor
+    // (the actual running state is tracked in the actor loop, not in shared state)
+    let (tx, rx) = oneshot::channel();
+    state
+        .control
+        .cmd_tx
+        .send(ControlCommand::ListRunning { respond: tx })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "control session unavailable".to_string(),
+            )
+        })?;
+
+    let running = rx.await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to check running missions".to_string(),
+        )
+    })?;
+
+    if running.iter().any(|m| m.mission_id == mission_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Cannot delete a running mission. Cancel it first.".to_string(),
+        ));
+    }
+
+    // Get memory system
+    let mem = state.memory.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Memory system not available".to_string(),
+        )
+    })?;
+
+    // Delete the mission
+    let deleted = mem
+        .supabase
+        .delete_mission(mission_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(Json(serde_json::json!({
+            "ok": true,
+            "deleted": mission_id
+        })))
+    } else {
+        Err((StatusCode::NOT_FOUND, "Mission not found".to_string()))
+    }
+}
+
+/// Delete all empty "Untitled" missions.
+/// Returns the count of deleted missions.
+/// Note: This excludes any currently running missions to prevent data loss.
+pub async fn cleanup_empty_missions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get currently running mission IDs to exclude from cleanup
+    // (a newly-started mission may have empty history in DB while actively running)
+    let (tx, rx) = oneshot::channel();
+    state
+        .control
+        .cmd_tx
+        .send(ControlCommand::ListRunning { respond: tx })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "control session unavailable".to_string(),
+            )
+        })?;
+
+    let running = rx.await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to check running missions".to_string(),
+        )
+    })?;
+
+    let running_ids: Vec<Uuid> = running.iter().map(|m| m.mission_id).collect();
+
+    // Get memory system
+    let mem = state.memory.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Memory system not available".to_string(),
+        )
+    })?;
+
+    // Delete empty untitled missions, excluding running ones
+    let count = mem
+        .supabase
+        .delete_empty_untitled_missions_excluding(&running_ids)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "deleted_count": count
+    })))
 }
 
 /// Stream control session events via SSE.
@@ -1718,16 +1851,17 @@ async fn control_actor_loop(
                         // First check parallel runners
                         if let Some(runner) = parallel_runners.get_mut(&mission_id) {
                             runner.cancel();
-                            let _ = events_tx.send(AgentEvent::Error { 
+                            let _ = events_tx.send(AgentEvent::Error {
                                 message: format!("Parallel mission {} cancelled", mission_id),
                                 mission_id: Some(mission_id),
                             });
                             parallel_runners.remove(&mission_id);
                             let _ = respond.send(Ok(()));
                         } else {
-                            // Check if this is the current running mission
-                            let current = current_mission.read().await.clone();
-                            if current == Some(mission_id) {
+                            // Check if this is the currently executing mission
+                            // Use running_mission_id (the actual mission being executed)
+                            // instead of current_mission (which can change when user creates a new mission)
+                            if running_mission_id == Some(mission_id) {
                                 // Cancel the current execution
                                 if let Some(token) = &running_cancel {
                                     token.cancel();
@@ -1862,18 +1996,30 @@ async fn control_actor_loop(
                         let mut interrupted_ids = Vec::new();
 
                         // Handle main mission - use running_mission_id (the actual mission being executed)
+                        // Note: We DON'T persist history here because:
+                        // 1. If current_mission == running_mission_id, history is correct
+                        // 2. If current_mission != running_mission_id (user created new mission),
+                        //    history was cleared and doesn't belong to running_mission_id
+                        // The running mission's history is already in DB from previous exchanges,
+                        // and any in-progress exchange will be lost (acceptable for shutdown).
                         if running.is_some() {
                             if let Some(mission_id) = running_mission_id {
-                                // Persist current history before marking as interrupted
-                                persist_mission_history(&memory, &current_mission, &history).await;
-                                
+                                // Only persist if the running mission is still current mission
+                                // (i.e., user didn't create a new mission while this one was running)
+                                let current_mid = current_mission.read().await.clone();
+                                if current_mid == Some(mission_id) {
+                                    persist_mission_history(&memory, &current_mission, &history).await;
+                                }
+                                // Note: If missions differ, don't persist - the local history
+                                // belongs to current_mission, not running_mission_id
+
                                 if let Some(mem) = &memory {
                                     if let Ok(()) = mem.supabase.update_mission_status(mission_id, "interrupted").await {
                                         interrupted_ids.push(mission_id);
                                         tracing::info!("Marked mission {} as interrupted", mission_id);
                                     }
                                 }
-                                
+
                                 // Cancel execution
                                 if let Some(token) = &running_cancel {
                                     token.cancel();
@@ -1981,17 +2127,67 @@ async fn control_actor_loop(
                 }
             }, if running.is_some() => {
                 if let Some(res) = finished {
+                    // Save the running mission ID before clearing it - we need it for persist and auto-complete
+                    // (current_mission can change if user clicks "New Mission" while task was running)
+                    let completed_mission_id = running_mission_id;
                     running = None;
                     running_cancel = None;
                     running_mission_id = None;
                     match res {
                         Ok((_mid, user_msg, agent_result)) => {
-                            // Append to conversation history.
-                            history.push(("user".to_string(), user_msg));
-                            history.push(("assistant".to_string(), agent_result.output.clone()));
+                            // Only append to local history if this mission is still the current mission.
+                            // If the user created a new mission mid-execution, history was cleared for that new mission,
+                            // and we don't want to contaminate it with the old mission's exchange.
+                            let current_mid = current_mission.read().await.clone();
+                            if completed_mission_id == current_mid {
+                                history.push(("user".to_string(), user_msg.clone()));
+                                history.push(("assistant".to_string(), agent_result.output.clone()));
+                            }
 
-                            // Persist to mission
-                            persist_mission_history(&memory, &current_mission, &history).await;
+                            // Persist to mission using the actual completed mission ID
+                            // (not current_mission, which could have changed)
+                            //
+                            // IMPORTANT: We fetch existing history from DB and append, rather than
+                            // using the local `history` variable, because CreateMission may have
+                            // cleared `history` while this task was running. This prevents data loss.
+                            if let (Some(mem), Some(mid)) = (&memory, completed_mission_id) {
+                                // Fetch existing history from DB
+                                let existing_history: Vec<MissionHistoryEntry> = match mem.supabase.get_mission(mid).await {
+                                    Ok(Some(mission)) => {
+                                        serde_json::from_value(mission.history).unwrap_or_default()
+                                    }
+                                    _ => Vec::new(),
+                                };
+
+                                // Append new messages to existing history
+                                let mut messages: Vec<MissionMessage> = existing_history
+                                    .iter()
+                                    .map(|e| MissionMessage {
+                                        role: e.role.clone(),
+                                        content: e.content.clone(),
+                                    })
+                                    .collect();
+                                messages.push(MissionMessage { role: "user".to_string(), content: user_msg.clone() });
+                                messages.push(MissionMessage { role: "assistant".to_string(), content: agent_result.output.clone() });
+
+                                if let Err(e) = mem.supabase.update_mission_history(mid, &messages).await {
+                                    tracing::warn!("Failed to persist mission history: {}", e);
+                                }
+
+                                // Update title from first user message if not set (only on first exchange)
+                                if existing_history.is_empty() {
+                                    // Use safe_truncate_index for UTF-8 safe truncation, matching persist_mission_history
+                                    let title = if user_msg.len() > 100 {
+                                        let safe_end = crate::memory::safe_truncate_index(&user_msg, 100);
+                                        format!("{}...", &user_msg[..safe_end])
+                                    } else {
+                                        user_msg.clone()
+                                    };
+                                    if let Err(e) = mem.supabase.update_mission_title(mid, &title).await {
+                                        tracing::warn!("Failed to update mission title: {}", e);
+                                    }
+                                }
+                            }
 
                             // P1 FIX: Auto-complete mission if agent execution ended in a terminal state
                             // without an explicit complete_mission call.
@@ -2004,7 +2200,9 @@ async fn control_actor_loop(
                             // - Parallel missions (each has its own DB status)
                             if agent_result.terminal_reason.is_some() {
                                 if let Some(mem) = &memory {
-                                    if let Some(mission_id) = current_mission.read().await.clone() {
+                                    // Use completed_mission_id (the actual mission that just finished)
+                                    // instead of current_mission (which can change when user creates a new mission)
+                                    if let Some(mission_id) = completed_mission_id {
                                         // Check current mission status from DB - only auto-complete if still "active"
                                         let current_status = mem.supabase.get_mission(mission_id).await
                                             .ok()

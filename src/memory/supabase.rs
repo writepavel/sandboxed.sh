@@ -105,8 +105,34 @@ impl SupabaseClient {
             .header("Authorization", format!("Bearer {}", self.service_role_key))
             .send()
             .await?;
-        
+
         Ok(resp.json().await?)
+    }
+
+    /// Get total cost across all runs (in cents).
+    pub async fn get_total_cost_cents(&self) -> anyhow::Result<u64> {
+        // Fetch only the total_cost_cents column for efficiency
+        #[derive(serde::Deserialize)]
+        struct CostOnly {
+            total_cost_cents: Option<i64>,
+        }
+
+        let resp = self.client
+            .get(format!(
+                "{}/runs?select=total_cost_cents",
+                self.rest_url()
+            ))
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .send()
+            .await?;
+
+        let costs: Vec<CostOnly> = resp.json().await?;
+        let total: i64 = costs.iter()
+            .filter_map(|c| c.total_cost_cents)
+            .sum();
+
+        Ok(total.max(0) as u64)
     }
     
     // ==================== Tasks ====================
@@ -686,9 +712,94 @@ impl SupabaseClient {
         
         Ok(())
     }
-    
+
+    /// Delete a mission by ID.
+    /// Returns true if the mission was deleted, false if it didn't exist.
+    pub async fn delete_mission(&self, id: Uuid) -> anyhow::Result<bool> {
+        let resp = self.client
+            .delete(format!("{}/missions?id=eq.{}", self.rest_url(), id))
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Prefer", "return=representation")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await?;
+            anyhow::bail!("Failed to delete mission: {}", text);
+        }
+
+        // Check if anything was actually deleted
+        let deleted: Vec<DbMission> = resp.json().await?;
+        Ok(!deleted.is_empty())
+    }
+
+    /// Delete all empty "Untitled" missions (no history, no title set).
+    /// Returns the count of deleted missions.
+    pub async fn delete_empty_untitled_missions(&self) -> anyhow::Result<usize> {
+        self.delete_empty_untitled_missions_excluding(&[]).await
+    }
+
+    /// Delete all empty "Untitled" missions (no history, no title set),
+    /// excluding the specified mission IDs (e.g., currently running missions).
+    /// Returns the count of deleted missions.
+    pub async fn delete_empty_untitled_missions_excluding(&self, exclude_ids: &[Uuid]) -> anyhow::Result<usize> {
+        // Minimal struct for partial field selection - avoids deserialization errors
+        // when querying only id, title, history fields (DbMission has more required fields)
+        #[derive(serde::Deserialize)]
+        struct PartialMission {
+            id: Uuid,
+            #[allow(dead_code)]
+            title: Option<String>,
+            history: serde_json::Value,
+        }
+
+        // First get missions with null or "Untitled Mission" title and empty history
+        let resp = self.client
+            .get(format!(
+                "{}/missions?select=id,title,history&or=(title.is.null,title.eq.Untitled%20Mission)&status=eq.active",
+                self.rest_url()
+            ))
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await?;
+            anyhow::bail!("Failed to query empty missions: {}", text);
+        }
+
+        let missions: Vec<PartialMission> = resp.json().await?;
+
+        // Filter to only those with empty history (history is a JSON array)
+        // and not in the exclude list (e.g., currently running missions)
+        let empty_ids: Vec<Uuid> = missions
+            .into_iter()
+            .filter(|m| {
+                m.history.as_array().map_or(true, |arr| arr.is_empty())
+            })
+            .filter(|m| !exclude_ids.contains(&m.id))
+            .map(|m| m.id)
+            .collect();
+
+        if empty_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Delete in batches
+        let mut deleted_count = 0;
+        for id in &empty_ids {
+            if self.delete_mission(*id).await? {
+                deleted_count += 1;
+            }
+        }
+
+        Ok(deleted_count)
+    }
+
     // ==================== User Facts ====================
-    
+
     /// Insert a user fact into memory.
     pub async fn insert_user_fact(
         &self,

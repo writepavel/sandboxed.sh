@@ -133,6 +133,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/control/missions/:id/cancel", post(control::cancel_mission))
         .route("/api/control/missions/:id/resume", post(control::resume_mission))
         .route("/api/control/missions/:id/parallel", post(control::start_mission_parallel))
+        .route("/api/control/missions/:id", axum::routing::delete(control::delete_mission))
+        // Mission cleanup
+        .route("/api/control/missions/cleanup", post(control::cleanup_empty_missions))
         // Parallel execution endpoints
         .route("/api/control/running", get(control::list_running_missions))
         .route("/api/control/parallel/config", get(control::get_parallel_config))
@@ -273,8 +276,12 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
         .filter(|t| t.status == TaskStatus::Failed)
         .count();
 
-    // Calculate total cost (would need to track this properly in production)
-    let total_cost_cents = 0u64; // TODO: Track actual costs
+    // Calculate total cost from runs in database
+    let total_cost_cents = if let Some(mem) = &state.memory {
+        mem.supabase.get_total_cost_cents().await.unwrap_or(0)
+    } else {
+        0
+    };
 
     let finished = completed_tasks + failed_tasks;
     let success_rate = if finished > 0 {

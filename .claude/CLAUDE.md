@@ -23,14 +23,19 @@ cargo test                      # Run tests
 cargo fmt                       # Format code
 cargo clippy                    # Lint
 
-# Dashboard (uses Bun, NOT npm)
+# Dashboard (uses Bun, NOT npm/yarn/pnpm)
 cd dashboard
-bun install                     # Install deps
+bun install                     # Install deps (NEVER use npm install)
 bun dev                         # Dev server (port 3001)
 bun run build                   # Production build
 
+# IMPORTANT: Always use bun for dashboard, never npm
+# - bun install (not npm install)
+# - bun add <pkg> (not npm install <pkg>)
+# - bun run <script> (not npm run <script>)
+
 # Deployment
-ssh root@95.216.112.253 'cd /root/open_agent && git pull && cargo build --release && cp target/release/open_agent /usr/local/bin/ && systemctl restart open_agent'
+ssh root@95.216.112.253 'cd /root/open_agent && git pull && cargo build --release && cp target/release/open_agent /usr/local/bin/ && cp target/release/desktop-mcp /usr/local/bin/ && systemctl restart open_agent'
 ```
 
 ## Architecture
@@ -86,6 +91,35 @@ OPENCODE_PERMISSIVE=true
 ```
 Dashboard → Open Agent API → OpenCode Server → Anthropic API (Claude Max)
 ```
+
+**Desktop Tools with OpenCode:**
+To enable desktop tools (i3, Xvfb, screenshots) when using the OpenCode backend:
+
+1. Build the MCP server: `cargo build --release --bin desktop-mcp`
+2. Ensure `opencode.json` is in the project root with the desktop MCP config
+3. OpenCode will automatically load the tools from the MCP server
+
+The `opencode.json` configures MCP servers for desktop and browser automation:
+```json
+{
+  "mcp": {
+    "desktop": {
+      "type": "local",
+      "command": ["./target/release/desktop-mcp"],
+      "enabled": true
+    },
+    "playwright": {
+      "type": "local",
+      "command": ["npx", "@playwright/mcp@latest"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**Available MCP Tools:**
+- **Desktop tools** (i3/Xvfb): `desktop_start_session`, `desktop_screenshot`, `desktop_click`, `desktop_type`, `desktop_i3_command`, etc.
+- **Playwright tools**: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_screenshot`, etc.
 
 ## Model Preferences
 
@@ -205,12 +239,15 @@ pub fn do_thing() -> Result<T, MyError> {
 | Property | Value |
 |----------|-------|
 | Host | `95.216.112.253` |
-| SSH | `ssh root@95.216.112.253` |
+| SSH | `ssh -i ~/.ssh/cursor root@95.216.112.253` |
 | Backend URL | `https://agent-backend.thomas.md` |
 | Dashboard URL | `https://agent.thomas.md` |
 | Binary | `/usr/local/bin/open_agent` |
+| Desktop MCP | `/usr/local/bin/desktop-mcp` |
 | Env file | `/etc/open_agent/open_agent.env` |
 | Service | `systemctl status open_agent` |
+
+**SSH Key:** Use `~/.ssh/cursor` key for production server access.
 
 ## Adding New Components
 
