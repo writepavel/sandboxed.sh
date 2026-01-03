@@ -68,6 +68,8 @@ import {
   Monitor,
   PanelRightClose,
   PanelRight,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 import {
   OptionList,
@@ -587,6 +589,12 @@ export default function ControlClient() {
 
   const [runState, setRunState] = useState<ControlRunState>("idle");
   const [queueLen, setQueueLen] = useState(0);
+
+  // Connection state for SSE stream - starts as disconnected until first event received
+  const [connectionState, setConnectionState] = useState<
+    "connected" | "disconnected" | "reconnecting"
+  >("disconnected");
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
 
   // Progress state (for "Subtask X of Y" indicator)
   const [progress, setProgress] = useState<{
@@ -1207,7 +1215,25 @@ export default function ControlClient() {
       }
 
       if (event.type === "status" && isRecord(data)) {
+        const wasReconnecting = reconnectAttempts > 0;
         reconnectAttempts = 0;
+
+        // Update connection state to connected
+        setConnectionState("connected");
+        setReconnectAttempt(0);
+
+        // If we just reconnected, refresh the viewed mission's history to catch missed events
+        if (wasReconnecting && viewingId) {
+          getMission(viewingId)
+            .then((mission) => {
+              if (!mounted) return;
+              const historyItems = missionHistoryToItems(mission);
+              setItems(historyItems);
+              setMissionItems((prev) => ({ ...prev, [viewingId]: historyItems }));
+            })
+            .catch(() => {}); // Ignore errors - we'll get updates via stream
+        }
+
         const st = data["state"];
         const newState =
           typeof st === "string" ? (st as ControlRunState) : "idle";
@@ -1420,6 +1446,9 @@ export default function ControlClient() {
         maxReconnectDelay
       );
       reconnectAttempts++;
+      // Update connection state to show reconnecting indicator
+      setConnectionState("reconnecting");
+      setReconnectAttempt(reconnectAttempts);
       reconnectTimeout = setTimeout(() => {
         if (mounted) connect();
       }, delay);
@@ -1721,6 +1750,31 @@ export default function ControlClient() {
 
           {/* Status panel */}
           <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
+            {/* Connection status indicator - only show when not connected */}
+            {connectionState !== "connected" && (
+              <>
+                <div className={cn(
+                  "flex items-center gap-2",
+                  connectionState === "reconnecting" ? "text-amber-400" : "text-red-400"
+                )}>
+                  {connectionState === "reconnecting" ? (
+                    <>
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      <span className="text-sm font-medium">
+                        Reconnecting{reconnectAttempt > 1 ? ` (${reconnectAttempt})` : "..."}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <WifiOff className="h-3.5 w-3.5" />
+                      <span className="text-sm font-medium">Disconnected</span>
+                    </>
+                  )}
+                </div>
+                <div className="h-4 w-px bg-white/[0.08]" />
+              </>
+            )}
+
             {/* Run state indicator */}
             <div className={cn("flex items-center gap-2", status.className)}>
               <StatusIcon

@@ -306,8 +306,8 @@ struct ControlView: View {
                 ScrollView {
                     LazyVStack(spacing: 16) {
                         if messages.isEmpty && !isLoading {
-                            // Show working indicator when agent is running but no messages yet
-                            if runState == .running {
+                            // Show working indicator when this specific mission is running but no messages yet
+                            if viewingMissionIsRunning {
                                 agentWorkingIndicator
                             } else {
                                 emptyStateView
@@ -325,8 +325,8 @@ struct ControlView: View {
                                 .id(message.id)
                             }
 
-                            // Show working indicator after messages when running but no active streaming item
-                            if runState == .running && !hasActiveStreamingItem {
+                            // Show working indicator after messages when this mission is running but no active streaming item
+                            if viewingMissionIsRunning && !hasActiveStreamingItem {
                                 agentWorkingIndicator
                             }
                         }
@@ -399,6 +399,19 @@ struct ControlView: View {
         messages.contains { msg in
             (msg.isThinking && !msg.thinkingDone) || msg.isPhase
         }
+    }
+
+    /// Check if the currently viewed mission is running (not just any mission)
+    private var viewingMissionIsRunning: Bool {
+        guard let viewingId = viewingMissionId else {
+            // No specific mission being viewed - fall back to global state
+            return runState != .idle
+        }
+        // Check if this specific mission is in the running missions list
+        guard let missionInfo = runningMissions.first(where: { $0.missionId == viewingId }) else {
+            return false
+        }
+        return missionInfo.state == "running" || missionInfo.state == "waiting_for_tool"
     }
     
     private var agentWorkingIndicator: some View {
@@ -833,9 +846,24 @@ struct ControlView: View {
                         }
                         Task { @MainActor in
                             // Successfully received an event - we're connected
+                            let wasReconnecting = !self.connectionState.isConnected && self.reconnectAttempt > 0
                             if !self.connectionState.isConnected {
                                 self.connectionState = .connected
                                 self.reconnectAttempt = 0
+
+                                // If we just reconnected, refresh the viewed mission's history to catch missed events
+                                if wasReconnecting, let viewingId = self.viewingMissionId {
+                                    Task {
+                                        do {
+                                            let mission = try await self.api.getMission(id: viewingId)
+                                            await MainActor.run {
+                                                self.applyViewingMission(mission)
+                                            }
+                                        } catch {
+                                            // Ignore errors - we'll get updates via stream
+                                        }
+                                    }
+                                }
                             }
                             self.handleStreamEvent(type: eventType, data: data)
                         }
