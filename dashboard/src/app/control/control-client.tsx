@@ -896,8 +896,9 @@ export default function ControlClient() {
         })
         .catch((err) => {
           console.error("Failed to load mission:", err);
-          // Only show error toast if this wasn't due to auth (authRetryTrigger > 0 means we already retried)
-          if (authRetryTrigger > 0) {
+          // Show error toast for mission load failures (skip if likely a 401 during initial page load)
+          const is401 = err?.message?.includes("401") || err?.status === 401;
+          if (!is401) {
             toast.error("Failed to load mission");
           }
 

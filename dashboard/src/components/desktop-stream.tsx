@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { cn } from "@/lib/utils";
+import { getValidJwt } from "@/lib/auth";
+import { getRuntimeApiBase } from "@/lib/settings";
 import {
   Monitor,
   Play,
@@ -54,12 +56,7 @@ export function DesktopStream({
 
   // Build WebSocket URL - uses refs to get current values without causing reconnections
   const buildWsUrl = useCallback(() => {
-    const baseUrl =
-      typeof window !== "undefined"
-        ? localStorage.getItem("api_base_url") ||
-          process.env.NEXT_PUBLIC_API_URL ||
-          "https://agent-backend.thomas.md"
-        : "";
+    const baseUrl = getRuntimeApiBase();
 
     // Convert https to wss, http to ws
     const wsUrl = baseUrl
@@ -88,12 +85,9 @@ export function DesktopStream({
 
     const url = buildWsUrl();
 
-    // Get JWT token
-    const token =
-      typeof window !== "undefined"
-        ? sessionStorage.getItem("jwt") ||
-          localStorage.getItem("jwt_token")
-        : null;
+    // Get JWT token using proper auth module
+    const jwt = getValidJwt();
+    const token = jwt?.token ?? null;
 
     // Create WebSocket with subprotocol auth
     const protocols = token ? ["openagent", `jwt.${token}`] : ["openagent"];
