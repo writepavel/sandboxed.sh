@@ -777,10 +777,12 @@ struct ControlView: View {
             do {
                 let (messageId, _) = try await api.sendMessage(content: content)
 
-                // Optimistically add user message to UI immediately
-                let userMessage = ChatMessage(id: messageId, type: .user, content: content)
-                messages.append(userMessage)
-                shouldScrollToBottom = true
+                // Add user message to UI if not already added by SSE (race condition guard)
+                if !messages.contains(where: { $0.id == messageId }) {
+                    let userMessage = ChatMessage(id: messageId, type: .user, content: content)
+                    messages.append(userMessage)
+                    shouldScrollToBottom = true
+                }
 
                 // If we don't have a current mission, the backend may have just created one
                 // Refresh to get the new mission context
