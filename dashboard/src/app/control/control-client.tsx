@@ -651,7 +651,8 @@ export default function ControlClient() {
 
   // Desktop stream state
   const [showDesktopStream, setShowDesktopStream] = useState(false);
-  const [desktopDisplayId] = useState(":99");
+  const [desktopDisplayId, setDesktopDisplayId] = useState(":101");
+  const [showDisplaySelector, setShowDisplaySelector] = useState(false);
 
   // Check if the mission we're viewing is actually running (not just any mission)
   const viewingMissionIsRunning = useMemo(() => {
@@ -1282,15 +1283,34 @@ export default function ControlClient() {
 
       if (event.type === "user_message" && isRecord(data)) {
         const msgId = String(data["id"] ?? Date.now());
+        const msgContent = String(data["content"] ?? "");
         setItems((prev) => {
-          // Skip if already added (optimistic update race condition)
+          // Skip if already added with this ID
           if (prev.some((item) => item.id === msgId)) return prev;
+
+          // Check if there's a pending temp message with matching content (SSE arrived before API response)
+          // We verify content to avoid mismatching with messages from other sessions/devices
+          const tempIndex = prev.findIndex(
+            (item) =>
+              item.kind === "user" &&
+              item.id.startsWith("temp-") &&
+              item.content === msgContent
+          );
+
+          if (tempIndex !== -1) {
+            // Replace temp ID with server ID, keeping the original content/timestamp
+            const updated = [...prev];
+            updated[tempIndex] = { ...updated[tempIndex], id: msgId };
+            return updated;
+          }
+
+          // No matching temp message found, add new (message came from another client/session)
           return [
             ...prev,
             {
               kind: "user",
               id: msgId,
-              content: String(data["content"] ?? ""),
+              content: msgContent,
               timestamp: Date.now(),
             },
           ];
@@ -1481,24 +1501,35 @@ export default function ControlClient() {
     setInput("");
     setDraftInput("");
 
+    // Generate temp ID and add message optimistically BEFORE the API call
+    // This ensures messages appear in send order, not response order
+    const tempId = `temp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const timestamp = Date.now();
+
+    setItems((prev) => [
+      ...prev,
+      {
+        kind: "user" as const,
+        id: tempId,
+        content,
+        timestamp,
+      },
+    ]);
+
     try {
       const { id } = await postControlMessage(content);
 
-      // Optimistically add user message if not already present (race condition guard)
-      setItems((prev) => {
-        if (prev.some((item) => item.id === id)) return prev;
-        return [
-          ...prev,
-          {
-            kind: "user" as const,
-            id,
-            content,
-            timestamp: Date.now(),
-          },
-        ];
-      });
+      // Replace temp ID with server-assigned ID
+      // This allows SSE handler to correctly deduplicate
+      setItems((prev) =>
+        prev.map((item) =>
+          item.id === tempId ? { ...item, id } : item
+        )
+      );
     } catch (err) {
       console.error(err);
+      // Remove the optimistic message on error
+      setItems((prev) => prev.filter((item) => item.id !== tempId));
       toast.error("Failed to send message");
     }
   };
@@ -1728,25 +1759,66 @@ export default function ControlClient() {
             </button>
           )}
 
-          {/* Desktop stream toggle */}
-          <button
-            onClick={() => setShowDesktopStream(!showDesktopStream)}
-            className={cn(
-              "flex items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors",
-              showDesktopStream
-                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
-            )}
-            title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
-          >
-            <Monitor className="h-4 w-4" />
-            <span className="hidden sm:inline">Desktop</span>
-            {showDesktopStream ? (
-              <PanelRightClose className="h-4 w-4" />
-            ) : (
-              <PanelRight className="h-4 w-4" />
-            )}
-          </button>
+          {/* Desktop stream toggle with display selector */}
+          <div className="relative flex items-center">
+            <button
+              onClick={() => setShowDesktopStream(!showDesktopStream)}
+              className={cn(
+                "flex items-center gap-2 rounded-l-lg border px-3 py-2 text-sm transition-colors",
+                showDesktopStream
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                  : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+              )}
+              title={showDesktopStream ? "Hide desktop stream" : "Show desktop stream"}
+            >
+              <Monitor className="h-4 w-4" />
+              <span className="hidden sm:inline">Desktop</span>
+              {showDesktopStream ? (
+                <PanelRightClose className="h-4 w-4" />
+              ) : (
+                <PanelRight className="h-4 w-4" />
+              )}
+            </button>
+            <div className="relative">
+              <button
+                onClick={() => setShowDisplaySelector(!showDisplaySelector)}
+                className={cn(
+                  "flex items-center gap-1 rounded-r-lg border-y border-r px-2 py-2 text-sm transition-colors",
+                  showDesktopStream
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                    : "border-white/[0.06] bg-white/[0.02] text-white/70 hover:bg-white/[0.04]"
+                )}
+                title="Select display"
+              >
+                <span className="text-xs font-mono">{desktopDisplayId}</span>
+                <ChevronDown className="h-3 w-3" />
+              </button>
+              {showDisplaySelector && (
+                <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] rounded-lg border border-white/[0.06] bg-[#121214] shadow-xl">
+                  {[":99", ":100", ":101", ":102"].map((display) => (
+                    <button
+                      key={display}
+                      onClick={() => {
+                        setDesktopDisplayId(display);
+                        setShowDisplaySelector(false);
+                      }}
+                      className={cn(
+                        "flex w-full items-center px-3 py-2 text-sm font-mono transition-colors hover:bg-white/[0.04]",
+                        desktopDisplayId === display
+                          ? "text-emerald-400"
+                          : "text-white/70"
+                      )}
+                    >
+                      {display}
+                      {desktopDisplayId === display && (
+                        <CheckCircle className="ml-auto h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
 
           {/* Status panel */}
           <div className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
