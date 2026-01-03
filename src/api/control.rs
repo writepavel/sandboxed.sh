@@ -1718,6 +1718,22 @@ async fn control_actor_loop(
                                 set_and_emit_status(&status, &events_tx, ControlRunState::Running, queue.len()).await;
                                 let current_mid = current_mission.read().await.clone();
                                 let _ = events_tx.send(AgentEvent::UserMessage { id: mid, content: msg.clone(), mission_id: current_mid });
+
+                                // Immediately persist user message to database so it's visible when loading mission
+                                history.push(("user".to_string(), msg.clone()));
+                                if let (Some(mem), Some(mission_id)) = (&memory, current_mid) {
+                                    let messages: Vec<MissionMessage> = history
+                                        .iter()
+                                        .map(|(role, content)| MissionMessage {
+                                            role: role.clone(),
+                                            content: content.clone(),
+                                        })
+                                        .collect();
+                                    if let Err(e) = mem.supabase.update_mission_history(mission_id, &messages).await {
+                                        tracing::warn!("Failed to persist user message: {}", e);
+                                    }
+                                }
+
                                 let cfg = config.clone();
                                 let agent = Arc::clone(&root_agent);
                                 let mem = memory.clone();
@@ -2201,12 +2217,12 @@ async fn control_actor_loop(
                     running_mission_id = None;
                     match res {
                         Ok((_mid, user_msg, agent_result)) => {
-                            // Only append to local history if this mission is still the current mission.
+                            // Only append assistant to local history if this mission is still the current mission.
+                            // Note: User message was already added before execution started.
                             // If the user created a new mission mid-execution, history was cleared for that new mission,
                             // and we don't want to contaminate it with the old mission's exchange.
                             let current_mid = current_mission.read().await.clone();
                             if completed_mission_id == current_mid {
-                                history.push(("user".to_string(), user_msg.clone()));
                                 history.push(("assistant".to_string(), agent_result.output.clone()));
                             }
 
@@ -2216,8 +2232,9 @@ async fn control_actor_loop(
                             // IMPORTANT: We fetch existing history from DB and append, rather than
                             // using the local `history` variable, because CreateMission may have
                             // cleared `history` while this task was running. This prevents data loss.
+                            // Note: User message was already persisted before execution started.
                             if let (Some(mem), Some(mid)) = (&memory, completed_mission_id) {
-                                // Fetch existing history from DB
+                                // Fetch existing history from DB (should already contain user message)
                                 let existing_history: Vec<MissionHistoryEntry> = match mem.supabase.get_mission(mid).await {
                                     Ok(Some(mission)) => {
                                         serde_json::from_value(mission.history).unwrap_or_default()
@@ -2225,7 +2242,7 @@ async fn control_actor_loop(
                                     _ => Vec::new(),
                                 };
 
-                                // Append new messages to existing history
+                                // Append assistant message to existing history (user was already persisted)
                                 let mut messages: Vec<MissionMessage> = existing_history
                                     .iter()
                                     .map(|e| MissionMessage {
@@ -2233,15 +2250,14 @@ async fn control_actor_loop(
                                         content: e.content.clone(),
                                     })
                                     .collect();
-                                messages.push(MissionMessage { role: "user".to_string(), content: user_msg.clone() });
                                 messages.push(MissionMessage { role: "assistant".to_string(), content: agent_result.output.clone() });
 
                                 if let Err(e) = mem.supabase.update_mission_history(mid, &messages).await {
                                     tracing::warn!("Failed to persist mission history: {}", e);
                                 }
 
-                                // Update title from first user message if not set (only on first exchange)
-                                if existing_history.is_empty() {
+                                // Update title from first user message if not set (check for user-only history)
+                                if existing_history.len() == 1 && existing_history[0].role == "user" {
                                     // Use safe_truncate_index for UTF-8 safe truncation, matching persist_mission_history
                                     let title = if user_msg.len() > 100 {
                                         let safe_end = crate::memory::safe_truncate_index(&user_msg, 100);
