@@ -591,6 +591,7 @@ export default function ControlClient() {
 
   // Mission state
   const [currentMission, setCurrentMission] = useState<Mission | null>(null);
+  const [viewingMission, setViewingMission] = useState<Mission | null>(null);
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [missionLoading, setMissionLoading] = useState(false);
 
@@ -655,6 +656,7 @@ export default function ControlClient() {
   const viewingMissionIdRef = useRef<string | null>(null);
   const runningMissionsRef = useRef<RunningMissionInfo[]>([]);
   const currentMissionRef = useRef<Mission | null>(null);
+  const viewingMissionRef = useRef<Mission | null>(null);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -668,6 +670,10 @@ export default function ControlClient() {
   useEffect(() => {
     currentMissionRef.current = currentMission;
   }, [currentMission]);
+
+  useEffect(() => {
+    viewingMissionRef.current = viewingMission;
+  }, [viewingMission]);
 
   // Smart auto-scroll
   const { containerRef, endRef, isAtBottom, scrollToBottom } =
@@ -879,11 +885,13 @@ export default function ControlClient() {
   useEffect(() => {
     const missionId = searchParams.get("mission");
     if (missionId) {
+      const previousViewingMission = viewingMissionRef.current;
       setMissionLoading(true);
       setViewingMissionId(missionId); // Set viewing ID immediately to prevent "Agent is working..." flash
       loadMission(missionId)
         .then((mission) => {
           setCurrentMission(mission);
+          setViewingMission(mission);
           setItems(missionHistoryToItems(mission));
         })
         .catch((err) => {
@@ -892,6 +900,18 @@ export default function ControlClient() {
           if (authRetryTrigger > 0) {
             toast.error("Failed to load mission");
           }
+
+          // Revert viewing state to the previous mission to avoid filtering out events
+          const fallbackMission = previousViewingMission ?? currentMissionRef.current;
+          if (fallbackMission) {
+            setViewingMissionId(fallbackMission.id);
+            setViewingMission(fallbackMission);
+            setItems(missionHistoryToItems(fallbackMission));
+          } else {
+            setViewingMissionId(null);
+            setViewingMission(null);
+            setItems([]);
+          }
         })
         .finally(() => setMissionLoading(false));
     } else {
@@ -899,6 +919,7 @@ export default function ControlClient() {
         .then((mission) => {
           if (mission) {
             setCurrentMission(mission);
+            setViewingMission(mission);
             setItems(missionHistoryToItems(mission));
             router.replace(`/control?mission=${mission.id}`, { scroll: false });
           }
@@ -974,6 +995,9 @@ export default function ControlClient() {
   // Handle switching which mission we're viewing
   const handleViewMission = useCallback(
     async (missionId: string) => {
+      const previousViewingId = viewingMissionIdRef.current;
+      const previousViewingMission = viewingMissionRef.current;
+
       setViewingMissionId(missionId);
       fetchingMissionIdRef.current = missionId;
 
@@ -991,6 +1015,10 @@ export default function ControlClient() {
         setItems(historyItems);
         // Update cache with fresh data
         setMissionItems((prev) => ({ ...prev, [missionId]: historyItems }));
+        setViewingMission(mission);
+        if (currentMissionRef.current?.id === mission.id) {
+          setCurrentMission(mission);
+        }
       } catch (err) {
         console.error("Failed to load mission:", err);
         
@@ -999,10 +1027,19 @@ export default function ControlClient() {
           return;
         }
         
-        // Fallback to cached items if API fails
-        if (missionItems[missionId]) {
-          setItems(missionItems[missionId]);
+        // Revert viewing state to avoid filtering out events
+        const fallbackMission = previousViewingMission ?? currentMissionRef.current;
+        if (fallbackMission) {
+          setViewingMissionId(fallbackMission.id);
+          setViewingMission(fallbackMission);
+          setItems(missionHistoryToItems(fallbackMission));
+        } else if (previousViewingId && missionItems[previousViewingId]) {
+          setViewingMissionId(previousViewingId);
+          setViewingMission(null);
+          setItems(missionItems[previousViewingId]);
         } else {
+          setViewingMissionId(null);
+          setViewingMission(null);
           setItems([]);
         }
       }
@@ -1015,7 +1052,10 @@ export default function ControlClient() {
     if (currentMission && !viewingMissionId) {
       setViewingMissionId(currentMission.id);
     }
-  }, [currentMission, viewingMissionId]);
+    if (currentMission && (!viewingMission || viewingMissionId === currentMission.id)) {
+      setViewingMission(currentMission);
+    }
+  }, [currentMission, viewingMission, viewingMissionId]);
 
   // Note: We don't auto-cache items from SSE events because they may not have mission_id
   // and could be from any mission. We only cache when explicitly loading from API.
@@ -1026,6 +1066,7 @@ export default function ControlClient() {
       setMissionLoading(true);
       const mission = await createMission(undefined, modelOverride);
       setCurrentMission(mission);
+      setViewingMission(mission);
       setViewingMissionId(mission.id); // Also update viewing to the new mission
       setItems([]);
       setShowParallelPanel(true); // Show the missions panel so user can see the new mission
@@ -1044,10 +1085,16 @@ export default function ControlClient() {
 
   // Handle setting mission status
   const handleSetStatus = async (status: MissionStatus) => {
-    if (!currentMission) return;
+    const mission = viewingMission ?? currentMission;
+    if (!mission) return;
     try {
-      await setMissionStatus(currentMission.id, status);
-      setCurrentMission({ ...currentMission, status });
+      await setMissionStatus(mission.id, status);
+      if (currentMission?.id === mission.id) {
+        setCurrentMission({ ...mission, status });
+      }
+      if (viewingMission?.id === mission.id) {
+        setViewingMission({ ...mission, status });
+      }
       setShowStatusMenu(false);
       toast.success(`Mission marked as ${status}`);
     } catch (err) {
@@ -1058,16 +1105,22 @@ export default function ControlClient() {
 
   // Handle resuming an interrupted mission
   const handleResumeMission = async (cleanWorkspace: boolean = false) => {
-    if (!currentMission || !["interrupted", "blocked"].includes(currentMission.status)) return;
+    const mission = viewingMission ?? currentMission;
+    if (!mission || !["interrupted", "blocked"].includes(mission.status)) return;
     try {
       setMissionLoading(true);
-      const resumed = await resumeMission(currentMission.id, cleanWorkspace);
+      const resumed = await resumeMission(mission.id, cleanWorkspace);
       setCurrentMission(resumed);
+      setViewingMission(resumed);
+      setViewingMissionId(resumed.id);
+      const historyItems = missionHistoryToItems(resumed);
+      setItems(historyItems);
+      setMissionItems((prev) => ({ ...prev, [resumed.id]: historyItems }));
       setShowStatusMenu(false);
       toast.success(
         cleanWorkspace 
           ? "Mission resumed with clean workspace" 
-          : (currentMission.status === "blocked" ? "Continuing mission" : "Mission resumed")
+          : (mission.status === "blocked" ? "Continuing mission" : "Mission resumed")
       );
     } catch (err) {
       console.error("Failed to resume mission:", err);
@@ -1392,13 +1445,14 @@ export default function ControlClient() {
     }
   };
 
-  const missionStatus = currentMission
-    ? missionStatusLabel(currentMission.status)
+  const activeMission = viewingMission ?? currentMission;
+  const missionStatus = activeMission
+    ? missionStatusLabel(activeMission.status)
     : null;
-  const missionTitle = currentMission?.title
-    ? currentMission.title.length > 60
-      ? currentMission.title.slice(0, 60) + "..."
-      : currentMission.title
+  const missionTitle = activeMission?.title
+    ? activeMission.title.length > 60
+      ? activeMission.title.slice(0, 60) + "..."
+      : activeMission.title
     : "New Mission";
 
   return (
@@ -1436,8 +1490,8 @@ export default function ControlClient() {
                 )}
               </div>
               <p className="text-xs text-white/40 truncate">
-                {currentMission
-                  ? `Mission ${currentMission.id.slice(0, 8)}...`
+                {activeMission
+                  ? `Mission ${activeMission.id.slice(0, 8)}...`
                   : "No active mission"}
               </p>
             </div>
@@ -1445,7 +1499,7 @@ export default function ControlClient() {
         </div>
 
         <div className="flex items-center gap-3 shrink-0 flex-wrap">
-          {currentMission && (
+          {activeMission && (
             <div className="relative" ref={statusMenuRef}>
               <button
                 onClick={() => setShowStatusMenu(!showStatusMenu)}
@@ -1470,7 +1524,7 @@ export default function ControlClient() {
                     <XCircle className="h-4 w-4 text-red-400" />
                     Mark Failed
                   </button>
-                  {(currentMission.status === "interrupted" || currentMission.status === "blocked") && (
+                  {(activeMission?.status === "interrupted" || activeMission?.status === "blocked") && (
                     <>
                       <button
                         onClick={() => handleResumeMission(false)}
@@ -1478,7 +1532,7 @@ export default function ControlClient() {
                         className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04] disabled:opacity-50"
                       >
                         <PlayCircle className="h-4 w-4 text-emerald-400" />
-                        {currentMission.status === "blocked" ? "Continue Mission" : "Resume Mission"}
+                        {activeMission?.status === "blocked" ? "Continue Mission" : "Resume Mission"}
                       </button>
                       <button
                         onClick={() => handleResumeMission(true)}
@@ -1487,11 +1541,11 @@ export default function ControlClient() {
                         title="Delete work folder and start fresh"
                       >
                         <Trash2 className="h-4 w-4 text-orange-400" />
-                        Clean & {currentMission.status === "blocked" ? "Continue" : "Resume"}
+                        Clean & {activeMission?.status === "blocked" ? "Continue" : "Resume"}
                       </button>
                     </>
                   )}
-                  {currentMission.status !== "active" && currentMission.status !== "interrupted" && currentMission.status !== "blocked" && (
+                  {activeMission?.status !== "active" && activeMission?.status !== "interrupted" && activeMission?.status !== "blocked" && (
                     <button
                       onClick={() => handleSetStatus("active")}
                       className="flex w-full items-center gap-2 px-3 py-2 text-sm text-white/70 hover:bg-white/[0.04]"
@@ -1557,7 +1611,7 @@ export default function ControlClient() {
                       ))}
                     </select>
                     <p className="text-xs text-white/30 mt-1.5">
-                      Auto uses Claude Sonnet 4
+                      Auto uses Claude Opus 4.5
                     </p>
                   </div>
                   <div className="flex gap-2 pt-1">
@@ -1810,26 +1864,26 @@ export default function ControlClient() {
                       arrive.
                     </p>
                   </>
-                ) : currentMission && currentMission.status !== "active" ? (
+                ) : activeMission && activeMission.status !== "active" ? (
                   <>
                     <h2 className="text-lg font-medium text-white">
-                      {currentMission.status === "interrupted" 
+                      {activeMission.status === "interrupted" 
                         ? "Mission Interrupted" 
-                        : currentMission.status === "blocked"
+                        : activeMission.status === "blocked"
                         ? "Iteration Limit Reached"
                         : "No conversation history"}
                     </h2>
                     <p className="mt-2 text-sm text-white/40 max-w-sm">
-                      {currentMission.status === "interrupted" ? (
+                      {activeMission.status === "interrupted" ? (
                         <>This mission was interrupted (server shutdown or cancellation). Click the <strong className="text-amber-400">Resume</strong> button in the mission menu to continue where you left off.</>
-                      ) : currentMission.status === "blocked" ? (
+                      ) : activeMission.status === "blocked" ? (
                         <>The agent reached its iteration limit ({maxIterations}). You can continue the mission to give it more iterations.</>
                       ) : (
-                        <>This mission was {currentMission.status} without any messages.
-                        {currentMission.status === "completed" && " You can reactivate it to continue."}</>
+                        <>This mission was {activeMission.status} without any messages.
+                        {activeMission.status === "completed" && " You can reactivate it to continue."}</>
                       )}
                     </p>
-                    {currentMission.status === "blocked" && (
+                    {activeMission.status === "blocked" && (
                       <div className="mt-4 flex gap-2">
                         <button
                           onClick={() => handleResumeMission(false)}
@@ -2174,7 +2228,7 @@ export default function ControlClient() {
               })}
               
               {/* Continue banner for blocked missions */}
-              {currentMission?.status === "blocked" && items.length > 0 && (
+              {activeMission?.status === "blocked" && items.length > 0 && (
                 <div className="flex justify-center py-4">
                   <div className="flex items-center gap-3 rounded-xl bg-amber-500/10 border border-amber-500/20 px-5 py-3">
                     <Clock className="h-5 w-5 text-amber-400" />
