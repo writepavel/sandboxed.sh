@@ -1242,15 +1242,20 @@ export default function ControlClient() {
       }
 
       if (event.type === "user_message" && isRecord(data)) {
-        setItems((prev) => [
-          ...prev,
-          {
-            kind: "user",
-            id: String(data["id"] ?? Date.now()),
-            content: String(data["content"] ?? ""),
-            timestamp: Date.now(),
-          },
-        ]);
+        const msgId = String(data["id"] ?? Date.now());
+        setItems((prev) => {
+          // Skip if already added (optimistic update race condition)
+          if (prev.some((item) => item.id === msgId)) return prev;
+          return [
+            ...prev,
+            {
+              kind: "user",
+              id: msgId,
+              content: String(data["content"] ?? ""),
+              timestamp: Date.now(),
+            },
+          ];
+        });
         return;
       }
 
@@ -1435,7 +1440,21 @@ export default function ControlClient() {
     setDraftInput("");
 
     try {
-      await postControlMessage(content);
+      const { id } = await postControlMessage(content);
+
+      // Optimistically add user message if not already present (race condition guard)
+      setItems((prev) => {
+        if (prev.some((item) => item.id === id)) return prev;
+        return [
+          ...prev,
+          {
+            kind: "user" as const,
+            id,
+            content,
+            timestamp: Date.now(),
+          },
+        ];
+      });
     } catch (err) {
       console.error(err);
       toast.error("Failed to send message");
