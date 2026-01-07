@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::agents::{Agent, AgentContext, AgentId, AgentResult, AgentType, TerminalReason};
 use crate::api::control::{AgentEvent, AgentTreeNode};
 use crate::config::Config;
-use crate::opencode::{extract_text, OpenCodeClient, OpenCodeEvent};
+use crate::opencode::{extract_reasoning, extract_text, OpenCodeClient, OpenCodeEvent};
 use crate::task::Task;
 
 /// How long to wait without events before checking if a tool is stuck.
@@ -159,15 +159,23 @@ impl OpenCodeAgent {
 
     /// Forward an OpenCode event to the control broadcast channel.
     fn forward_event(&self, oc_event: &OpenCodeEvent, ctx: &AgentContext) {
+        tracing::debug!(
+            event_type = ?std::mem::discriminant(oc_event),
+            has_control_events = ctx.control_events.is_some(),
+            mission_id = ?ctx.mission_id,
+            "forward_event called"
+        );
+
         let Some(events_tx) = &ctx.control_events else {
-            tracing::trace!("forward_event: no control_events channel, skipping");
+            tracing::debug!("forward_event: no control_events channel, skipping");
             return;
         };
 
         let agent_event = match oc_event {
             OpenCodeEvent::Thinking { content } => {
-                tracing::debug!(
+                tracing::info!(
                     content_len = content.len(),
+                    content_preview = %content.chars().take(100).collect::<String>(),
                     "Forwarding Thinking event to control broadcast"
                 );
                 AgentEvent::Thinking {
@@ -177,8 +185,9 @@ impl OpenCodeAgent {
                 }
             }
             OpenCodeEvent::TextDelta { content } => {
-                tracing::trace!(
+                tracing::info!(
                     content_len = content.len(),
+                    content_preview = %content.chars().take(100).collect::<String>(),
                     "Forwarding TextDelta as Thinking event"
                 );
                 AgentEvent::Thinking {
@@ -221,7 +230,20 @@ impl OpenCodeAgent {
             OpenCodeEvent::MessageComplete { .. } => return, // Don't forward completion marker
         };
 
-        let _ = events_tx.send(agent_event);
+        match events_tx.send(agent_event) {
+            Ok(receiver_count) => {
+                tracing::debug!(
+                    receiver_count = receiver_count,
+                    "Successfully sent event to broadcast channel"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "Failed to send event to broadcast channel (no receivers?)"
+                );
+            }
+        }
     }
 }
 
@@ -272,13 +294,9 @@ impl Agent for OpenCodeAgent {
             }
         };
 
-        // Choose model: requested override > config default
-        let model_override: Option<String> = task
-            .analysis()
-            .requested_model
-            .clone()
-            .or_else(|| Some(ctx.config.default_model.clone()));
-        if let Some(ref model) = model_override {
+        // Use the configured default model
+        let selected_model: Option<String> = Some(ctx.config.default_model.clone());
+        if let Some(ref model) = selected_model {
             task.analysis_mut().selected_model = Some(model.clone());
         }
 
@@ -291,7 +309,7 @@ impl Agent for OpenCodeAgent {
                 &session.id,
                 &directory,
                 task.description(),
-                model_override.as_deref(),
+                selected_model.as_deref(),
                 agent_name,
             )
             .await;
@@ -310,7 +328,7 @@ impl Agent for OpenCodeAgent {
                         ctx,
                         &session.id,
                         &directory,
-                        model_override.as_deref(),
+                        selected_model.as_deref(),
                         agent_name,
                         tree,
                     )
@@ -336,6 +354,10 @@ impl Agent for OpenCodeAgent {
                     event = event_rx.recv() => {
                         match event {
                             Some(oc_event) => {
+                                tracing::debug!(
+                                    event_type = ?std::mem::discriminant(&oc_event),
+                                    "Received event from OpenCode SSE channel"
+                                );
                                 last_event_time = Instant::now();
                                 stuck_tool_warned = false; // Reset warning on new event
 
@@ -390,7 +412,7 @@ impl Agent for OpenCodeAgent {
                                         &session.id,
                                         &directory,
                                         &stuck_tools,
-                                        model_override.as_deref(),
+                                        selected_model.as_deref(),
                                         agent_name,
                                         ctx,
                                     ).await {
@@ -531,7 +553,7 @@ impl Agent for OpenCodeAgent {
                                         &session.id,
                                         &directory,
                                         &stuck_tools,
-                                        model_override.as_deref(),
+                                        selected_model.as_deref(),
                                         agent_name,
                                         ctx,
                                     ).await {
@@ -623,8 +645,21 @@ impl Agent for OpenCodeAgent {
             }
         };
 
-        // Emit final thinking done marker
+        // Extract and emit any reasoning content from the final response
+        // This ensures extended thinking content is captured even if not streamed via SSE
         if let Some(events_tx) = &ctx.control_events {
+            if let Some(reasoning_content) = extract_reasoning(&response.parts) {
+                tracing::info!(
+                    reasoning_len = reasoning_content.len(),
+                    "Emitting reasoning content from final response"
+                );
+                let _ = events_tx.send(AgentEvent::Thinking {
+                    content: reasoning_content,
+                    done: false,
+                    mission_id: ctx.mission_id,
+                });
+            }
+            // Emit final thinking done marker
             let _ = events_tx.send(AgentEvent::Thinking {
                 content: String::new(),
                 done: true,

@@ -53,8 +53,6 @@ pub struct AppState {
     pub library: library_api::SharedLibrary,
     /// Workspace store
     pub workspaces: workspace::SharedWorkspaceStore,
-    /// Agent configuration store
-    pub agents: Arc<crate::agent_config::AgentStore>,
     /// OpenCode connection store
     pub opencode_connections: Arc<crate::opencode_config::OpenCodeStore>,
     /// AI Provider store
@@ -63,6 +61,8 @@ pub struct AppState {
     pub pending_oauth: Arc<RwLock<HashMap<crate::ai_providers::ProviderType, crate::ai_providers::PendingOAuth>>>,
     /// Secrets store for encrypted credentials
     pub secrets: Option<Arc<crate::secrets::SecretsStore>>,
+    /// Console session pool for WebSocket reconnection
+    pub console_pool: Arc<console::SessionPool>,
 }
 
 /// Start the HTTP server.
@@ -82,11 +82,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Initialize workspace store (loads from disk and recovers orphaned chroots)
     let workspaces = Arc::new(workspace::WorkspaceStore::new(config.working_dir.clone()).await);
-
-    // Initialize agent configuration store
-    let agents = Arc::new(crate::agent_config::AgentStore::new(
-        config.working_dir.join(".openagent/agents.json"),
-    ).await);
 
     // Initialize OpenCode connection store
     let opencode_connections = Arc::new(crate::opencode_config::OpenCodeStore::new(
@@ -111,15 +106,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    // Spawn the single global control session actor.
-    let control_state = control::ControlHub::new(
-        config.clone(),
-        Arc::clone(&root_agent),
-        Arc::clone(&mcp),
-        Arc::clone(&workspaces),
-    );
+    // Initialize console session pool for WebSocket reconnection
+    let console_pool = Arc::new(console::SessionPool::new());
+    Arc::clone(&console_pool).start_cleanup_task();
 
     // Initialize configuration library (optional - can also be configured at runtime)
+    // Must be created before ControlHub so it can be passed to control sessions
     let library: library_api::SharedLibrary = Arc::new(RwLock::new(None));
     if let Some(library_remote) = config.library_remote.clone() {
         let library_clone = Arc::clone(&library);
@@ -139,6 +131,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         tracing::info!("Configuration library disabled (no remote configured)");
     }
 
+    // Spawn the single global control session actor.
+    let control_state = control::ControlHub::new(
+        config.clone(),
+        Arc::clone(&root_agent),
+        Arc::clone(&mcp),
+        Arc::clone(&workspaces),
+        Arc::clone(&library),
+    );
+
     let state = Arc::new(AppState {
         config: config.clone(),
         tasks: RwLock::new(HashMap::new()),
@@ -147,11 +148,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         mcp,
         library,
         workspaces,
-        agents,
         opencode_connections,
         ai_providers,
         pending_oauth,
         secrets,
+        console_pool,
     });
 
     let public_routes = Router::new()
@@ -255,6 +256,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route("/api/mcp/refresh", post(mcp_api::refresh_all_mcps))
         .route("/api/mcp/:id", get(mcp_api::get_mcp))
         .route("/api/mcp/:id", axum::routing::delete(mcp_api::remove_mcp))
+        .route("/api/mcp/:id", axum::routing::patch(mcp_api::update_mcp))
         .route("/api/mcp/:id/enable", post(mcp_api::enable_mcp))
         .route("/api/mcp/:id/disable", post(mcp_api::disable_mcp))
         .route("/api/mcp/:id/refresh", post(mcp_api::refresh_mcp))
@@ -267,8 +269,6 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/library", library_api::routes())
         // Workspace management endpoints
         .nest("/api/workspaces", workspaces_api::routes())
-        // Agent configuration endpoints
-        .nest("/api/agents", super::agents::routes())
         // OpenCode connection endpoints
         .nest("/api/opencode/connections", opencode_api::routes())
         // AI Provider endpoints
