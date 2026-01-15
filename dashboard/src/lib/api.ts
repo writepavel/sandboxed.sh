@@ -1914,6 +1914,49 @@ export async function buildWorkspace(
   return res.json();
 }
 
+// Debug info for a workspace container
+export interface WorkspaceDebugInfo {
+  id: string;
+  name: string;
+  status: string;
+  path: string;
+  path_exists: boolean;
+  size_bytes: number | null;
+  directories: { path: string; exists: boolean; file_count: number | null }[];
+  has_bash: boolean;
+  init_script_exists: boolean;
+  init_script_modified: string | null;
+  distro: string | null;
+  last_error: string | null;
+}
+
+export interface InitLogResponse {
+  exists: boolean;
+  content: string | null;
+  total_lines: number | null;
+  log_path: string;
+}
+
+// Get workspace debug info (container state)
+export async function getWorkspaceDebug(id: string): Promise<WorkspaceDebugInfo> {
+  const res = await apiFetch(`/api/workspaces/${id}/debug`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to get workspace debug info");
+  }
+  return res.json();
+}
+
+// Get init script log from container
+export async function getWorkspaceInitLog(id: string): Promise<InitLogResponse> {
+  const res = await apiFetch(`/api/workspaces/${id}/init-log`);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || "Failed to get init log");
+  }
+  return res.json();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenCode Connection API
 // ─────────────────────────────────────────────────────────────────────────────

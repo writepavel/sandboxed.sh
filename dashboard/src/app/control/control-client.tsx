@@ -3687,18 +3687,11 @@ export default function ControlClient() {
             })
           );
 
-          // Also update the mission in our local state if it matches
-          if (missionId) {
-            setMissions((prev) =>
-              prev.map((m) =>
-                m.id === missionId ? { ...m, status: newStatus as MissionStatus } : m
-              )
+          // Also update the current mission if it matches
+          if (missionId && currentMissionRef.current?.id === missionId) {
+            setCurrentMission((prev) =>
+              prev ? { ...prev, status: newStatus as MissionStatus } : prev
             );
-            if (currentMissionRef.current?.id === missionId) {
-              setCurrentMission((prev) =>
-                prev ? { ...prev, status: newStatus as MissionStatus } : prev
-              );
-            }
           }
         }
       }
