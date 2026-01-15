@@ -38,6 +38,9 @@ import {
   Bookmark,
   FileText,
   Sparkles,
+  Eye,
+  EyeOff,
+  Lock,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/components/toast';
@@ -74,7 +77,7 @@ export default function WorkspacesPage() {
   const [showBuildLogs, setShowBuildLogs] = useState(false);
 
   // Workspace settings state
-  const [envRows, setEnvRows] = useState<{ id: string; key: string; value: string }[]>([]);
+  const [envRows, setEnvRows] = useState<{ id: string; key: string; value: string; secret: boolean; visible: boolean }[]>([]);
   const [initScript, setInitScript] = useState('');
   const [savingWorkspace, setSavingWorkspace] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
@@ -115,12 +118,27 @@ export default function WorkspacesPage() {
     }
   };
 
+  // Patterns that indicate a sensitive value
+  const isSensitiveKey = (key: string) => {
+    const upperKey = key.toUpperCase();
+    const sensitivePatterns = [
+      'KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'PASS', 'CREDENTIAL', 'AUTH',
+      'PRIVATE', 'API_KEY', 'ACCESS_TOKEN', 'B64', 'BASE64', 'ENCRYPTED',
+    ];
+    return sensitivePatterns.some(pattern => upperKey.includes(pattern));
+  };
+
   const toEnvRows = (env: Record<string, string>) =>
-    Object.entries(env).map(([key, value]) => ({
-      id: `${key}-${Math.random().toString(36).slice(2, 8)}`,
-      key,
-      value,
-    }));
+    Object.entries(env).map(([key, value]) => {
+      const secret = isSensitiveKey(key);
+      return {
+        id: `${key}-${Math.random().toString(36).slice(2, 8)}`,
+        key,
+        value,
+        secret,
+        visible: !secret, // Hidden by default if secret
+      };
+    });
 
   const envRowsToMap = (rows: { key: string; value: string }[]) => {
     const env: Record<string, string> = {};
@@ -833,7 +851,7 @@ export default function WorkspacesPage() {
                         onClick={() =>
                           setEnvRows((rows) => [
                             ...rows,
-                            { id: Math.random().toString(36).slice(2), key: '', value: '' },
+                            { id: Math.random().toString(36).slice(2), key: '', value: '', secret: false, visible: true },
                           ])
                         }
                         className="text-xs text-indigo-400 hover:text-indigo-300 font-medium"
@@ -848,7 +866,7 @@ export default function WorkspacesPage() {
                           <p className="text-xs text-white/40">No environment variables</p>
                           <button
                             onClick={() =>
-                              setEnvRows([{ id: Math.random().toString(36).slice(2), key: '', value: '' }])
+                              setEnvRows([{ id: Math.random().toString(36).slice(2), key: '', value: '', secret: false, visible: true }])
                             }
                             className="text-xs text-indigo-400 hover:text-indigo-300 mt-2"
                           >
@@ -861,29 +879,61 @@ export default function WorkspacesPage() {
                             <div key={row.id} className="flex items-center gap-2">
                               <input
                                 value={row.key}
-                                onChange={(e) =>
+                                onChange={(e) => {
+                                  const newKey = e.target.value;
+                                  const secret = isSensitiveKey(newKey);
                                   setEnvRows((rows) =>
                                     rows.map((r) =>
-                                      r.id === row.id ? { ...r, key: e.target.value } : r
+                                      r.id === row.id ? { ...r, key: newKey, secret, visible: r.visible || !secret } : r
                                     )
-                                  )
-                                }
+                                  );
+                                }}
                                 placeholder="KEY"
                                 className="flex-1 px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 font-mono focus:outline-none focus:border-indigo-500/50"
                               />
                               <span className="text-white/20">=</span>
-                              <input
-                                value={row.value}
-                                onChange={(e) =>
-                                  setEnvRows((rows) =>
-                                    rows.map((r) =>
-                                      r.id === row.id ? { ...r, value: e.target.value } : r
+                              <div className="flex-1 relative">
+                                <input
+                                  type={row.secret && !row.visible ? 'password' : 'text'}
+                                  value={row.value}
+                                  onChange={(e) =>
+                                    setEnvRows((rows) =>
+                                      rows.map((r) =>
+                                        r.id === row.id ? { ...r, value: e.target.value } : r
+                                      )
                                     )
-                                  )
-                                }
-                                placeholder="value"
-                                className="flex-1 px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 font-mono focus:outline-none focus:border-indigo-500/50"
-                              />
+                                  }
+                                  placeholder="value"
+                                  className={cn(
+                                    "w-full px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 font-mono focus:outline-none focus:border-indigo-500/50",
+                                    row.secret && "pr-8"
+                                  )}
+                                />
+                                {row.secret && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setEnvRows((rows) =>
+                                        rows.map((r) =>
+                                          r.id === row.id ? { ...r, visible: !r.visible } : r
+                                        )
+                                      )
+                                    }
+                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60 transition-colors"
+                                  >
+                                    {row.visible ? (
+                                      <EyeOff className="h-3.5 w-3.5" />
+                                    ) : (
+                                      <Eye className="h-3.5 w-3.5" />
+                                    )}
+                                  </button>
+                                )}
+                              </div>
+                              {row.secret && (
+                                <span title="Sensitive value - will be encrypted">
+                                  <Lock className="h-3.5 w-3.5 text-amber-400/60" />
+                                </span>
+                              )}
                               <button
                                 onClick={() => setEnvRows((rows) => rows.filter((r) => r.id !== row.id))}
                                 className="p-2 text-white/30 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
@@ -896,7 +946,7 @@ export default function WorkspacesPage() {
                       )}
                       {envRows.length > 0 && (
                         <p className="text-xs text-white/35 mt-4 pt-3 border-t border-white/[0.04]">
-                          Injected into workspace shells and MCP tool runs.
+                          Injected into workspace shells and MCP tool runs. Sensitive values (<Lock className="h-3 w-3 inline-block text-amber-400/60 -mt-0.5" />) are encrypted at rest.
                         </p>
                       )}
                     </div>
