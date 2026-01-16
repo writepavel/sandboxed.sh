@@ -318,7 +318,7 @@ cargo --version
 
 ### 4.2 Deploy the repository
 
-On the server we keep the repo under:
+On the server we keep the repo under `/opt/open_agent/vaduz-v1`. **This must be a git clone** (not just copied files) for the dashboard's one-click update system to work.
 
 ```bash
 mkdir -p /opt/open_agent
@@ -326,13 +326,18 @@ cd /opt/open_agent
 git clone <YOUR_OPEN_AGENT_REPO_URL> vaduz-v1
 ```
 
-If you develop locally, a fast deploy loop is to `rsync` source to the server and build on the server (debug builds are much faster):
+> **Important**: The update system in Settings relies on git tags to detect new releases. If you deploy via rsync without `.git`, the "Update Available" button won't work. Always use `git clone` for production deployments.
+
+For local development, you can rsync to a *different* path (e.g., `/root/open_agent`) for rapid iteration, but keep the git clone at `/opt/open_agent/vaduz-v1` for the update system:
 
 ```bash
+# Fast dev loop (to a separate path)
 rsync -az --delete \
   --exclude target --exclude .git --exclude dashboard/node_modules \
-  /path/to/vaduz-v1/ \
-  root@<server-ip>:/opt/open_agent/vaduz-v1/
+  /path/to/local-dev/ \
+  root@<server-ip>:/root/open_agent/
+
+# The git clone at /opt/open_agent/vaduz-v1 is used by the update system
 ```
 
 If you need to specify a custom SSH key, add `-e "ssh -i ~/.ssh/your_key"`.
@@ -582,11 +587,29 @@ Or follow `docs/DESKTOP_SETUP.md`.
 
 ## 9) Updating
 
-### 9.1 Update Open Agent (build on server, restart service)
+### 9.1 Update Open Agent via Dashboard (recommended)
+
+The Settings page shows available updates for Open Agent, OpenCode, and oh-my-opencode. When a new version is available:
+
+1. Go to **Settings → System Components**
+2. If "Update Available" appears, click the **Update** button
+3. The update will:
+   - Fetch the latest git tags from the repository
+   - Checkout the newest release tag
+   - Build the binaries (debug mode for faster compile)
+   - Install and restart the service
+
+**Requirements for one-click updates:**
+- The repository at `/opt/open_agent/vaduz-v1` must be a git clone (not rsync'd files)
+- Create GitHub releases with version tags (e.g., `0.2.1` or `v0.2.1`) to trigger update detection
+- The server needs SSH access to pull from GitHub (deploy key configured in section 0.5.3)
+
+### 9.2 Update Open Agent manually (CLI)
 
 ```bash
 cd /opt/open_agent/vaduz-v1
-git pull
+git fetch --tags origin
+git checkout <version-tag>  # e.g., v0.2.1
 source /root/.cargo/env
 cargo build --bin open_agent --bin host-mcp --bin desktop-mcp
 install -m 0755 target/debug/open_agent /usr/local/bin/open_agent
@@ -595,7 +618,15 @@ install -m 0755 target/debug/desktop-mcp /usr/local/bin/desktop-mcp
 systemctl restart open_agent.service
 ```
 
-### 9.2 Update OpenCode (replace binary, restart service)
+Or to follow the latest master branch:
+
+```bash
+cd /opt/open_agent/vaduz-v1
+git pull origin master
+# ... build and install as above
+```
+
+### 9.3 Update OpenCode (replace binary, restart service)
 
 ```bash
 # Optionally pin a version
