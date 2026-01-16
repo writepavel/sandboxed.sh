@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, forwardRef, useImperativeHandle } from 'react';
 import { listLibraryCommands, getVisibleAgents, type CommandSummary } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -16,6 +16,10 @@ const BUILTIN_COMMANDS: CommandSummary[] = [
 export interface SubmitPayload {
   content: string;
   agent?: string;
+}
+
+export interface EnhancedInputHandle {
+  submit: () => void;
 }
 
 interface EnhancedInputProps {
@@ -34,14 +38,14 @@ interface AutocompleteItem {
   source?: string;
 }
 
-export function EnhancedInput({
+export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>(function EnhancedInput({
   value,
   onChange,
   onSubmit,
   placeholder = "Message the root agent...",
   disabled = false,
   className,
-}: EnhancedInputProps) {
+}, ref) {
   const [commands, setCommands] = useState<CommandSummary[]>([]);
   const [agents, setAgents] = useState<string[]>([]);
   const [showAutocomplete, setShowAutocomplete] = useState(false);
@@ -273,7 +277,7 @@ export function EnhancedInput({
     textareaRef.current?.focus();
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = useCallback(() => {
     const trimmedValue = displayValue.trim();
     if (!trimmedValue && !lockedAgent) return;
     if (disabled) return;
@@ -301,7 +305,12 @@ export function EnhancedInput({
     // Clear state after submit
     setLockedAgent(null);
     onChange('');
-  };
+  }, [displayValue, lockedAgent, disabled, onSubmit, parsedAgentFromValue, value, onChange]);
+
+  // Expose submit method via ref so parent can trigger submit (e.g., from Send button)
+  useImperativeHandle(ref, () => ({
+    submit: handleSubmit,
+  }), [handleSubmit]);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value;
@@ -428,4 +437,4 @@ export function EnhancedInput({
       )}
     </div>
   );
-}
+});

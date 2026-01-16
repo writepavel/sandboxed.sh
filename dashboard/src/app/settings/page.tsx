@@ -315,19 +315,35 @@ export default function SettingsPage() {
       {/* Centered content container */}
       <div className="w-full max-w-xl">
         {/* Header */}
-        <div className="mb-8 flex items-start justify-between">
+        <div className="mb-8 flex items-center justify-between">
           <div>
             <h1 className="text-xl font-semibold text-white">Settings</h1>
             <p className="mt-1 text-sm text-white/50">
               Configure your server connection and AI providers
             </p>
           </div>
-          {hasUnsavedChanges && (
-            <div className="flex items-center gap-2 text-amber-400 text-xs">
-              <AlertTriangle className="h-3.5 w-3.5" />
-              <span>Unsaved changes</span>
-            </div>
-          )}
+          <div className="flex items-center gap-3">
+            {hasUnsavedChanges && (
+              <div className="flex items-center gap-2 text-amber-400 text-xs">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                <span>Unsaved</span>
+              </div>
+            )}
+            <button
+              onClick={handleSave}
+              disabled={!!urlError || !!repoError}
+              className={cn(
+                'flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-colors cursor-pointer',
+                urlError || repoError
+                  ? 'bg-white/10 cursor-not-allowed opacity-50'
+                  : 'bg-indigo-500 hover:bg-indigo-600'
+              )}
+            >
+              <Save className="h-4 w-4" />
+              Save
+              <span className="text-xs text-white/40">⌘S</span>
+            </button>
+          </div>
         </div>
 
         <div className="space-y-5">
@@ -557,21 +573,6 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          {/* Save Button */}
-          <button
-            onClick={handleSave}
-            disabled={!!urlError || !!repoError}
-            className={cn(
-              'w-full flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium text-white transition-colors cursor-pointer',
-              urlError || repoError
-                ? 'bg-white/10 cursor-not-allowed opacity-50'
-                : 'bg-indigo-500 hover:bg-indigo-600'
-            )}
-          >
-            <Save className="h-4 w-4" />
-            Save Settings
-            <span className="text-xs text-white/50 ml-1">(⌘S)</span>
-          </button>
         </div>
       </div>
     </div>
