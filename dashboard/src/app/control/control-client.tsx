@@ -38,6 +38,8 @@ import {
   closeDesktopSession,
   keepAliveDesktopSession,
   cleanupOrphanedDesktopSessions,
+  removeFromQueue,
+  clearQueue,
   type StreamDiagnosticUpdate,
   type ControlRunState,
   type Mission,
@@ -50,6 +52,7 @@ import {
   type DesktopSessionStatus,
   type StoredEvent,
 } from "@/lib/api";
+import { QueueStrip, type QueueItem } from "@/components/queue-strip";
 import {
   Send,
   Square,
@@ -75,6 +78,7 @@ import {
   RotateCcw,
   PlayCircle,
   Link2,
+  ListPlus,
   X,
   Wrench,
   Terminal,
@@ -2432,6 +2436,14 @@ export default function ControlClient() {
   const missionHistoryToItems = useCallback((mission: Mission): ChatItem[] => {
     // Estimate timestamps based on mission creation time
     const baseTime = new Date(mission.created_at).getTime();
+    // Find index of last assistant message to apply mission status
+    const lastAssistantIdx = mission.history.reduce(
+      (lastIdx, entry, i) => (entry.role === "assistant" ? i : lastIdx),
+      -1
+    );
+    // Mission is considered failed if status is "failed"
+    const missionFailed = mission.status === "failed";
+
     return mission.history.map((entry, i) => {
       // Spread timestamps across history (rough estimate)
       const timestamp = baseTime + i * 60000; // 1 minute apart
@@ -2443,14 +2455,19 @@ export default function ControlClient() {
           timestamp,
         };
       } else {
+        // Last assistant message inherits mission status
+        // Earlier assistant messages are assumed successful
+        const isLastAssistant = i === lastAssistantIdx;
+        const success = isLastAssistant ? !missionFailed : true;
         return {
           kind: "assistant" as const,
           id: `history-${mission.id}-${i}`,
           content: entry.content,
-          success: true,
+          success,
           costCents: 0,
           model: null,
           timestamp,
+          resumable: isLastAssistant && missionFailed ? mission.resumable : undefined,
         };
       }
     });
@@ -3982,6 +3999,45 @@ export default function ControlClient() {
     }
   };
 
+  // Compute queued items for the queue strip
+  const queuedItems: QueueItem[] = useMemo(() => {
+    return items
+      .filter((item): item is Extract<typeof item, { kind: "user" }> =>
+        item.kind === "user" && item.queued === true
+      )
+      .map((item) => ({
+        id: item.id,
+        content: item.content,
+        agent: null, // Agent info not stored in current item structure
+      }));
+  }, [items]);
+
+  // Handle removing a message from the queue
+  const handleRemoveFromQueue = async (messageId: string) => {
+    try {
+      await removeFromQueue(messageId);
+      // Optimistically remove from local state
+      setItems((prev) => prev.filter((item) => item.id !== messageId));
+      toast.success("Removed from queue");
+    } catch (err) {
+      console.error(err);
+      toast.error("Failed to remove from queue");
+    }
+  };
+
+  // Handle clearing all queued messages
+  const handleClearQueue = async () => {
+    try {
+      const { cleared } = await clearQueue();
+      // Optimistically remove all queued items from local state
+      setItems((prev) => prev.filter((item) => !(item.kind === "user" && item.queued === true)));
+      toast.success(`Cleared ${cleared} message${cleared !== 1 ? "s" : ""} from queue`);
+    } catch (err) {
+      console.error(err);
+      toast.error("Failed to clear queue");
+    }
+  };
+
   const activeMission = viewingMission ?? currentMission;
   const missionStatus = activeMission
     ? missionStatusLabel(activeMission.status)
@@ -5149,56 +5205,75 @@ export default function ControlClient() {
               </button>
             </div>
           ) : (
-            <form
-              onSubmit={(e) => e.preventDefault()}
-              className="mx-auto flex max-w-3xl gap-3 items-end"
-            >
-              <div className="flex gap-1">
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
-                  title="Attach files"
-                >
-                  <Paperclip className="h-5 w-5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowUrlInput(!showUrlInput)}
-                  className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? 'text-indigo-400 border-indigo-500/30' : ''}`}
-                  title="Download from URL"
-                >
-                  <Link2 className="h-5 w-5" />
-                </button>
-              </div>
-
-              <EnhancedInput
-                value={input}
-                onChange={setInput}
-                onSubmit={handleEnhancedSubmit}
-                placeholder="Message the root agent… (paste files to upload)"
+            <div className="mx-auto max-w-3xl w-full space-y-2">
+              {/* Queue Strip - shows queued messages when present */}
+              <QueueStrip
+                items={queuedItems}
+                onRemove={handleRemoveFromQueue}
+                onClearAll={handleClearQueue}
               />
 
-              {isBusy ? (
-                <button
-                  type="button"
-                  onClick={handleStop}
-                  className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
-                >
-                  <Square className="h-4 w-4" />
-                  Stop
-                </button>
-              ) : (
-                <button
-                  type="submit"
-                  disabled={!input.trim()}
-                  className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
-                >
-                  <Send className="h-4 w-4" />
-                  Send
-                </button>
+              <form
+                onSubmit={(e) => e.preventDefault()}
+                className="flex gap-3 items-end"
+              >
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0"
+                    title="Attach files"
+                  >
+                    <Paperclip className="h-5 w-5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowUrlInput(!showUrlInput)}
+                    className={`p-3 rounded-xl border border-white/[0.06] bg-white/[0.02] text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors shrink-0 ${showUrlInput ? 'text-indigo-400 border-indigo-500/30' : ''}`}
+                    title="Download from URL"
+                  >
+                    <Link2 className="h-5 w-5" />
+                  </button>
+                </div>
+
+                <EnhancedInput
+                  value={input}
+                  onChange={setInput}
+                  onSubmit={handleEnhancedSubmit}
+                  placeholder="Message the root agent… (paste files to upload)"
+                />
+
+                {isBusy ? (
+                  <>
+                    <button
+                      type="submit"
+                      disabled={!input.trim()}
+                      className="flex items-center gap-2 rounded-xl bg-indigo-500/80 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                    >
+                      <ListPlus className="h-4 w-4" />
+                      Queue
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleStop}
+                      className="flex items-center gap-2 rounded-xl bg-red-500 hover:bg-red-600 px-5 py-3 text-sm font-medium text-white transition-colors shrink-0"
+                    >
+                      <Square className="h-4 w-4" />
+                      Stop
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={!input.trim()}
+                    className="flex items-center gap-2 rounded-xl bg-indigo-500 hover:bg-indigo-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                  >
+                    <Send className="h-4 w-4" />
+                    Send
+                  </button>
               )}
-            </form>
+              </form>
+            </div>
           )}
         </div>
       </div>

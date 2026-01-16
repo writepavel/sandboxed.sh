@@ -16,8 +16,13 @@ final class APIService {
     
     // Configuration
     var baseURL: String {
-        get { UserDefaults.standard.string(forKey: "api_base_url") ?? "https://agent-backend.thomas.md" }
+        get { UserDefaults.standard.string(forKey: "api_base_url") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "api_base_url") }
+    }
+
+    /// Whether the server URL has been configured
+    var isConfigured: Bool {
+        !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     
     private var jwtToken: String? {
@@ -190,7 +195,25 @@ final class APIService {
     func cancelControl() async throws {
         let _: EmptyResponse = try await post("/api/control/cancel", body: EmptyBody())
     }
-    
+
+    // MARK: - Queue Management
+
+    func getQueue() async throws -> [QueuedMessage] {
+        try await get("/api/control/queue")
+    }
+
+    func removeFromQueue(messageId: String) async throws {
+        let _: EmptyResponse = try await delete("/api/control/queue/\(messageId)")
+    }
+
+    func clearQueue() async throws -> Int {
+        struct ClearResponse: Decodable {
+            let cleared: Int
+        }
+        let response: ClearResponse = try await delete("/api/control/queue")
+        return response.cleared
+    }
+
     // MARK: - Tasks
     
     func listTasks() async throws -> [TaskState] {

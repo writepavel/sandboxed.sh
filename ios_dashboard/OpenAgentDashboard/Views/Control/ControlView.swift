@@ -13,6 +13,8 @@ struct ControlView: View {
     @State private var inputText = ""
     @State private var runState: ControlRunState = .idle
     @State private var queueLength = 0
+    @State private var queuedItems: [QueuedMessage] = []
+    @State private var showQueueSheet = false
     @State private var currentMission: Mission?
     @State private var viewingMission: Mission?
     @State private var isLoading = true
@@ -41,10 +43,10 @@ struct ControlView: View {
     @State private var desktopDisplayId = ":101"
     private let availableDisplays = [":99", ":100", ":101", ":102"]
 
-    // Workspace selection state
-    @State private var workspaces: [Workspace] = []
+    // Workspace selection state (global)
+    private var workspaceState = WorkspaceState.shared
     @State private var showNewMissionSheet = false
-    @State private var selectedWorkspaceId: String? = nil
+    @State private var showSettings = false
 
     @FocusState private var isInputFocused: Bool
     
@@ -101,9 +103,15 @@ struct ControlView: View {
                                 .foregroundStyle(Theme.textSecondary)
 
                             if queueLength > 0 {
-                                Text("• \(queueLength) queued")
-                                    .font(.caption2)
-                                    .foregroundStyle(Theme.textTertiary)
+                                Button {
+                                    Task { await loadQueueItems() }
+                                    showQueueSheet = true
+                                    HapticService.lightTap()
+                                } label: {
+                                    Text("• \(queueLength) queued")
+                                        .font(.caption2)
+                                        .foregroundStyle(Theme.warning)
+                                }
                             }
 
                             // Progress indicator
@@ -120,25 +128,48 @@ struct ControlView: View {
             }
             
             ToolbarItem(placement: .topBarLeading) {
-                // Running missions toggle
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showRunningMissions.toggle()
-                    }
-                    HapticService.selectionChanged()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "square.stack.3d.up")
-                            .font(.system(size: 14))
-                        if !runningMissions.isEmpty {
-                            Text("\(runningMissions.count)")
-                                .font(.caption2.weight(.semibold))
+                // Workspace selector menu
+                Menu {
+                    // Workspace selection section
+                    Section("Workspace") {
+                        ForEach(workspaceState.workspaces) { workspace in
+                            Button {
+                                workspaceState.selectWorkspace(id: workspace.id)
+                                HapticService.selectionChanged()
+                            } label: {
+                                HStack {
+                                    Label(workspace.displayLabel, systemImage: workspace.workspaceType.icon)
+                                    if workspaceState.selectedWorkspace?.id == workspace.id {
+                                        Spacer()
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
                         }
                     }
-                    .foregroundStyle(showRunningMissions ? Theme.accent : Theme.textSecondary)
+
+                    // Running missions section
+                    if !runningMissions.isEmpty {
+                        Section("Running Missions (\(runningMissions.count))") {
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    showRunningMissions.toggle()
+                                }
+                            } label: {
+                                Label(
+                                    showRunningMissions ? "Hide Running Missions" : "Show Running Missions",
+                                    systemImage: "square.stack.3d.up"
+                                )
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.system(size: 16))
+                        .foregroundStyle(Theme.textSecondary)
                 }
             }
-            
+
             ToolbarItem(placement: .topBarTrailing) {
                 // Desktop stream button
                 Button {
@@ -155,7 +186,7 @@ struct ControlView: View {
                 Menu {
                     Button {
                         Task {
-                            await loadWorkspaces()
+                            await workspaceState.loadWorkspaces()
                             showNewMissionSheet = true
                         }
                     } label: {
@@ -179,6 +210,14 @@ struct ControlView: View {
                         }
                     } label: {
                         Label("View Desktop (\(desktopDisplayId))", systemImage: "display")
+                    }
+
+                    Divider()
+
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
                     }
 
                     if let mission = viewingMission {
@@ -220,6 +259,9 @@ struct ControlView: View {
             }
         }
         .task {
+            // Load workspaces for the workspace picker
+            await workspaceState.loadWorkspaces()
+
             // Check if we're being opened with a specific mission from History
             if let pendingId = nav.consumePendingMission() {
                 await loadMission(id: pendingId)
@@ -228,15 +270,15 @@ struct ControlView: View {
             } else {
                 await loadCurrentMission(updateViewing: true)
             }
-            
+
             // Fetch initial running missions
             await refreshRunningMissions()
-            
+
             // Auto-show bar if there are multiple running missions
             if runningMissions.count > 1 {
                 showRunningMissions = true
             }
-            
+
             startStreaming()
             startPollingRunningMissions()
         }
@@ -269,8 +311,11 @@ struct ControlView: View {
         }
         .sheet(isPresented: $showNewMissionSheet) {
             NewMissionSheet(
-                workspaces: workspaces,
-                selectedWorkspaceId: $selectedWorkspaceId,
+                workspaces: workspaceState.workspaces,
+                selectedWorkspaceId: Binding(
+                    get: { workspaceState.selectedWorkspace?.id },
+                    set: { if let id = $0 { workspaceState.selectWorkspace(id: id) } }
+                ),
                 onCreate: { workspaceId in
                     showNewMissionSheet = false
                     Task { await createNewMission(workspaceId: workspaceId) }
@@ -282,8 +327,27 @@ struct ControlView: View {
             .presentationDetents([.medium])
             .presentationDragIndicator(.visible)
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsView()
+        }
+        .sheet(isPresented: $showQueueSheet) {
+            QueueSheet(
+                items: queuedItems,
+                onRemove: { messageId in
+                    Task { await removeFromQueue(messageId: messageId) }
+                },
+                onClearAll: {
+                    Task { await clearQueue() }
+                },
+                onDismiss: {
+                    showQueueSheet = false
+                }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
     }
-    
+
     // MARK: - Running Missions Bar
     
     private var runningMissionsBar: some View {
@@ -496,7 +560,7 @@ struct ControlView: View {
     private var emptyStateView: some View {
         VStack(spacing: 32) {
             Spacer()
-            
+
             // Animated brain icon
             Image(systemName: "brain")
                 .font(.system(size: 56, weight: .light))
@@ -508,58 +572,34 @@ struct ControlView: View {
                     )
                 )
                 .symbolEffect(.pulse, options: .repeating.speed(0.5))
-            
+
             VStack(spacing: 12) {
                 Text("Ready to Help")
                     .font(.title2.bold())
                     .foregroundStyle(Theme.textPrimary)
-                
-                Text("Send a message to start working\nwith the AI agent")
+
+                Text(emptyStateSubtitle)
                     .font(.subheadline)
                     .foregroundStyle(Theme.textSecondary)
                     .multilineTextAlignment(.center)
                     .lineSpacing(4)
             }
-            
-            // Quick action templates
-            VStack(spacing: 12) {
-                Text("Quick actions:")
-                    .font(.caption)
-                    .foregroundStyle(Theme.textMuted)
 
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                    quickActionButton(
-                        icon: "doc.text.fill",
-                        title: "Analyze files",
-                        prompt: "Read the files in /root/context and summarize what they contain",
-                        color: Theme.accent
-                    )
-                    quickActionButton(
-                        icon: "globe",
-                        title: "Search web",
-                        prompt: "Search the web for the latest news about ",
-                        color: Theme.success
-                    )
-                    quickActionButton(
-                        icon: "chevron.left.forwardslash.chevron.right",
-                        title: "Write code",
-                        prompt: "Write a Python script that ",
-                        color: Theme.warning
-                    )
-                    quickActionButton(
-                        icon: "terminal.fill",
-                        title: "Run command",
-                        prompt: "Run the command: ",
-                        color: Theme.info
-                    )
-                }
-            }
-            .padding(.top, 8)
-            
             Spacer()
             Spacer()
         }
         .padding(.horizontal, 32)
+    }
+
+    private var emptyStateSubtitle: String {
+        if let workspace = workspaceState.selectedWorkspace {
+            if workspace.isDefault {
+                return "Send a message to start working\non the host environment"
+            } else {
+                return "Send a message to start working\nin \(workspace.name)"
+            }
+        }
+        return "Send a message to start working\nwith the AI agent"
     }
     
     private func suggestionChip(_ text: String) -> some View {
@@ -581,40 +621,12 @@ struct ControlView: View {
         }
     }
 
-    private func quickActionButton(icon: String, title: String, prompt: String, color: Color) -> some View {
-        Button {
-            inputText = prompt
-            isInputFocused = true
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .font(.system(size: 14))
-                    .foregroundStyle(color)
-                    .frame(width: 20)
-
-                Text(title)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Theme.textSecondary)
-
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(Theme.backgroundSecondary)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Theme.border, lineWidth: 1)
-            )
-        }
-    }
-    
     // MARK: - Input
 
     private var inputView: some View {
         VStack(spacing: 0) {
             // ChatGPT-style input: clean outline, no fill, integrated send button
-            HStack(alignment: .bottom, spacing: 0) {
+            HStack(alignment: .center, spacing: 0) {
                 // Text input - minimal style with just a border
                 TextField("Message the agent...", text: $inputText, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -662,10 +674,8 @@ struct ControlView: View {
                 .disabled(runState == .idle && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .animation(.easeInOut(duration: 0.15), value: runState)
                 .animation(.easeInOut(duration: 0.15), value: inputText.isEmpty)
-                .padding(.trailing, 6)
-                .padding(.bottom, 6)
+                .padding(.trailing, 8)
             }
-            .background(Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
@@ -674,7 +684,6 @@ struct ControlView: View {
             .padding(.horizontal, 16)
             .padding(.top, 12)
             .padding(.bottom, 16)
-            .background(Theme.backgroundPrimary)
         }
     }
     
@@ -781,23 +790,6 @@ struct ControlView: View {
         }
     }
 
-    private func loadWorkspaces() async {
-        do {
-            workspaces = try await api.listWorkspaces()
-            // Validate selected workspace still exists, reset to default if not
-            if let selected = selectedWorkspaceId, !workspaces.contains(where: { $0.id == selected }) {
-                selectedWorkspaceId = nil
-            }
-            // Default to host workspace if none selected
-            if selectedWorkspaceId == nil, let defaultWorkspace = workspaces.first(where: { $0.isDefault }) {
-                selectedWorkspaceId = defaultWorkspace.id
-            }
-        } catch {
-            print("Failed to load workspaces: \(error)")
-            workspaces = []
-            selectedWorkspaceId = nil
-        }
-    }
     
     private func setMissionStatus(_ status: MissionStatus) async {
         guard let mission = viewingMission else { return }
@@ -878,6 +870,50 @@ struct ControlView: View {
             HapticService.success()
         } catch {
             print("Failed to cancel: \(error)")
+            HapticService.error()
+        }
+    }
+
+    // MARK: - Queue Management
+
+    private func loadQueueItems() async {
+        do {
+            queuedItems = try await api.getQueue()
+        } catch {
+            print("Failed to load queue: \(error)")
+        }
+    }
+
+    private func removeFromQueue(messageId: String) async {
+        // Optimistic update
+        queuedItems.removeAll { $0.id == messageId }
+        queueLength = max(0, queueLength - 1)
+
+        do {
+            try await api.removeFromQueue(messageId: messageId)
+        } catch {
+            print("Failed to remove from queue: \(error)")
+            // Refresh from server on error to get actual state
+            await loadQueueItems()
+            queueLength = queuedItems.count
+            HapticService.error()
+        }
+    }
+
+    private func clearQueue() async {
+        // Optimistic update
+        queuedItems = []
+        queueLength = 0
+        showQueueSheet = false
+
+        do {
+            _ = try await api.clearQueue()
+            HapticService.success()
+        } catch {
+            print("Failed to clear queue: \(error)")
+            // Refresh from server on error to get actual state
+            await loadQueueItems()
+            queueLength = queuedItems.count
             HapticService.error()
         }
     }

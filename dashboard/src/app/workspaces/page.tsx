@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import useSWR from 'swr';
 import {
   listWorkspaces,
   getWorkspace,
@@ -36,132 +37,95 @@ import {
   RefreshCw,
   Save,
   Bookmark,
-  FileText,
   Sparkles,
-  Eye,
-  EyeOff,
-  Lock,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/components/toast';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
+import { EnvVarsEditor, type EnvRow, toEnvRows, envRowsToMap, getEncryptedKeys } from '@/components/env-vars-editor';
 
 // The nil UUID represents the default "host" workspace which cannot be deleted
 const DEFAULT_WORKSPACE_ID = '00000000-0000-0000-0000-000000000000';
 
+// Format bytes into human-readable size
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  if (gb < 1024) return `${gb.toFixed(2)} GB`;
+  const tb = gb / 1024;
+  return `${tb.toFixed(2)} TB`;
+}
+
 export default function WorkspacesPage() {
   const router = useRouter();
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [selectedWorkspace, setSelectedWorkspace] = useState<Workspace | null>(null);
-  const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
-  const { showError } = useToast();
+  const { showError, showInfo } = useToast();
 
   const [showNewWorkspaceDialog, setShowNewWorkspaceDialog] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
   const [newWorkspaceType, setNewWorkspaceType] = useState<'host' | 'chroot'>('chroot');
   const [newWorkspaceTemplate, setNewWorkspaceTemplate] = useState('');
-  const [templates, setTemplates] = useState<WorkspaceTemplateSummary[]>([]);
-  const [templatesError, setTemplatesError] = useState<string | null>(null);
-  const [availableSkills, setAvailableSkills] = useState<SkillSummary[]>([]);
-  const [skillsError, setSkillsError] = useState<string | null>(null);
   const [skillsFilter, setSkillsFilter] = useState('');
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
-  const [workspaceTab, setWorkspaceTab] = useState<'overview' | 'skills' | 'environment' | 'template'>('overview');
+  const [workspaceTab, setWorkspaceTab] = useState<'overview' | 'skills' | 'environment' | 'template' | 'build'>('overview');
 
   // Build state
   const [building, setBuilding] = useState(false);
   const [selectedDistro, setSelectedDistro] = useState<ChrootDistro>('ubuntu-noble');
   const [buildDebug, setBuildDebug] = useState<WorkspaceDebugInfo | null>(null);
   const [buildLog, setBuildLog] = useState<InitLogResponse | null>(null);
-  const [showBuildLogs, setShowBuildLogs] = useState(false);
+  const buildLogRef = useRef<HTMLPreElement>(null);
 
   // Workspace settings state
-  const [envRows, setEnvRows] = useState<{ id: string; key: string; value: string; secret: boolean; visible: boolean }[]>([]);
+  const [envRows, setEnvRows] = useState<EnvRow[]>([]);
   const [initScript, setInitScript] = useState('');
   const [savingWorkspace, setSavingWorkspace] = useState(false);
   const [savingTemplate, setSavingTemplate] = useState(false);
   const [templateName, setTemplateName] = useState('');
   const [templateDescription, setTemplateDescription] = useState('');
 
-  const loadData = async () => {
-    try {
-      setLoading(true);
-      const workspacesData = await listWorkspaces();
-      setWorkspaces(workspacesData);
-    } catch (err) {
-      showError(err instanceof Error ? err.message : 'Failed to load workspaces');
-    } finally {
-      setLoading(false);
-    }
-  };
+  // SWR: fetch workspaces (shared key with overview page)
+  const { data: workspaces = [], isLoading: loading, mutate: mutateWorkspaces } = useSWR(
+    'workspaces',
+    listWorkspaces,
+    { revalidateOnFocus: false }
+  );
 
-  const loadTemplates = async () => {
-    try {
-      setTemplatesError(null);
-      const templateData = await listWorkspaceTemplates();
-      setTemplates(templateData);
-    } catch (err) {
-      setTemplates([]);
-      setTemplatesError(err instanceof Error ? err.message : 'Failed to load templates');
-    }
-  };
+  // SWR: fetch templates
+  const { data: templates = [], error: templatesError, mutate: mutateTemplates } = useSWR(
+    'workspace-templates',
+    listWorkspaceTemplates,
+    { revalidateOnFocus: false }
+  );
 
-  const loadSkills = async () => {
-    try {
-      setSkillsError(null);
-      const skills = await listLibrarySkills();
-      setAvailableSkills(skills);
-    } catch (err) {
-      setAvailableSkills([]);
-      setSkillsError(err instanceof Error ? err.message : 'Failed to load skills');
-    }
-  };
+  // SWR: fetch skills (shared key with library)
+  const { data: availableSkills = [], error: skillsError } = useSWR(
+    'library-skills',
+    listLibrarySkills,
+    { revalidateOnFocus: false }
+  );
 
-  // Patterns that indicate a sensitive value
-  const isSensitiveKey = (key: string) => {
-    const upperKey = key.toUpperCase();
-    const sensitivePatterns = [
-      'KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'PASS', 'CREDENTIAL', 'AUTH',
-      'PRIVATE', 'API_KEY', 'ACCESS_TOKEN', 'B64', 'BASE64', 'ENCRYPTED',
+  // Dynamic tabs based on workspace state - Build tab only shows for chroot workspaces
+  const getWorkspaceTabs = (workspace: Workspace | null) => {
+    const tabs: { id: 'overview' | 'skills' | 'environment' | 'template' | 'build'; label: string }[] = [
+      { id: 'overview', label: 'Overview' },
+      { id: 'skills', label: 'Skills' },
+      { id: 'environment', label: 'Env' },
     ];
-    return sensitivePatterns.some(pattern => upperKey.includes(pattern));
+    // Add Build tab for chroot workspaces
+    if (workspace?.workspace_type === 'chroot') {
+      tabs.push({ id: 'build', label: 'Build' });
+    }
+    tabs.push({ id: 'template', label: 'Template' });
+    return tabs;
   };
+  const workspaceTabs = getWorkspaceTabs(selectedWorkspace);
 
-  const toEnvRows = (env: Record<string, string>) =>
-    Object.entries(env).map(([key, value]) => {
-      const secret = isSensitiveKey(key);
-      return {
-        id: `${key}-${Math.random().toString(36).slice(2, 8)}`,
-        key,
-        value,
-        secret,
-        visible: !secret, // Hidden by default if secret
-      };
-    });
-
-  const envRowsToMap = (rows: { key: string; value: string }[]) => {
-    const env: Record<string, string> = {};
-    rows.forEach((row) => {
-      const key = row.key.trim();
-      if (!key) return;
-      env[key] = row.value;
-    });
-    return env;
-  };
-
-  const workspaceTabs = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'skills', label: 'Skills' },
-    { id: 'environment', label: 'Env & Init' },
-    { id: 'template', label: 'Template' },
-  ] as const;
-
-  useEffect(() => {
-    loadData();
-    loadTemplates();
-    loadSkills();
-  }, []);
 
   // Handle Escape key for modals
   useEffect(() => {
@@ -211,20 +175,32 @@ export default function WorkspacesPage() {
     }
   }, [newWorkspaceTemplate]);
 
-  // Poll build progress when workspace is building
+  // Poll build progress when workspace is building, or fetch logs on error
   useEffect(() => {
-    if (!selectedWorkspace || selectedWorkspace.status !== 'building') {
+    if (!selectedWorkspace) {
       setBuildDebug(null);
       setBuildLog(null);
       return;
     }
 
-    // Auto-expand logs when building starts
-    setShowBuildLogs(true);
+    const isBuilding = selectedWorkspace.status === 'building';
+    const hasError = selectedWorkspace.status === 'error';
+
+    // Clear state when transitioning to ready or other non-error states
+    if (!isBuilding && !hasError) {
+      setBuildDebug(null);
+      setBuildLog(null);
+      return;
+    }
+
+    // Auto-switch to Build tab when building starts or on error
+    if (isBuilding || hasError) {
+      setWorkspaceTab('build');
+    }
 
     let cancelled = false;
 
-    const pollBuildProgress = async () => {
+    const fetchBuildInfo = async () => {
       try {
         const [debug, log] = await Promise.all([
           getWorkspaceDebug(selectedWorkspace.id).catch(() => null),
@@ -234,27 +210,43 @@ export default function WorkspacesPage() {
         if (debug) setBuildDebug(debug);
         if (log) setBuildLog(log);
 
-        // Refresh workspace status
-        const updated = await getWorkspace(selectedWorkspace.id);
-        if (cancelled) return;
-        if (updated.status !== selectedWorkspace.status) {
-          setSelectedWorkspace(updated);
-          await loadData();
+        // Only poll for status updates when building (not when already in error state)
+        if (isBuilding) {
+          const updated = await getWorkspace(selectedWorkspace.id);
+          if (cancelled) return;
+          if (updated.status !== selectedWorkspace.status) {
+            setSelectedWorkspace(updated);
+            await mutateWorkspaces();
+          }
         }
       } catch {
         // Ignore errors during polling
       }
     };
 
-    // Poll immediately and then every 3 seconds
-    pollBuildProgress();
-    const interval = setInterval(pollBuildProgress, 3000);
+    // Fetch immediately
+    fetchBuildInfo();
+
+    // Only poll repeatedly when building, not when in error state
+    if (isBuilding) {
+      const interval = setInterval(fetchBuildInfo, 3000);
+      return () => {
+        cancelled = true;
+        clearInterval(interval);
+      };
+    }
 
     return () => {
       cancelled = true;
-      clearInterval(interval);
     };
   }, [selectedWorkspace?.id, selectedWorkspace?.status]);
+
+  // Auto-scroll build log to bottom when new content arrives
+  useEffect(() => {
+    if (buildLogRef.current) {
+      buildLogRef.current.scrollTop = buildLogRef.current.scrollHeight;
+    }
+  }, [buildLog?.content]);
 
   const loadWorkspace = async (id: string) => {
     try {
@@ -275,30 +267,33 @@ export default function WorkspacesPage() {
         workspace_type: workspaceType,
         template: newWorkspaceTemplate || undefined,
       });
-      await loadData();
-      setShowNewWorkspaceDialog(false);
-      setNewWorkspaceName('');
-      setNewWorkspaceTemplate('');
 
-      // Auto-select the new workspace
-      setSelectedWorkspace(created);
+      // Refresh workspace list immediately after creation so it appears in the UI
+      // even if the build step fails later
+      await mutateWorkspaces();
 
-      // Auto-trigger build for isolated (chroot) workspaces
+      // For chroot workspaces, trigger build BEFORE showing the modal
+      // This prevents the flicker where status briefly shows as non-building
+      let workspaceToShow = created;
       if (workspaceType === 'chroot') {
-        setBuilding(true);
         try {
-          const updated = await buildWorkspace(created.id, created.distro as ChrootDistro || 'ubuntu-noble', false);
-          setSelectedWorkspace(updated);
-          await loadData();
+          workspaceToShow = await buildWorkspace(created.id, created.distro as ChrootDistro || 'ubuntu-noble', false);
         } catch (buildErr) {
           showError(buildErr instanceof Error ? buildErr.message : 'Failed to start build');
           // Refresh workspace to get error status
-          const refreshed = await getWorkspace(created.id);
-          setSelectedWorkspace(refreshed);
-        } finally {
-          setBuilding(false);
+          try {
+            workspaceToShow = await getWorkspace(created.id);
+          } catch {
+            // If getWorkspace also fails, use created workspace
+          }
+          // Refresh list again to show error status
+          await mutateWorkspaces();
         }
       }
+      setShowNewWorkspaceDialog(false);
+      setNewWorkspaceName('');
+      setNewWorkspaceTemplate('');
+      setSelectedWorkspace(workspaceToShow);
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Failed to create workspace');
     } finally {
@@ -311,7 +306,7 @@ export default function WorkspacesPage() {
     try {
       await deleteWorkspace(id);
       setSelectedWorkspace(null);
-      await loadData();
+      await mutateWorkspaces();
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Failed to delete workspace');
     }
@@ -323,11 +318,11 @@ export default function WorkspacesPage() {
       setBuilding(true);
       const updated = await buildWorkspace(selectedWorkspace.id, selectedDistro, rebuild);
       setSelectedWorkspace(updated);
-      await loadData();
+      await mutateWorkspaces();
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Failed to build workspace');
       // Refresh to get latest status
-      await loadData();
+      await mutateWorkspaces();
       if (selectedWorkspace) {
         const refreshed = await getWorkspace(selectedWorkspace.id);
         setSelectedWorkspace(refreshed);
@@ -348,7 +343,8 @@ export default function WorkspacesPage() {
         skills: selectedSkills,
       });
       setSelectedWorkspace(updated);
-      await loadData();
+      await mutateWorkspaces();
+      showInfo('Changes will apply to new missions', 'Saved');
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Failed to save workspace settings');
     } finally {
@@ -366,14 +362,16 @@ export default function WorkspacesPage() {
     try {
       setSavingTemplate(true);
       const env_vars = envRowsToMap(envRows);
+      const encrypted_keys = getEncryptedKeys(envRows);
       await saveWorkspaceTemplate(trimmedName, {
         description: templateDescription.trim() || undefined,
         distro: selectedDistro,
         skills: selectedSkills,
         env_vars,
+        encrypted_keys,
         init_script: initScript,
       });
-      await loadTemplates();
+      await mutateTemplates();
     } catch (err) {
       showError(err instanceof Error ? err.message : 'Failed to save workspace template');
     } finally {
@@ -515,51 +513,48 @@ export default function WorkspacesPage() {
             className="w-full max-w-2xl max-h-[85vh] rounded-2xl bg-[#161618] border border-white/[0.06] shadow-[0_25px_100px_rgba(0,0,0,0.7)] flex flex-col overflow-hidden animate-scale-in-simple"
             onClick={(e) => e.stopPropagation()}
           >
-            {/* Header */}
-            <div className="px-6 pt-5 pb-4 border-b border-white/[0.06]">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="h-11 w-11 rounded-xl bg-gradient-to-br from-indigo-500/20 to-indigo-600/10 border border-indigo-500/20 flex items-center justify-center">
-                    <Server className="h-5 w-5 text-indigo-400" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-medium text-white">{selectedWorkspace.name}</h3>
-                    <div className="flex items-center gap-2 mt-0.5">
-                      <span className="text-xs text-white/40 font-mono">
-                        {formatWorkspaceType(selectedWorkspace.workspace_type)}
-                      </span>
-                      <span className="text-white/20">·</span>
-                      <span
-                        className={cn(
-                          'text-xs font-medium',
-                          selectedWorkspace.status === 'ready'
-                            ? 'text-emerald-400'
-                            : selectedWorkspace.status === 'building' || selectedWorkspace.status === 'pending'
-                            ? 'text-amber-400'
-                            : 'text-red-400'
-                        )}
-                      >
-                        {selectedWorkspace.status}
-                      </span>
-                    </div>
-                  </div>
+            {/* Header - Compact */}
+            <div className="px-5 pt-4 pb-3 border-b border-white/[0.06]">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-medium text-white">{selectedWorkspace.name}</h3>
+                  <span className="text-white/20">·</span>
+                  <span className="text-xs text-white/40">
+                    {formatWorkspaceType(selectedWorkspace.workspace_type)}
+                  </span>
+                  <span className="text-white/20">·</span>
+                  <span
+                    className={cn(
+                      'text-xs font-medium',
+                      selectedWorkspace.status === 'ready'
+                        ? 'text-emerald-400'
+                        : selectedWorkspace.status === 'building' || selectedWorkspace.status === 'pending'
+                        ? 'text-amber-400'
+                        : 'text-red-400'
+                    )}
+                  >
+                    {selectedWorkspace.status === 'building' && (
+                      <Loader className="inline h-3 w-3 animate-spin mr-1" />
+                    )}
+                    {selectedWorkspace.status}
+                  </span>
                 </div>
                 <button
                   onClick={() => setSelectedWorkspace(null)}
-                  className="p-2 -mr-1 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.06] transition-colors"
+                  className="p-1.5 -mr-1 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.06] transition-colors"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
 
               {/* Tabs */}
-              <div className="mt-4 flex items-center gap-1">
+              <div className="flex items-center gap-1">
                 {workspaceTabs.map((tab) => (
                   <button
                     key={tab.id}
                     onClick={() => setWorkspaceTab(tab.id)}
                     className={cn(
-                      'px-3.5 py-1.5 text-xs font-medium rounded-lg transition-all',
+                      'px-3 py-1.5 text-xs font-medium rounded-lg transition-all',
                       workspaceTab === tab.id
                         ? 'bg-white/[0.08] text-white'
                         : 'text-white/50 hover:text-white/80 hover:bg-white/[0.04]'
@@ -574,193 +569,209 @@ export default function WorkspacesPage() {
             {/* Content */}
             <div className="flex-1 min-h-0 overflow-y-auto">
               {workspaceTab === 'overview' && (
-                <div className="px-6 py-5 space-y-5">
-                  {/* Quick Info Grid */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="p-3.5 rounded-xl bg-white/[0.02] border border-white/[0.05]">
-                      <p className="text-[10px] text-white/40 uppercase tracking-wider mb-1">Template</p>
-                      <p className="text-sm text-white/90 font-medium">
-                        {selectedWorkspace.template || 'None'}
-                      </p>
-                    </div>
-                    <div className="p-3.5 rounded-xl bg-white/[0.02] border border-white/[0.05]">
-                      <p className="text-[10px] text-white/40 uppercase tracking-wider mb-1">Distribution</p>
-                      <p className="text-sm text-white/90 font-medium">
-                        {selectedWorkspace.distro || 'Default'}
-                      </p>
-                    </div>
+                <div className="px-5 py-4 space-y-4">
+                  {/* Quick Info - Inline badges */}
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    {selectedWorkspace.template && (
+                      <span className="px-2.5 py-1 rounded-md bg-white/[0.04] border border-white/[0.06] text-white/70">
+                        Template: <span className="text-white/90">{selectedWorkspace.template}</span>
+                      </span>
+                    )}
+                    {selectedWorkspace.distro && (
+                      <span className="px-2.5 py-1 rounded-md bg-white/[0.04] border border-white/[0.06] text-white/70">
+                        Distro: <span className="text-white/90">{selectedWorkspace.distro}</span>
+                      </span>
+                    )}
+                    <span className="px-2.5 py-1 rounded-md bg-white/[0.04] border border-white/[0.06] text-white/50">
+                      {formatDate(selectedWorkspace.created_at)}
+                    </span>
                   </div>
 
-                  {/* Details Section */}
-                  <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden">
-                    <div className="px-4 py-3 border-b border-white/[0.05]">
-                      <p className="text-xs text-white/50 font-medium">Details</p>
-                    </div>
-                    <div className="divide-y divide-white/[0.04]">
-                      <div className="px-4 py-3 flex items-start justify-between gap-4">
-                        <span className="text-xs text-white/40 shrink-0">Path</span>
-                        <code className="text-xs text-white/70 font-mono break-all text-right">
-                          {selectedWorkspace.path}
-                        </code>
-                      </div>
-                      <div className="px-4 py-3 flex items-center justify-between gap-4">
-                        <span className="text-xs text-white/40">ID</span>
-                        <code className="text-xs text-white/70 font-mono">
-                          {selectedWorkspace.id}
-                        </code>
-                      </div>
-                      <div className="px-4 py-3 flex items-center justify-between">
-                        <span className="text-xs text-white/40">Created</span>
-                        <span className="text-xs text-white/70">
-                          {formatDate(selectedWorkspace.created_at)}
-                        </span>
-                      </div>
-                    </div>
+                  {/* Path - Minimal */}
+                  <div className="text-xs text-white/40">
+                    <code className="font-mono text-white/60">{selectedWorkspace.path}</code>
                   </div>
 
                   {selectedWorkspace.error_message && (
-                    <div className="rounded-xl bg-red-500/5 border border-red-500/15 p-4">
-                      <div className="flex items-start gap-3">
+                    <div className="rounded-lg bg-red-500/5 border border-red-500/15 p-3">
+                      <div className="flex items-start gap-2">
                         <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
                         <p className="text-sm text-red-300">{extractErrorSummary(selectedWorkspace.error_message)}</p>
                       </div>
                     </div>
                   )}
 
-                  {/* Build Environment */}
-                  {selectedWorkspace.workspace_type === 'chroot' && (
-                    <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden">
-                      <div className="px-4 py-3 border-b border-white/[0.05] flex items-center justify-between">
-                        <p className="text-xs text-white/50 font-medium">Build Environment</p>
-                        {selectedWorkspace.status === 'building' && (
-                          <span className="flex items-center gap-1.5 text-xs text-amber-400">
-                            <Loader className="h-3 w-3 animate-spin" />
-                            Building...
-                          </span>
-                        )}
+                  {/* Action hint for chroot workspaces */}
+                  {selectedWorkspace.workspace_type === 'chroot' && selectedWorkspace.status !== 'building' && selectedWorkspace.status !== 'ready' && (
+                    <div className="rounded-lg bg-amber-500/5 border border-amber-500/15 p-3">
+                      <p className="text-xs text-amber-300/80">
+                        Go to the <button onClick={() => setWorkspaceTab('build')} className="underline hover:text-amber-200">Build</button> tab to create the container environment.
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {workspaceTab === 'build' && selectedWorkspace.workspace_type === 'chroot' && (
+                <div className="px-5 py-4 flex flex-col h-full">
+                  {/* Build controls - shown when not building */}
+                  {selectedWorkspace.status !== 'building' && (
+                    <div className="space-y-4 mb-4">
+                      <div className="flex items-center gap-3">
+                        <select
+                          value={selectedDistro}
+                          onChange={(e) => setSelectedDistro(e.target.value as ChrootDistro)}
+                          disabled={building}
+                          className="px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-sm text-white focus:outline-none focus:border-indigo-500/50 disabled:opacity-50 appearance-none cursor-pointer"
+                          style={{
+                            backgroundImage:
+                              "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                            backgroundPosition: 'right 0.5rem center',
+                            backgroundRepeat: 'no-repeat',
+                            backgroundSize: '1.25em 1.25em',
+                            paddingRight: '2rem',
+                          }}
+                        >
+                          {CHROOT_DISTROS.map((distro) => (
+                            <option key={distro.value} value={distro.value} className="bg-[#161618]">
+                              {distro.label}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={() => handleBuildWorkspace(selectedWorkspace.status === 'ready')}
+                          disabled={building}
+                          className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg disabled:opacity-50 transition-colors"
+                        >
+                          {building ? (
+                            <>
+                              <Loader className="h-4 w-4 animate-spin" />
+                              {selectedWorkspace.status === 'ready' ? 'Rebuilding...' : 'Building...'}
+                            </>
+                          ) : selectedWorkspace.status === 'ready' ? (
+                            <>
+                              <RefreshCw className="h-4 w-4" />
+                              Rebuild
+                            </>
+                          ) : (
+                            <>
+                              <Hammer className="h-4 w-4" />
+                              Build
+                            </>
+                          )}
+                        </button>
+                        <span className="text-xs text-white/40">
+                          {selectedWorkspace.status === 'ready'
+                            ? 'Destroys container and reruns init script'
+                            : 'Creates isolated Linux filesystem'}
+                        </span>
                       </div>
-                      <div className="p-4 space-y-4">
-                        {/* Show build controls when not building */}
-                        {selectedWorkspace.status !== 'building' && (
-                          <>
-                            <div>
-                              <label className="text-xs text-white/40 block mb-2">Linux Distribution</label>
-                              <select
-                                value={selectedDistro}
-                                onChange={(e) => setSelectedDistro(e.target.value as ChrootDistro)}
-                                disabled={building}
-                                className="w-full px-3 py-2.5 rounded-lg bg-black/20 border border-white/[0.06] text-sm text-white focus:outline-none focus:border-indigo-500/50 disabled:opacity-50 appearance-none cursor-pointer"
-                                style={{
-                                  backgroundImage:
-                                    "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
-                                  backgroundPosition: 'right 0.75rem center',
-                                  backgroundRepeat: 'no-repeat',
-                                  backgroundSize: '1.25em 1.25em',
-                                }}
-                              >
-                                {CHROOT_DISTROS.map((distro) => (
-                                  <option key={distro.value} value={distro.value} className="bg-[#161618]">
-                                    {distro.label}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                            <div className="flex items-center gap-3">
-                              <button
-                                onClick={() => handleBuildWorkspace(selectedWorkspace.status === 'ready')}
-                                disabled={building}
-                                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-500 hover:bg-indigo-600 rounded-lg disabled:opacity-50 transition-colors"
-                              >
-                                {building ? (
-                                  <>
-                                    <Loader className="h-4 w-4 animate-spin" />
-                                    {selectedWorkspace.status === 'ready' ? 'Rebuilding...' : 'Building...'}
-                                  </>
-                                ) : selectedWorkspace.status === 'ready' ? (
-                                  <>
-                                    <RefreshCw className="h-4 w-4" />
-                                    Rebuild
-                                  </>
-                                ) : (
-                                  <>
-                                    <Hammer className="h-4 w-4" />
-                                    Build
-                                  </>
-                                )}
-                              </button>
-                              <p className="text-xs text-white/40 flex-1">
-                                {selectedWorkspace.status === 'ready'
-                                  ? 'Destroys container and reruns init script'
-                                  : 'Creates isolated Linux filesystem'}
-                              </p>
-                            </div>
-                          </>
-                        )}
 
-                        {/* Build Progress Logs - shown when building */}
-                        {selectedWorkspace.status === 'building' && (
-                          <div className="space-y-3">
-                            {/* Header with size */}
-                            <div className="flex items-center justify-between">
-                              <div className="flex items-center gap-2">
-                                <FileText className="h-3.5 w-3.5 text-amber-400" />
-                                <span className="text-xs text-white/70 font-medium">Build Output</span>
-                              </div>
-                              {buildDebug?.size_bytes != null && buildDebug.size_bytes > 0 && (
-                                <span className="text-[10px] text-white/40 font-mono">
-                                  {buildDebug.size_bytes >= 1024 * 1024 * 1024
-                                    ? `${(buildDebug.size_bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
-                                    : `${(buildDebug.size_bytes / 1024 / 1024).toFixed(1)} MB`}
-                                </span>
-                              )}
-                            </div>
-
-                            {/* Container Status Badges */}
-                            {buildDebug && (
-                              <div className="flex flex-wrap gap-2">
-                                {buildDebug.has_bash && (
-                                  <span className="px-2 py-0.5 text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded">
-                                    bash ready
-                                  </span>
-                                )}
-                                {buildDebug.init_script_exists && (
-                                  <span className="px-2 py-0.5 text-[10px] font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded">
-                                    init script running
-                                  </span>
-                                )}
-                                {buildDebug.distro && (
-                                  <span className="px-2 py-0.5 text-[10px] font-mono text-white/40 bg-white/[0.04] border border-white/[0.06] rounded">
-                                    {buildDebug.distro}
-                                  </span>
-                                )}
-                              </div>
-                            )}
-
-                            {/* Init Log Output */}
-                            {buildLog?.exists && buildLog.content ? (
-                              <div className="rounded-lg bg-black/30 border border-white/[0.06] overflow-hidden">
-                                <div className="px-3 py-1.5 border-b border-white/[0.06] flex items-center justify-between">
-                                  <span className="text-[10px] text-white/40 font-mono">{buildLog.log_path}</span>
-                                  {buildLog.total_lines && (
-                                    <span className="text-[10px] text-white/30">{buildLog.total_lines} lines</span>
-                                  )}
-                                </div>
-                                <pre className="p-3 text-[11px] font-mono text-white/70 overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap break-all">
-                                  {buildLog.content.split('\n').slice(-50).join('\n')}
-                                </pre>
-                              </div>
-                            ) : (
-                              <div className="flex items-center gap-2 py-6 justify-center text-xs text-white/40">
-                                <Loader className="h-3 w-3 animate-spin" />
-                                <span>Waiting for build output...</span>
-                              </div>
-                            )}
-                          </div>
-                        )}
+                      {/* Init Script */}
+                      <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden">
+                        <div className="px-4 py-3 border-b border-white/[0.05] flex items-center gap-2">
+                          <Terminal className="h-4 w-4 text-indigo-400" />
+                          <p className="text-xs text-white/50 font-medium">Init Script</p>
+                        </div>
+                        <div className="p-4">
+                          <ConfigCodeEditor
+                            value={initScript}
+                            onChange={setInitScript}
+                            language="bash"
+                            placeholder="#!/usr/bin/env bash&#10;# Install packages or setup files here"
+                            className="min-h-[180px]"
+                            minHeight={180}
+                          />
+                          <p className="text-xs text-white/35 mt-3">
+                            Runs during build. Save changes, then Rebuild to apply.
+                          </p>
+                        </div>
                       </div>
                     </div>
                   )}
 
+                  {/* Build Progress - shown when building or on error */}
+                  {(selectedWorkspace.status === 'building' || selectedWorkspace.status === 'error') && (
+                    <div className="flex-1 flex flex-col min-h-0">
+                      {/* Error message */}
+                      {selectedWorkspace.status === 'error' && selectedWorkspace.error_message && (
+                        <div className="rounded-lg bg-red-500/10 border border-red-500/20 p-3 mb-3">
+                          <div className="flex items-start gap-2">
+                            <AlertCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-sm text-red-300 font-medium">Build Failed</p>
+                              <p className="text-xs text-red-300/70 mt-1 break-words">{selectedWorkspace.error_message}</p>
+                              {selectedWorkspace.error_message.includes('signal KILL') && (
+                                <p className="text-xs text-red-300/50 mt-2">
+                                  SIGKILL usually indicates out-of-memory. Try reducing packages installed or increasing server memory.
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Status header */}
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          {buildDebug?.has_bash && (
+                            <span className="px-2 py-0.5 text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded">
+                              bash ready
+                            </span>
+                          )}
+                          {selectedWorkspace.status === 'building' && buildDebug?.init_script_exists && (
+                            <span className="px-2 py-0.5 text-[10px] font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded">
+                              init script running
+                            </span>
+                          )}
+                          {buildDebug?.distro && (
+                            <span className="px-2 py-0.5 text-[10px] font-mono text-white/40 bg-white/[0.04] border border-white/[0.06] rounded">
+                              {buildDebug.distro}
+                            </span>
+                          )}
+                        </div>
+                        {buildDebug?.size_bytes != null && buildDebug.size_bytes > 0 && (
+                          <span className="text-[10px] text-white/40 font-mono">
+                            {formatBytes(buildDebug.size_bytes)}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Log output - constrained height with internal scroll */}
+                      {buildLog?.exists && buildLog.content ? (
+                        <div className="max-h-64 rounded-lg bg-black/30 border border-white/[0.06] overflow-hidden flex flex-col">
+                          <div className="px-3 py-1.5 border-b border-white/[0.06] flex items-center justify-between shrink-0">
+                            <span className="text-[10px] text-white/40 font-mono">{buildLog.log_path}</span>
+                            {buildLog.total_lines && (
+                              <span className="text-[10px] text-white/30">{buildLog.total_lines} lines</span>
+                            )}
+                          </div>
+                          <pre
+                            ref={buildLogRef}
+                            className="flex-1 min-h-0 p-3 text-[11px] font-mono text-white/70 overflow-auto whitespace-pre-wrap break-all"
+                          >
+                            {buildLog.content.split('\n').slice(-100).join('\n')}
+                          </pre>
+                        </div>
+                      ) : selectedWorkspace.status === 'error' ? (
+                        <div className="h-20 flex items-center justify-center text-xs text-white/40">
+                          <span>No build log available</span>
+                        </div>
+                      ) : (
+                        <div className="h-32 flex items-center justify-center text-xs text-white/40">
+                          <Loader className="h-3 w-3 animate-spin mr-2" />
+                          <span>Waiting for build output...</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Ready state info */}
+                  {selectedWorkspace.status === 'ready' && (
+                    <div className="text-xs text-white/40 mt-2">
+                      Container is ready. Use Rebuild to recreate with updated init script or distro.
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -786,7 +797,7 @@ export default function WorkspacesPage() {
                       />
 
                       {skillsError ? (
-                        <p className="text-xs text-red-400 py-4 text-center">{skillsError}</p>
+                        <p className="text-xs text-red-400 py-4 text-center">{skillsError instanceof Error ? skillsError.message : 'Failed to load skills'}</p>
                       ) : availableSkills.length === 0 ? (
                         <div className="py-8 text-center">
                           <Sparkles className="h-8 w-8 text-white/10 mx-auto mb-2" />
@@ -840,138 +851,14 @@ export default function WorkspacesPage() {
 
               {workspaceTab === 'environment' && (
                 <div className="px-6 py-5 space-y-4">
-                  {/* Environment Variables */}
-                  <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden">
-                    <div className="px-4 py-3 border-b border-white/[0.05] flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <FileText className="h-4 w-4 text-indigo-400" />
-                        <p className="text-xs text-white/50 font-medium">Environment Variables</p>
-                      </div>
-                      <button
-                        onClick={() =>
-                          setEnvRows((rows) => [
-                            ...rows,
-                            { id: Math.random().toString(36).slice(2), key: '', value: '', secret: false, visible: true },
-                          ])
-                        }
-                        className="text-xs text-indigo-400 hover:text-indigo-300 font-medium"
-                      >
-                        + Add
-                      </button>
-                    </div>
-
-                    <div className="p-4">
-                      {envRows.length === 0 ? (
-                        <div className="py-6 text-center">
-                          <p className="text-xs text-white/40">No environment variables</p>
-                          <button
-                            onClick={() =>
-                              setEnvRows([{ id: Math.random().toString(36).slice(2), key: '', value: '', secret: false, visible: true }])
-                            }
-                            className="text-xs text-indigo-400 hover:text-indigo-300 mt-2"
-                          >
-                            Add your first variable
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="space-y-2">
-                          {envRows.map((row) => (
-                            <div key={row.id} className="flex items-center gap-2">
-                              <input
-                                value={row.key}
-                                onChange={(e) => {
-                                  const newKey = e.target.value;
-                                  const secret = isSensitiveKey(newKey);
-                                  setEnvRows((rows) =>
-                                    rows.map((r) =>
-                                      r.id === row.id ? { ...r, key: newKey, secret, visible: r.visible || !secret } : r
-                                    )
-                                  );
-                                }}
-                                placeholder="KEY"
-                                className="flex-1 px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 font-mono focus:outline-none focus:border-indigo-500/50"
-                              />
-                              <span className="text-white/20">=</span>
-                              <div className="flex-1 relative">
-                                <input
-                                  type={row.secret && !row.visible ? 'password' : 'text'}
-                                  value={row.value}
-                                  onChange={(e) =>
-                                    setEnvRows((rows) =>
-                                      rows.map((r) =>
-                                        r.id === row.id ? { ...r, value: e.target.value } : r
-                                      )
-                                    )
-                                  }
-                                  placeholder="value"
-                                  className={cn(
-                                    "w-full px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/25 font-mono focus:outline-none focus:border-indigo-500/50",
-                                    row.secret && "pr-8"
-                                  )}
-                                />
-                                {row.secret && (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setEnvRows((rows) =>
-                                        rows.map((r) =>
-                                          r.id === row.id ? { ...r, visible: !r.visible } : r
-                                        )
-                                      )
-                                    }
-                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60 transition-colors"
-                                  >
-                                    {row.visible ? (
-                                      <EyeOff className="h-3.5 w-3.5" />
-                                    ) : (
-                                      <Eye className="h-3.5 w-3.5" />
-                                    )}
-                                  </button>
-                                )}
-                              </div>
-                              {row.secret && (
-                                <span title="Sensitive value - will be encrypted">
-                                  <Lock className="h-3.5 w-3.5 text-amber-400/60" />
-                                </span>
-                              )}
-                              <button
-                                onClick={() => setEnvRows((rows) => rows.filter((r) => r.id !== row.id))}
-                                className="p-2 text-white/30 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
-                              >
-                                <X className="h-3.5 w-3.5" />
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      {envRows.length > 0 && (
-                        <p className="text-xs text-white/35 mt-4 pt-3 border-t border-white/[0.04]">
-                          Injected into workspace shells and MCP tool runs. Sensitive values (<Lock className="h-3 w-3 inline-block text-amber-400/60 -mt-0.5" />) are encrypted at rest.
-                        </p>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Init Script */}
-                  <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden">
-                    <div className="px-4 py-3 border-b border-white/[0.05] flex items-center gap-2">
-                      <Terminal className="h-4 w-4 text-indigo-400" />
-                      <p className="text-xs text-white/50 font-medium">Init Script</p>
-                    </div>
-                    <div className="p-4">
-                      <ConfigCodeEditor
-                        value={initScript}
-                        onChange={setInitScript}
-                        language="bash"
-                        placeholder="#!/usr/bin/env bash&#10;# Install packages or setup files here"
-                        className="min-h-[220px]"
-                        minHeight={220}
-                      />
-                      <p className="text-xs text-white/35 mt-3">
-                        Runs during build. Changes require rebuild to take effect.
-                      </p>
-                    </div>
-                  </div>
+                  <EnvVarsEditor
+                    rows={envRows}
+                    onChange={setEnvRows}
+                    description="Injected into workspace shells and MCP tool runs. Use workspace templates to configure encryption for sensitive values."
+                  />
+                  <p className="text-xs text-white/35">
+                    Applied to new missions automatically. Running missions keep their original values.
+                  </p>
                 </div>
               )}
 
@@ -1147,7 +1034,7 @@ export default function WorkspacesPage() {
                   ))}
                 </select>
                 {templatesError && (
-                  <p className="text-xs text-red-400 mt-1.5">{templatesError}</p>
+                  <p className="text-xs text-red-400 mt-1.5">{templatesError instanceof Error ? templatesError.message : 'Failed to load templates'}</p>
                 )}
               </div>
 

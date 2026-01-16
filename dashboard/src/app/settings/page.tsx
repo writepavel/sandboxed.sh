@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
   getHealth,
@@ -31,6 +32,7 @@ import {
 import { readSavedSettings, writeSavedSettings } from '@/lib/settings';
 import { cn } from '@/lib/utils';
 import { AddProviderModal } from '@/components/ui/add-provider-modal';
+import { ServerConnectionCard } from '@/components/server-connection-card';
 
 // Provider icons/colors mapping
 const providerConfig: Record<string, { color: string; icon: string }> = {
@@ -51,9 +53,19 @@ function getProviderConfig(type: string) {
   return providerConfig[type] || providerConfig.custom;
 }
 
+// Default provider types fallback
+const defaultProviderTypes: AIProviderTypeInfo[] = [
+  { id: 'anthropic', name: 'Anthropic', uses_oauth: true, env_var: 'ANTHROPIC_API_KEY' },
+  { id: 'openai', name: 'OpenAI', uses_oauth: true, env_var: 'OPENAI_API_KEY' },
+  { id: 'google', name: 'Google AI', uses_oauth: true, env_var: 'GOOGLE_API_KEY' },
+  { id: 'open-router', name: 'OpenRouter', uses_oauth: false, env_var: 'OPENROUTER_API_KEY' },
+  { id: 'groq', name: 'Groq', uses_oauth: false, env_var: 'GROQ_API_KEY' },
+  { id: 'mistral', name: 'Mistral AI', uses_oauth: false, env_var: 'MISTRAL_API_KEY' },
+  { id: 'xai', name: 'xAI', uses_oauth: false, env_var: 'XAI_API_KEY' },
+  { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
+];
+
 export default function SettingsPage() {
-  const [health, setHealth] = useState<HealthResponse | null>(null);
-  const [healthLoading, setHealthLoading] = useState(true);
   const [testingConnection, setTestingConnection] = useState(false);
 
   // Form state
@@ -74,10 +86,7 @@ export default function SettingsPage() {
   const [urlError, setUrlError] = useState<string | null>(null);
   const [repoError, setRepoError] = useState<string | null>(null);
 
-  // AI Providers state
-  const [providers, setProviders] = useState<AIProvider[]>([]);
-  const [providerTypes, setProviderTypes] = useState<AIProviderTypeInfo[]>([]);
-  const [providersLoading, setProvidersLoading] = useState(true);
+  // Modal/edit state
   const [showAddModal, setShowAddModal] = useState(false);
   const [authenticatingProviderId, setAuthenticatingProviderId] = useState<string | null>(null);
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
@@ -87,6 +96,27 @@ export default function SettingsPage() {
     base_url?: string;
     enabled?: boolean;
   }>({});
+
+  // SWR: fetch health status
+  const { data: health, isLoading: healthLoading, mutate: mutateHealth } = useSWR(
+    'health',
+    getHealth,
+    { revalidateOnFocus: false }
+  );
+
+  // SWR: fetch AI providers
+  const { data: providers = [], isLoading: providersLoading, mutate: mutateProviders } = useSWR(
+    'ai-providers',
+    listAIProviders,
+    { revalidateOnFocus: false }
+  );
+
+  // SWR: fetch provider types (with fallback)
+  const { data: providerTypes = defaultProviderTypes } = useSWR(
+    'ai-provider-types',
+    listAIProviderTypes,
+    { revalidateOnFocus: false, fallbackData: defaultProviderTypes }
+  );
 
   // Check if there are unsaved changes
   const hasUnsavedChanges =
@@ -123,54 +153,6 @@ export default function SettingsPage() {
     return true;
   }, []);
 
-  // Load health and providers on mount
-  useEffect(() => {
-    const checkHealth = async () => {
-      setHealthLoading(true);
-      try {
-        const data = await getHealth();
-        setHealth(data);
-      } catch {
-        setHealth(null);
-      } finally {
-        setHealthLoading(false);
-      }
-    };
-    checkHealth();
-    loadProviders();
-    loadProviderTypes();
-  }, []);
-
-  const loadProviders = async () => {
-    try {
-      setProvidersLoading(true);
-      const data = await listAIProviders();
-      setProviders(data);
-    } catch {
-      // Silent fail - providers might not be available yet
-    } finally {
-      setProvidersLoading(false);
-    }
-  };
-
-  const loadProviderTypes = async () => {
-    try {
-      const data = await listAIProviderTypes();
-      setProviderTypes(data);
-    } catch {
-      // Use defaults if API fails
-      setProviderTypes([
-        { id: 'anthropic', name: 'Anthropic', uses_oauth: true, env_var: 'ANTHROPIC_API_KEY' },
-        { id: 'openai', name: 'OpenAI', uses_oauth: true, env_var: 'OPENAI_API_KEY' },
-        { id: 'google', name: 'Google AI', uses_oauth: true, env_var: 'GOOGLE_API_KEY' },
-        { id: 'open-router', name: 'OpenRouter', uses_oauth: false, env_var: 'OPENROUTER_API_KEY' },
-        { id: 'groq', name: 'Groq', uses_oauth: false, env_var: 'GROQ_API_KEY' },
-        { id: 'mistral', name: 'Mistral AI', uses_oauth: false, env_var: 'MISTRAL_API_KEY' },
-        { id: 'xai', name: 'xAI', uses_oauth: false, env_var: 'XAI_API_KEY' },
-        { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
-      ]);
-    }
-  };
 
   // Unsaved changes warning
   useEffect(() => {
@@ -225,10 +207,10 @@ export default function SettingsPage() {
         throw new Error(`HTTP ${response.status}`);
       }
       const data = await response.json();
-      setHealth(data);
+      mutateHealth(data, false); // Update cache without revalidation
       toast.success(`Connected to OpenAgent v${data.version}`);
     } catch (err) {
-      setHealth(null);
+      mutateHealth(undefined, false); // Clear cache on error
       toast.error(
         `Connection failed: ${err instanceof Error ? err.message : 'Unknown error'}`
       );
@@ -243,7 +225,7 @@ export default function SettingsPage() {
       const result = await authenticateAIProvider(provider.id);
       if (result.success) {
         toast.success(result.message);
-        loadProviders();
+        mutateProviders();
       } else {
         if (result.auth_url) {
           window.open(result.auth_url, '_blank');
@@ -265,7 +247,7 @@ export default function SettingsPage() {
     try {
       await setDefaultAIProvider(id);
       toast.success('Default provider updated');
-      loadProviders();
+      mutateProviders();
     } catch (err) {
       toast.error(
         `Failed to set default: ${err instanceof Error ? err.message : 'Unknown error'}`
@@ -277,7 +259,7 @@ export default function SettingsPage() {
     try {
       await deleteAIProvider(id);
       toast.success('Provider removed');
-      loadProviders();
+      mutateProviders();
     } catch (err) {
       toast.error(
         `Failed to delete: ${err instanceof Error ? err.message : 'Unknown error'}`
@@ -307,7 +289,7 @@ export default function SettingsPage() {
       });
       toast.success('Provider updated');
       setEditingProvider(null);
-      loadProviders();
+      mutateProviders();
     } catch (err) {
       toast.error(
         `Failed to update: ${err instanceof Error ? err.message : 'Unknown error'}`
@@ -326,7 +308,7 @@ export default function SettingsPage() {
       <AddProviderModal
         open={showAddModal}
         onClose={() => setShowAddModal(false)}
-        onSuccess={loadProviders}
+        onSuccess={() => mutateProviders()}
         providerTypes={providerTypes}
       />
 
@@ -349,74 +331,17 @@ export default function SettingsPage() {
         </div>
 
         <div className="space-y-5">
-          {/* API Connection */}
-          <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-500/10">
-                <Server className="h-5 w-5 text-indigo-400" />
-              </div>
-              <div>
-                <h2 className="text-sm font-medium text-white">API Connection</h2>
-                <p className="text-xs text-white/40">Configure server endpoint</p>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <div>
-                <label className="block text-xs font-medium text-white/60 mb-1.5">
-                  API URL
-                </label>
-                <input
-                  type="text"
-                  value={apiUrl}
-                  onChange={(e) => {
-                    setApiUrl(e.target.value);
-                    validateUrl(e.target.value);
-                  }}
-                  className={cn(
-                    'w-full rounded-lg border bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder-white/30 focus:outline-none transition-colors',
-                    urlError
-                      ? 'border-red-500/50 focus:border-red-500/50'
-                      : 'border-white/[0.06] focus:border-indigo-500/50'
-                  )}
-                />
-                {urlError && <p className="mt-1.5 text-xs text-red-400">{urlError}</p>}
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-white/40">Status:</span>
-                  {healthLoading ? (
-                    <span className="flex items-center gap-1.5 text-xs text-white/40">
-                      <RefreshCw className="h-3 w-3 animate-spin" />
-                      Checking...
-                    </span>
-                  ) : health ? (
-                    <span className="flex items-center gap-1.5 text-xs text-emerald-400">
-                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                      Connected (v{health.version})
-                    </span>
-                  ) : (
-                    <span className="flex items-center gap-1.5 text-xs text-red-400">
-                      <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
-                      Disconnected
-                    </span>
-                  )}
-                </div>
-
-                <button
-                  onClick={testApiConnection}
-                  disabled={testingConnection}
-                  className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-xs text-white/70 hover:bg-white/[0.04] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <RefreshCw
-                    className={cn('h-3 w-3', testingConnection && 'animate-spin')}
-                  />
-                  Test Connection
-                </button>
-              </div>
-            </div>
-          </div>
+          {/* Server Connection & System Components */}
+          <ServerConnectionCard
+            apiUrl={apiUrl}
+            setApiUrl={setApiUrl}
+            urlError={urlError}
+            validateUrl={validateUrl}
+            health={health ?? null}
+            healthLoading={healthLoading}
+            testingConnection={testingConnection}
+            testApiConnection={testApiConnection}
+          />
 
           {/* AI Providers */}
           <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">
