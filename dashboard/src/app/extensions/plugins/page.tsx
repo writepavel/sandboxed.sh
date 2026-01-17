@@ -597,6 +597,12 @@ function InstalledPluginsSection() {
   }, []);
 
   const handleUpdate = (packageName: string) => {
+    // Clean up any previous EventSource to prevent leaks
+    if (cleanupRef.current) {
+      cleanupRef.current();
+      cleanupRef.current = null;
+    }
+
     setUpdating(packageName);
     setUpdateProgress(null);
 
