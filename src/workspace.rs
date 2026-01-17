@@ -663,8 +663,17 @@ fn opencode_entry_from_mcp(
                     // Bind-mount host's resolv.conf for DNS resolution in shared network mode
                     cmd.push("--bind-ro=/etc/resolv.conf".to_string());
                 } else {
-                    // Isolated network mode - use Tailscale network configuration
-                    cmd.extend(nspawn::tailscale_nspawn_extra_args(&merged_env));
+                    // Isolated network mode - check if Tailscale is configured
+                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(&merged_env);
+                    if tailscale_args.is_empty() {
+                        // Tailscale not configured - fall back to binding resolv.conf for DNS
+                        // This ensures DNS works even if the user sets shared_network=false
+                        // without proper Tailscale configuration
+                        cmd.push("--bind-ro=/etc/resolv.conf".to_string());
+                    } else {
+                        // Tailscale configured - it handles networking and DNS
+                        cmd.extend(tailscale_args);
+                    }
                 }
                 for (key, value) in &nspawn_env {
                     cmd.push(format!("--setenv={}={}", key, value));
