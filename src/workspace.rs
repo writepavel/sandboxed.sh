@@ -1431,12 +1431,25 @@ pub async fn write_runtime_workspace_state(
     tokio::fs::create_dir_all(&runtime_dir).await?;
     let context_root = working_dir_root.join(context_dir_name);
     let mission_context = mission_id.map(|id| context_root.join(id.to_string()));
+    // Create the mission context directory on the host so it exists when bind-mounted
+    if let Some(target) = mission_context.as_ref() {
+        tokio::fs::create_dir_all(target).await?;
+    }
     let context_link = working_dir.join(context_dir_name);
     if let Some(target) = mission_context.as_ref() {
         if !context_link.exists() {
             #[cfg(unix)]
             {
-                if let Err(e) = std::os::unix::fs::symlink(target, &context_link) {
+                // For chroot workspaces, the symlink must point to the container path
+                // since /root/context is bind-mounted, not the host path
+                let symlink_target = if workspace.workspace_type == WorkspaceType::Chroot {
+                    PathBuf::from("/root")
+                        .join(context_dir_name)
+                        .join(mission_id.unwrap().to_string())
+                } else {
+                    target.clone()
+                };
+                if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &context_link) {
                     tracing::warn!(
                         workspace = %workspace.name,
                         mission = ?mission_id,
