@@ -20,6 +20,63 @@ use tokio::process::Command;
 use super::{resolve_path_simple as resolve_path, Tool};
 use crate::nspawn;
 
+/// Context information read from the local context file.
+/// This is re-read before each container command to handle timing issues
+/// where the context file is written after the MCP process starts.
+#[derive(Debug, Default)]
+struct RuntimeContext {
+    context_root: Option<String>,
+    mission_id: Option<String>,
+}
+
+/// Read context information from the local context file or fall back to env vars.
+/// This function is called before each container command to ensure we have the latest
+/// context information, even if the context file was written after the MCP started.
+fn read_runtime_context(container_root: &Path) -> RuntimeContext {
+    // First check env vars (set during MCP initialization)
+    let env_context_root = env::var("OPEN_AGENT_CONTEXT_ROOT").ok();
+    let env_mission_id = env::var("OPEN_AGENT_MISSION_ID").ok();
+
+    // If env vars are set, use them
+    if env_context_root.is_some() {
+        return RuntimeContext {
+            context_root: env_context_root,
+            mission_id: env_mission_id,
+        };
+    }
+
+    // Otherwise, try to read from the local context file
+    // This handles the case where the MCP started before the context file was written
+    let context_file = container_root.join(".openagent_context.json");
+    if let Ok(contents) = std::fs::read_to_string(&context_file) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+            let context_root = json
+                .get("context_root")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mission_id = json
+                .get("mission_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // If we found context_root in the file, update the env var for future calls
+            if let Some(ref root) = context_root {
+                env::set_var("OPEN_AGENT_CONTEXT_ROOT", root);
+            }
+            if let Some(ref id) = mission_id {
+                env::set_var("OPEN_AGENT_MISSION_ID", id);
+            }
+
+            return RuntimeContext {
+                context_root,
+                mission_id,
+            };
+        }
+    }
+
+    RuntimeContext::default()
+}
+
 /// Sanitize command output to be safe for LLM consumption.
 /// Removes binary garbage while preserving valid text.
 fn sanitize_output(bytes: &[u8]) -> String {
@@ -476,12 +533,15 @@ async fn run_container_command(
     args.push("--setenv=HOME=/root".to_string());
 
     // Bind mission context into containers so uploaded files are accessible.
-    if let Ok(context_root) = env::var("OPEN_AGENT_CONTEXT_ROOT") {
+    // We read from the local context file to handle timing issues where the context file
+    // is written after the MCP process starts.
+    let runtime_ctx = read_runtime_context(&root);
+    if let Some(context_root) = runtime_ctx.context_root.as_ref() {
         let context_root = context_root.trim();
         if !context_root.is_empty() && Path::new(context_root).exists() {
             args.push(format!("--bind={}:/root/context", context_root));
             args.push("--setenv=OPEN_AGENT_CONTEXT_ROOT=/root/context".to_string());
-            if let Ok(mission_id) = env::var("OPEN_AGENT_MISSION_ID") {
+            if let Some(mission_id) = runtime_ctx.mission_id.as_ref() {
                 let mission_id = mission_id.trim();
                 if !mission_id.is_empty() {
                     args.push(format!(
