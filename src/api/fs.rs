@@ -182,8 +182,27 @@ fn resolve_upload_base(path: &str) -> Result<PathBuf, (StatusCode, String)> {
 
     // Relative path -> resolve against current workspace working dir if known
     if let Some(state) = load_runtime_workspace() {
-        if let Some(wd) = state.working_dir {
-            return Ok(PathBuf::from(wd).join(path));
+        if let Some(wd) = state
+            .working_dir
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            let base = PathBuf::from(wd);
+            // For container workspaces, map container path back to host path
+            if is_container_workspace(&state) {
+                if let Some(mapped_base) = map_container_path_to_host(&base, &state) {
+                    return Ok(mapped_base.join(path));
+                }
+            }
+            return Ok(base.join(path));
+        }
+
+        // Fallback: use workspace root directly for container workspaces
+        if is_container_workspace(&state) {
+            if let Some(root) = workspace_root_path(&state) {
+                return Ok(root.join(path));
+            }
         }
     }
 
