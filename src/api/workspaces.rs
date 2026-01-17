@@ -326,7 +326,7 @@ async fn create_workspace(
         None => None,
     };
 
-    let workspace = match workspace_type {
+    let mut workspace = match workspace_type {
         WorkspaceType::Host => Workspace {
             id: Uuid::new_v4(),
             name: req.name,
@@ -388,9 +388,56 @@ async fn create_workspace(
     }
     drop(library_guard);
 
-    let response: WorkspaceResponse = workspace.into();
+    // Auto-start build for template-based chroot workspaces
+    // This improves UX by not requiring a separate build API call
+    if workspace.workspace_type == WorkspaceType::Chroot && req.template.is_some() {
+        let distro = workspace
+            .distro
+            .as_ref()
+            .map(|d| parse_distro(d))
+            .transpose()
+            .ok()
+            .flatten();
 
-    tracing::info!("Created workspace: {} ({})", response.name, id);
+        // Set status to Building
+        workspace.status = WorkspaceStatus::Building;
+        state.workspaces.update(workspace.clone()).await;
+
+        // Spawn build task
+        let workspaces_store = Arc::clone(&state.workspaces);
+        let working_dir = state.config.working_dir.clone();
+        let mut workspace_for_build = workspace.clone();
+
+        tokio::spawn(async move {
+            let result = crate::workspace::build_chroot_workspace(
+                &mut workspace_for_build,
+                distro,
+                false, // don't force rebuild
+                &working_dir,
+            )
+            .await;
+
+            if let Err(e) = result {
+                tracing::error!(
+                    workspace = %workspace_for_build.name,
+                    error = %e,
+                    "Failed to auto-build container workspace"
+                );
+            }
+
+            workspaces_store.update(workspace_for_build).await;
+        });
+
+        tracing::info!(
+            "Created and auto-building workspace: {} ({})",
+            workspace.name,
+            id
+        );
+    } else {
+        tracing::info!("Created workspace: {} ({})", workspace.name, id);
+    }
+
+    let response: WorkspaceResponse = workspace.into();
 
     Ok(Json(response))
 }
