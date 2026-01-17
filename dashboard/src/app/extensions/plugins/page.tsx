@@ -1,13 +1,18 @@
 'use client';
 
 import { useState, useMemo, useEffect } from 'react';
+import useSWR from 'swr';
 import { toast } from '@/components/toast';
-import { type Plugin } from '@/lib/api';
+import { type Plugin, getInstalledPlugins, updatePlugin, type InstalledPluginInfo } from '@/lib/api';
 import {
   AlertCircle,
+  ArrowUpCircle,
   Check,
+  Download,
+  ExternalLink,
   GitBranch,
   Loader,
+  Package,
   Plus,
   RefreshCw,
   Search,
@@ -488,6 +493,204 @@ function PluginFormModal({
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Installed Plugins Section (discovered from OpenCode config)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function InstalledPluginCard({
+  plugin,
+  onUpdate,
+  updating,
+}: {
+  plugin: InstalledPluginInfo;
+  onUpdate: (packageName: string) => void;
+  updating: string | null;
+}) {
+  const isUpdating = updating === plugin.package;
+
+  return (
+    <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-indigo-500/10 text-indigo-400 flex-shrink-0">
+            <Package className="h-5 w-5" />
+          </div>
+          <div className="min-w-0">
+            <h3 className="font-medium text-white truncate">{plugin.package}</h3>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span className="text-xs text-white/40">
+                {plugin.installed_version ?? 'unknown'}
+              </span>
+              {plugin.update_available && plugin.latest_version && (
+                <>
+                  <ArrowUpCircle className="h-3 w-3 text-amber-400" />
+                  <span className="text-xs text-amber-400">{plugin.latest_version} available</span>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <a
+            href={`https://www.npmjs.com/package/${plugin.package}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] px-2 py-1.5 text-xs text-white/60 hover:text-white transition-colors"
+          >
+            <ExternalLink className="h-3 w-3" />
+          </a>
+          {plugin.update_available && (
+            <button
+              onClick={() => onUpdate(plugin.package)}
+              disabled={isUpdating}
+              className={cn(
+                'flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors',
+                isUpdating
+                  ? 'bg-amber-500/20 text-amber-300 cursor-wait'
+                  : 'bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 hover:text-amber-300'
+              )}
+            >
+              {isUpdating ? (
+                <>
+                  <Loader className="h-3 w-3 animate-spin" />
+                  Updating...
+                </>
+              ) : (
+                <>
+                  <Download className="h-3 w-3" />
+                  Update
+                </>
+              )}
+            </button>
+          )}
+          {!plugin.update_available && plugin.latest_version && (
+            <span className="flex items-center gap-1 text-xs text-emerald-400">
+              <Check className="h-3 w-3" />
+              Latest
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InstalledPluginsSection() {
+  const { data, isLoading, error, mutate } = useSWR(
+    'installed-plugins',
+    getInstalledPlugins,
+    { revalidateOnFocus: false }
+  );
+
+  const [updating, setUpdating] = useState<string | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<string | null>(null);
+
+  const handleUpdate = (packageName: string) => {
+    setUpdating(packageName);
+    setUpdateProgress(null);
+
+    const cleanup = updatePlugin(packageName, (event) => {
+      setUpdateProgress(event.message);
+
+      if (event.event_type === 'complete') {
+        toast.success(event.message);
+        setUpdating(null);
+        setUpdateProgress(null);
+        mutate(); // Refresh the list
+      } else if (event.event_type === 'error') {
+        toast.error(event.message);
+        setUpdating(null);
+        setUpdateProgress(null);
+      }
+    });
+
+    // Cleanup on unmount
+    return cleanup;
+  };
+
+  if (isLoading) {
+    return (
+      <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
+        <div className="flex items-center gap-3 text-white/40">
+          <Loader className="h-4 w-4 animate-spin" />
+          <span className="text-sm">Loading installed plugins...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-6">
+        <div className="flex items-center gap-3 text-red-400">
+          <AlertCircle className="h-4 w-4" />
+          <span className="text-sm">Failed to load installed plugins</span>
+        </div>
+      </div>
+    );
+  }
+
+  const plugins = data?.plugins ?? [];
+
+  if (plugins.length === 0) {
+    return (
+      <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6">
+        <p className="text-sm text-white/40">
+          No plugins installed in OpenCode. Plugins are added via the <code className="px-1 py-0.5 rounded bg-white/[0.06]">plugin</code> array in <code className="px-1 py-0.5 rounded bg-white/[0.06]">~/.config/opencode/opencode.json</code>.
+        </p>
+      </div>
+    );
+  }
+
+  const hasUpdates = plugins.some((p) => p.update_available);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-medium text-white">Installed OpenCode Plugins</h2>
+          <p className="text-sm text-white/40">
+            Plugins discovered from your OpenCode config
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          {hasUpdates && (
+            <span className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-amber-400 bg-amber-500/10 rounded-full">
+              <ArrowUpCircle className="h-3 w-3" />
+              Updates available
+            </span>
+          )}
+          <button
+            onClick={() => mutate()}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors"
+          >
+            <RefreshCw className="h-3 w-3" />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {updateProgress && (
+        <div className="rounded-lg border border-indigo-500/20 bg-indigo-500/5 p-3">
+          <p className="text-sm text-indigo-300">{updateProgress}</p>
+        </div>
+      )}
+
+      <div className="grid gap-3">
+        {plugins.map((plugin) => (
+          <InstalledPluginCard
+            key={plugin.package}
+            plugin={plugin}
+            onUpdate={handleUpdate}
+            updating={updating}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function PluginsPage() {
   const {
     status,
@@ -714,10 +917,17 @@ export default function PluginsPage() {
             </div>
           )}
 
+          {/* Installed OpenCode Plugins - discovered from config */}
+          <InstalledPluginsSection />
+
+          {/* Divider */}
+          <div className="border-t border-white/[0.06] my-6" />
+
+          {/* Library Plugins */}
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <h1 className="text-xl font-semibold text-white">Plugins</h1>
-              <p className="text-sm text-white/40">Manage OpenCode plugins stored in your library repo.</p>
+              <h2 className="text-lg font-medium text-white">Library Plugins</h2>
+              <p className="text-sm text-white/40">Plugins managed in your library repo (synced to OpenCode).</p>
             </div>
             <button
               onClick={() => setShowAddModal(true)}
@@ -734,7 +944,7 @@ export default function PluginsPage() {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search plugins..."
+              placeholder="Search library plugins..."
               className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] pl-10 pr-4 py-2.5 text-sm text-white placeholder-white/30 focus:border-indigo-500/50 focus:outline-none transition-colors"
             />
           </div>

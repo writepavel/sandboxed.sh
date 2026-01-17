@@ -1622,6 +1622,59 @@ export async function saveLibraryPlugins(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Installed OpenCode Plugins (discovered from OpenCode config)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface InstalledPluginInfo {
+  package: string;
+  spec: string;
+  installed_version: string | null;
+  latest_version: string | null;
+  update_available: boolean;
+}
+
+export interface InstalledPluginsResponse {
+  plugins: InstalledPluginInfo[];
+}
+
+// Get installed plugins from OpenCode config with version info
+export async function getInstalledPlugins(): Promise<InstalledPluginsResponse> {
+  const res = await apiFetch("/api/system/plugins/installed");
+  if (!res.ok) {
+    throw new Error("Failed to fetch installed plugins");
+  }
+  return res.json();
+}
+
+// Update a plugin (returns SSE stream)
+export function updatePlugin(
+  packageName: string,
+  onEvent: (event: { event_type: string; message: string; progress?: number }) => void
+): () => void {
+  const url = `${window.location.origin}/api/system/plugins/${encodeURIComponent(packageName)}/update`;
+
+  const eventSource = new EventSource(url, { withCredentials: true });
+
+  eventSource.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      onEvent(data);
+      if (data.event_type === "complete" || data.event_type === "error") {
+        eventSource.close();
+      }
+    } catch (e) {
+      console.error("Failed to parse SSE event:", e);
+    }
+  };
+
+  eventSource.onerror = () => {
+    eventSource.close();
+  };
+
+  return () => eventSource.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Rules
 // ─────────────────────────────────────────────────────────────────────────────
 
