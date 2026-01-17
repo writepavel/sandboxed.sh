@@ -624,19 +624,26 @@ fn opencode_entry_from_mcp(
                     "--chdir".to_string(),
                     rel_str,
                 ];
-                // For chroot workspaces, compute context root from workspace_root
-                // instead of using the global env var (which is for the host workspace)
+                // For chroot workspaces, bind-mount the GLOBAL context root into the container.
+                // Mission context files are stored in the global context root (e.g., /root/context/{mission_id}),
+                // NOT in a workspace-specific directory. The global context root must be bind-mounted
+                // so that the symlink inside the container (`context -> /root/context/{mission_id}`) resolves.
                 let context_dir_name = std::env::var("OPEN_AGENT_CONTEXT_DIR_NAME")
                     .ok()
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or_else(|| "context".to_string());
-                let workspace_context_root = workspace_root.join(&context_dir_name);
+                // Get the global context root from env var, falling back to /root/context
+                let global_context_root = std::env::var("OPEN_AGENT_CONTEXT_ROOT")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/root").join(&context_dir_name));
                 // Create the context directory if it doesn't exist
-                let _ = std::fs::create_dir_all(&workspace_context_root);
-                if workspace_context_root.exists() {
+                let _ = std::fs::create_dir_all(&global_context_root);
+                if global_context_root.exists() {
                     cmd.push(format!(
                         "--bind={}:/root/context",
-                        workspace_context_root.display()
+                        global_context_root.display()
                     ));
                     nspawn_env.insert(
                         "OPEN_AGENT_CONTEXT_ROOT".to_string(),
