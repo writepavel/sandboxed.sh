@@ -1226,7 +1226,11 @@ async fn get_init_log(
     let total_lines = lines.len() as u32;
 
     // Return last 500 lines max
-    let start = if lines.len() > 500 { lines.len() - 500 } else { 0 };
+    let start = if lines.len() > 500 {
+        lines.len() - 500
+    } else {
+        0
+    };
     let truncated_content = lines[start..].join("\n");
 
     Ok(Json(InitLogResponse {

@@ -45,10 +45,7 @@ impl ItemType {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RenameChange {
     /// Rename a file or directory.
-    RenameFile {
-        from: String,
-        to: String,
-    },
+    RenameFile { from: String, to: String },
     /// Update a reference in a file.
     UpdateReference {
         file: String,
@@ -84,7 +81,11 @@ pub struct RenameResult {
 
 impl LibraryStore {
     /// Find all references to an item in the library.
-    pub async fn find_references(&self, item_type: ItemType, name: &str) -> Result<Vec<RenameChange>> {
+    pub async fn find_references(
+        &self,
+        item_type: ItemType,
+        name: &str,
+    ) -> Result<Vec<RenameChange>> {
         let mut refs = Vec::new();
 
         match item_type {
@@ -260,7 +261,11 @@ impl LibraryStore {
                 success: false,
                 changes: vec![],
                 warnings: vec![],
-                error: Some(format!("{} '{}' already exists", item_type.as_str(), new_name)),
+                error: Some(format!(
+                    "{} '{}' already exists",
+                    item_type.as_str(),
+                    new_name
+                )),
             });
         }
 
@@ -305,7 +310,10 @@ impl LibraryStore {
         }
 
         // Execute the rename
-        if let Err(e) = self.execute_rename(item_type, old_name, new_name, &old_path, &new_path).await {
+        if let Err(e) = self
+            .execute_rename(item_type, old_name, new_name, &old_path, &new_path)
+            .await
+        {
             return Ok(RenameResult {
                 success: false,
                 changes: vec![],
@@ -316,8 +324,17 @@ impl LibraryStore {
 
         // Execute reference updates
         for change in &changes {
-            if let RenameChange::UpdateReference { file, field, old_value, new_value } = change {
-                if let Err(e) = self.update_reference(file, field, old_value, new_value).await {
+            if let RenameChange::UpdateReference {
+                file,
+                field,
+                old_value,
+                new_value,
+            } = change
+            {
+                if let Err(e) = self
+                    .update_reference(file, field, old_value, new_value)
+                    .await
+                {
                     warnings.push(format!("Failed to update {}: {}", file, e));
                 }
             }
@@ -332,7 +349,12 @@ impl LibraryStore {
     }
 
     /// Get the old and new paths for an item type.
-    fn get_item_paths(&self, item_type: ItemType, old_name: &str, new_name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    fn get_item_paths(
+        &self,
+        item_type: ItemType,
+        old_name: &str,
+        new_name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         match item_type {
             ItemType::Skill => (
                 self.path.join("skill").join(old_name),
@@ -355,8 +377,12 @@ impl LibraryStore {
                 self.path.join("tool").join(format!("{}.ts", new_name)),
             ),
             ItemType::WorkspaceTemplate => (
-                self.path.join("workspace-template").join(format!("{}.json", old_name)),
-                self.path.join("workspace-template").join(format!("{}.json", new_name)),
+                self.path
+                    .join("workspace-template")
+                    .join(format!("{}.json", old_name)),
+                self.path
+                    .join("workspace-template")
+                    .join(format!("{}.json", new_name)),
             ),
         }
     }
@@ -375,7 +401,10 @@ impl LibraryStore {
             let content = fs::read_to_string(old_path).await?;
             if let Ok(mut template) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(obj) = template.as_object_mut() {
-                    obj.insert("name".to_string(), serde_json::Value::String(new_name.to_string()));
+                    obj.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(new_name.to_string()),
+                    );
                     let updated = serde_json::to_string_pretty(&template)?;
                     fs::write(old_path, updated).await?;
                 }

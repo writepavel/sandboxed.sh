@@ -335,14 +335,15 @@ impl LibraryStore {
                 if file_name.ends_with(".md") {
                     // Skip SKILL.md from the files list (it's in the content field)
                     if file_name != "SKILL.md" {
-                        let raw_content =
-                            fs::read_to_string(&entry_path).await.unwrap_or_default();
+                        let raw_content = fs::read_to_string(&entry_path).await.unwrap_or_default();
                         // Decrypt any encrypted tags for display
-                        let file_content = if let Ok(Some(key)) = env_crypto::load_private_key_from_env() {
-                            env_crypto::decrypt_content_tags(&key, &raw_content).unwrap_or(raw_content)
-                        } else {
-                            raw_content
-                        };
+                        let file_content =
+                            if let Ok(Some(key)) = env_crypto::load_private_key_from_env() {
+                                env_crypto::decrypt_content_tags(&key, &raw_content)
+                                    .unwrap_or(raw_content)
+                            } else {
+                                raw_content
+                            };
                         md_files.push(SkillFile {
                             name: file_name,
                             path: relative_path,
@@ -1244,7 +1245,10 @@ impl LibraryStore {
                 .context("Failed to decrypt template env vars")?,
             None => {
                 // No key configured - check if any values are encrypted
-                let has_encrypted = config.env_vars.values().any(|v| env_crypto::is_encrypted(v));
+                let has_encrypted = config
+                    .env_vars
+                    .values()
+                    .any(|v| env_crypto::is_encrypted(v));
                 if has_encrypted {
                     tracing::warn!(
                         "Template '{}' has encrypted env vars but PRIVATE_KEY is not configured",
@@ -1397,9 +1401,7 @@ impl LibraryStore {
             } else if let Err(e) = fs::write(&path, &content).await {
                 tracing::warn!("Failed to copy oh-my-opencode.json to Library: {}", e);
             } else {
-                tracing::info!(
-                    "Copied oh-my-opencode.json from system to Library for versioning"
-                );
+                tracing::info!("Copied oh-my-opencode.json from system to Library for versioning");
             }
 
             return Ok(settings);

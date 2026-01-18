@@ -38,6 +38,9 @@ pub struct Mission {
     /// Optional model override (provider/model)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// Backend to use for this mission ("opencode" or "claudecode")
+    #[serde(default = "default_backend")]
+    pub backend: String,
     pub history: Vec<MissionHistoryEntry>,
     pub created_at: String,
     pub updated_at: String,
@@ -50,6 +53,10 @@ pub struct Mission {
     /// Desktop sessions started during this mission (used for reconnect/stream resume)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub desktop_sessions: Vec<DesktopSessionInfo>,
+}
+
+fn default_backend() -> String {
+    "opencode".to_string()
 }
 
 fn default_workspace_id() -> Uuid {
@@ -119,6 +126,7 @@ pub trait MissionStore: Send + Sync {
         workspace_id: Option<Uuid>,
         agent: Option<&str>,
         model_override: Option<&str>,
+        backend: Option<&str>,
     ) -> Result<Mission, String>;
 
     /// Update mission status.

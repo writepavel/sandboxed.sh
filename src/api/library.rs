@@ -1325,7 +1325,10 @@ async fn rename_item(
     if !result.success {
         return Err((
             StatusCode::BAD_REQUEST,
-            result.error.clone().unwrap_or_else(|| "Rename failed".to_string()),
+            result
+                .error
+                .clone()
+                .unwrap_or_else(|| "Rename failed".to_string()),
         ));
     }
 

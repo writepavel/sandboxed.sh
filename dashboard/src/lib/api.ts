@@ -345,6 +345,8 @@ export interface Mission {
   workspace_id?: string;
   workspace_name?: string;
   agent?: string;
+  /** Backend used for this mission ("opencode" or "claudecode") */
+  backend?: string;
   history: MissionHistoryEntry[];
   desktop_sessions?: DesktopSessionInfo[];
   created_at: string;
@@ -412,6 +414,8 @@ export interface CreateMissionOptions {
   agent?: string;
   /** Override model for this mission (provider/model) */
   modelOverride?: string;
+  /** Backend to use for this mission ("opencode" or "claudecode") */
+  backend?: string;
 }
 
 export async function createMission(
@@ -422,12 +426,14 @@ export async function createMission(
     workspace_id?: string;
     agent?: string;
     model_override?: string;
+    backend?: string;
   } = {};
 
   if (options?.title) body.title = options.title;
   if (options?.workspaceId) body.workspace_id = options.workspaceId;
   if (options?.agent) body.agent = options.agent;
   if (options?.modelOverride) body.model_override = options.modelOverride;
+  if (options?.backend) body.backend = options.backend;
 
   const res = await apiFetch("/api/control/missions", {
     method: "POST",
@@ -2813,5 +2819,68 @@ export async function updateLibraryRemote(
     const text = await res.text();
     throw new Error(text || 'Failed to update library remote');
   }
+  return res.json();
+}
+
+// ============================================
+// Backends API
+// ============================================
+
+export interface Backend {
+  id: string;
+  name: string;
+}
+
+export interface BackendAgent {
+  id: string;
+  name: string;
+}
+
+export interface BackendConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  settings: Record<string, unknown>;
+}
+
+// List all available backends
+export async function listBackends(): Promise<Backend[]> {
+  const res = await apiFetch('/api/backends');
+  if (!res.ok) throw new Error('Failed to list backends');
+  return res.json();
+}
+
+// Get a specific backend
+export async function getBackend(id: string): Promise<Backend> {
+  const res = await apiFetch(`/api/backends/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error('Failed to get backend');
+  return res.json();
+}
+
+// List agents for a specific backend
+export async function listBackendAgents(backendId: string): Promise<BackendAgent[]> {
+  const res = await apiFetch(`/api/backends/${encodeURIComponent(backendId)}/agents`);
+  if (!res.ok) throw new Error('Failed to list backend agents');
+  return res.json();
+}
+
+// Get backend configuration
+export async function getBackendConfig(backendId: string): Promise<BackendConfig> {
+  const res = await apiFetch(`/api/backends/${encodeURIComponent(backendId)}/config`);
+  if (!res.ok) throw new Error('Failed to get backend config');
+  return res.json();
+}
+
+// Update backend configuration
+export async function updateBackendConfig(
+  backendId: string,
+  settings: Record<string, unknown>
+): Promise<{ ok: boolean; message?: string }> {
+  const res = await apiFetch(`/api/backends/${encodeURIComponent(backendId)}/config`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ settings }),
+  });
+  if (!res.ok) throw new Error('Failed to update backend config');
   return res.json();
 }

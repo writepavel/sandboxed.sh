@@ -91,29 +91,21 @@ impl OpenCodeAgent {
                     mission_id: ctx.mission_id,
                 }
             }
-            OpenCodeEvent::ToolCall {
-                tool_call_id,
-                name,
-                args,
-            } => {
+            OpenCodeEvent::ToolCall { id, name, args } => {
                 tracing::info!(
-                    tool_call_id = %tool_call_id,
+                    tool_call_id = %id,
                     name = %name,
                     "Forwarding tool_call event to control broadcast"
                 );
                 AgentEvent::ToolCall {
-                    tool_call_id: tool_call_id.clone(),
+                    tool_call_id: id.clone(),
                     name: name.clone(),
                     args: args.clone(),
                     mission_id: ctx.mission_id,
                 }
             }
-            OpenCodeEvent::ToolResult {
-                tool_call_id,
-                name,
-                result,
-            } => AgentEvent::ToolResult {
-                tool_call_id: tool_call_id.clone(),
+            OpenCodeEvent::ToolResult { id, name, result } => AgentEvent::ToolResult {
+                tool_call_id: id.clone(),
                 name: name.clone(),
                 result: result.clone(),
                 mission_id: ctx.mission_id,
@@ -430,10 +422,9 @@ impl Agent for OpenCodeAgent {
                                     }
                                 }
 
-                                if let OpenCodeEvent::ToolCall { tool_call_id, name, .. } = &oc_event
-                                {
+                                if let OpenCodeEvent::ToolCall { id, name, .. } = &oc_event {
                                     self.handle_frontend_tool_call(
-                                        tool_call_id,
+                                        id,
                                         name,
                                         &session.id,
                                         &directory,
@@ -493,10 +484,9 @@ impl Agent for OpenCodeAgent {
                                         sse_text_buffer = content.clone();
                                     }
                                 }
-                                if let OpenCodeEvent::ToolCall { tool_call_id, name, .. } = &oc_event
-                                {
+                                if let OpenCodeEvent::ToolCall { id, name, .. } = &oc_event {
                                     self.handle_frontend_tool_call(
-                                        tool_call_id,
+                                        id,
                                         name,
                                         &session.id,
                                         &directory,

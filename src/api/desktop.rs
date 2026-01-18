@@ -346,18 +346,20 @@ async fn collect_desktop_sessions(state: &Arc<AppState>) -> Vec<DesktopSessionDe
     let running_displays = get_running_xvfb_displays().await;
     for display in running_displays {
         // Check if this display is already in our list
-        sessions_by_display.entry(display.clone()).or_insert_with(|| DesktopSessionDetail {
-            display: display.clone(),
-            status: DesktopSessionStatus::Unknown,
-            mission_id: None,
-            mission_title: None,
-            mission_status: None,
-            started_at: "unknown".to_string(),
-            stopped_at: None,
-            keep_alive_until: None,
-            auto_close_in_secs: None,
-            process_running: true,
-        });
+        sessions_by_display
+            .entry(display.clone())
+            .or_insert_with(|| DesktopSessionDetail {
+                display: display.clone(),
+                status: DesktopSessionStatus::Unknown,
+                mission_id: None,
+                mission_title: None,
+                mission_status: None,
+                started_at: "unknown".to_string(),
+                stopped_at: None,
+                keep_alive_until: None,
+                auto_close_in_secs: None,
+                process_running: true,
+            });
     }
 
     let mut sessions: Vec<DesktopSessionDetail> = sessions_by_display.into_values().collect();

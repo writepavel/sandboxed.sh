@@ -163,10 +163,11 @@ async fn get_opencode_info(config: &crate::config::Config) -> ComponentInfo {
     match Command::new("opencode").arg("--version").output().await {
         Ok(output) if output.status.success() => {
             let version_str = String::from_utf8_lossy(&output.stdout);
-            let version = version_str
-                .lines()
-                .next()
-                .map(|l| l.trim().replace("opencode version ", "").replace("opencode ", ""));
+            let version = version_str.lines().next().map(|l| {
+                l.trim()
+                    .replace("opencode version ", "")
+                    .replace("opencode ", "")
+            });
 
             let update_available = check_opencode_update(version.as_deref()).await;
             let status = if update_available.is_some() {
@@ -279,7 +280,9 @@ async fn check_open_agent_update(current_version: Option<&str>) -> Option<String
         return None;
     }
 
-    let latest_tag = String::from_utf8_lossy(&tag_result.stdout).trim().to_string();
+    let latest_tag = String::from_utf8_lossy(&tag_result.stdout)
+        .trim()
+        .to_string();
     let latest_version = latest_tag.trim_start_matches('v');
 
     if latest_version != current && version_is_newer(latest_version, current) {
@@ -291,11 +294,7 @@ async fn check_open_agent_update(current_version: Option<&str>) -> Option<String
 
 /// Simple semver comparison (newer returns true if a > b).
 fn version_is_newer(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
 
     let va = parse(a);
     let vb = parse(b);
@@ -388,10 +387,7 @@ async fn get_oh_my_opencode_version() -> Option<String> {
 
     if output.status.success() {
         let version_str = String::from_utf8_lossy(&output.stdout);
-        return version_str
-            .lines()
-            .next()
-            .map(|l| l.trim().to_string());
+        return version_str.lines().next().map(|l| l.trim().to_string());
     }
 
     None
@@ -1018,7 +1014,9 @@ async fn update_plugin(
 }
 
 /// Stream the plugin update process.
-fn stream_plugin_update(package: String) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+fn stream_plugin_update(
+    package: String,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield Ok(Event::default().data(serde_json::to_string(&UpdateProgressEvent {
             event_type: "log".to_string(),

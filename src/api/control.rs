@@ -481,6 +481,8 @@ pub enum ControlCommand {
         agent: Option<String>,
         /// Optional model override (provider/model)
         model_override: Option<String>,
+        /// Backend to use for this mission ("opencode" or "claudecode")
+        backend: Option<String>,
         respond: oneshot::Sender<Result<Mission, String>>,
     },
     /// Update mission status
@@ -1046,6 +1048,8 @@ pub struct CreateMissionRequest {
     pub agent: Option<String>,
     /// Optional model override (provider/model)
     pub model_override: Option<String>,
+    /// Backend to use for this mission ("opencode" or "claudecode")
+    pub backend: Option<String>,
 }
 
 pub async fn create_mission(
@@ -1055,16 +1059,17 @@ pub async fn create_mission(
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
-    let (title, workspace_id, agent, model_override) = body
+    let (title, workspace_id, agent, model_override, backend) = body
         .map(|b| {
             (
                 b.title.clone(),
                 b.workspace_id,
                 b.agent.clone(),
                 b.model_override.clone(),
+                b.backend.clone(),
             )
         })
-        .unwrap_or((None, None, None, None));
+        .unwrap_or((None, None, None, None, None));
 
     // Validate agent exists before creating mission (fail fast with clear error)
     if let Some(ref agent_name) = agent {
@@ -1081,6 +1086,7 @@ pub async fn create_mission(
             workspace_id,
             agent,
             model_override,
+            backend,
             respond: tx,
         })
         .await
@@ -2057,7 +2063,7 @@ async fn control_actor_loop(
 
     // Helper to create a new mission
     async fn create_new_mission(mission_store: &Arc<dyn MissionStore>) -> Result<Mission, String> {
-        create_new_mission_with_title(mission_store, None, None, None, None).await
+        create_new_mission_with_title(mission_store, None, None, None, None, None).await
     }
 
     // Helper to create a new mission with title
@@ -2067,9 +2073,10 @@ async fn control_actor_loop(
         workspace_id: Option<Uuid>,
         agent: Option<&str>,
         model_override: Option<&str>,
+        backend: Option<&str>,
     ) -> Result<Mission, String> {
         mission_store
-            .create_mission(title, workspace_id, agent, model_override)
+            .create_mission(title, workspace_id, agent, model_override, backend)
             .await
     }
 
@@ -2566,7 +2573,7 @@ async fn control_actor_loop(
                             }
                         }
                     }
-                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, respond } => {
+                    ControlCommand::CreateMission { title, workspace_id, agent, model_override, backend, respond } => {
                         // First persist current mission history
                         persist_mission_history(
                             &mission_store,
@@ -2575,13 +2582,14 @@ async fn control_actor_loop(
                         )
                         .await;
 
-                        // Create a new mission with optional title, workspace, and agent
+                        // Create a new mission with optional title, workspace, agent, and backend
                         match create_new_mission_with_title(
                             &mission_store,
                             title.as_deref(),
                             workspace_id,
                             agent.as_deref(),
                             model_override.as_deref(),
+                            backend.as_deref(),
                         )
                         .await {
                             Ok(mission) => {

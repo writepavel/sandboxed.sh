@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
 import useSWR from 'swr';
-import { getVisibleAgents, getOpenAgentConfig } from '@/lib/api';
+import { getVisibleAgents, getOpenAgentConfig, listBackends, listBackendAgents, type Backend, type BackendAgent } from '@/lib/api';
 import type { Provider, Workspace } from '@/lib/api';
 
 interface NewMissionDialogProps {
@@ -14,6 +14,7 @@ interface NewMissionDialogProps {
     workspaceId?: string;
     agent?: string;
     modelOverride?: string;
+    backend?: string;
   }) => Promise<void> | void;
 }
 
@@ -51,11 +52,26 @@ export function NewMissionDialog({
   const [newMissionWorkspace, setNewMissionWorkspace] = useState('');
   const [newMissionAgent, setNewMissionAgent] = useState('');
   const [newMissionModelOverride, setNewMissionModelOverride] = useState('');
+  const [newMissionBackend, setNewMissionBackend] = useState('opencode');
   const [submitting, setSubmitting] = useState(false);
   const [defaultSet, setDefaultSet] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
 
-  // SWR: fetch once, cache globally, revalidate in background
+  // SWR: fetch backends
+  const { data: backends } = useSWR<Backend[]>('backends', listBackends, {
+    revalidateOnFocus: false,
+    dedupingInterval: 30000,
+    fallbackData: [{ id: 'opencode', name: 'OpenCode' }, { id: 'claudecode', name: 'Claude Code' }],
+  });
+
+  // SWR: fetch agents for selected backend
+  const { data: backendAgents } = useSWR<BackendAgent[]>(
+    newMissionBackend ? `backend-${newMissionBackend}-agents` : null,
+    () => listBackendAgents(newMissionBackend),
+    { revalidateOnFocus: false, dedupingInterval: 30000 }
+  );
+
+  // SWR: fetch once, cache globally, revalidate in background (fallback for agent list)
   const { data: agentsPayload } = useSWR('opencode-agents', getVisibleAgents, {
     revalidateOnFocus: false,
     dedupingInterval: 30000,
@@ -65,7 +81,8 @@ export function NewMissionDialog({
     dedupingInterval: 30000,
   });
 
-  const opencodeAgents = agentsPayload ? parseAgentNames(agentsPayload) : [];
+  // Parse agents from either backend API or fallback
+  const agents = backendAgents?.map(a => a.name) || parseAgentNames(agentsPayload);
 
   const formatWorkspaceType = (type: Workspace['workspace_type']) =>
     type === 'host' ? 'host' : 'isolated';
@@ -87,22 +104,23 @@ export function NewMissionDialog({
   // Set default agent when dialog opens (only once per open)
   // Wait for both agents AND config to load before setting defaults
   useEffect(() => {
-    if (!open || defaultSet || opencodeAgents.length === 0) return;
+    if (!open || defaultSet || agents.length === 0) return;
     // Wait for config to finish loading (undefined = still loading, null/object = loaded)
     if (config === undefined) return;
 
-    if (config?.default_agent && opencodeAgents.includes(config.default_agent)) {
+    if (config?.default_agent && agents.includes(config.default_agent)) {
       setNewMissionAgent(config.default_agent);
-    } else if (opencodeAgents.includes('Sisyphus')) {
+    } else if (agents.includes('Sisyphus')) {
       setNewMissionAgent('Sisyphus');
     }
     setDefaultSet(true);
-  }, [open, defaultSet, opencodeAgents, config]);
+  }, [open, defaultSet, agents, config]);
 
   const resetForm = () => {
     setNewMissionWorkspace('');
     setNewMissionAgent('');
     setNewMissionModelOverride('');
+    setNewMissionBackend('opencode');
     setDefaultSet(false);
   };
 
@@ -119,6 +137,7 @@ export function NewMissionDialog({
         workspaceId: newMissionWorkspace || undefined,
         agent: newMissionAgent || undefined,
         modelOverride: newMissionModelOverride || undefined,
+        backend: newMissionBackend || undefined,
       });
       setOpen(false);
       resetForm();
@@ -183,6 +202,36 @@ export function NewMissionDialog({
               <p className="text-xs text-white/30 mt-1.5">Where the mission will run</p>
             </div>
 
+            {/* Backend selection */}
+            <div>
+              <label className="block text-xs text-white/50 mb-1.5">Backend</label>
+              <select
+                value={newMissionBackend}
+                onChange={(e) => {
+                  setNewMissionBackend(e.target.value);
+                  // Reset agent selection when backend changes
+                  setNewMissionAgent('');
+                  setDefaultSet(false);
+                }}
+                className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white focus:border-indigo-500/50 focus:outline-none appearance-none cursor-pointer"
+                style={{
+                  backgroundImage:
+                    "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                  backgroundPosition: 'right 0.5rem center',
+                  backgroundRepeat: 'no-repeat',
+                  backgroundSize: '1.5em 1.5em',
+                  paddingRight: '2.5rem',
+                }}
+              >
+                {backends?.map((backend) => (
+                  <option key={backend.id} value={backend.id} className="bg-[#1a1a1a]">
+                    {backend.name}{backend.id === 'opencode' ? ' (Recommended)' : ''}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-white/30 mt-1.5">AI coding backend to power this mission</p>
+            </div>
+
             {/* Agent selection */}
             <div>
               <label className="block text-xs text-white/50 mb-1.5">Agent Configuration</label>
@@ -204,14 +253,14 @@ export function NewMissionDialog({
                 <option value="" className="bg-[#1a1a1a]">
                   {defaultAgentLabel}
                 </option>
-                {opencodeAgents.includes("Sisyphus") && (
+                {agents.includes("Sisyphus") && (
                   <option value="Sisyphus" className="bg-[#1a1a1a]">
                     Sisyphus (recommended)
                   </option>
                 )}
-                {opencodeAgents.length > 0 && (
-                  <optgroup label="OpenCode Agents" className="bg-[#1a1a1a]">
-                    {opencodeAgents.map((agent) => (
+                {agents.length > 0 && (
+                  <optgroup label={`${backends?.find(b => b.id === newMissionBackend)?.name || 'Backend'} Agents`} className="bg-[#1a1a1a]">
+                    {agents.map((agent: string) => (
                       <option key={agent} value={agent} className="bg-[#1a1a1a]">
                         {agent}
                       </option>
@@ -220,7 +269,7 @@ export function NewMissionDialog({
                 )}
               </select>
               <p className="text-xs text-white/30 mt-1.5">
-                OpenCode agents are provided by plugins; defaults are recommended
+                Agents are provided by plugins; defaults are recommended
               </p>
             </div>
 

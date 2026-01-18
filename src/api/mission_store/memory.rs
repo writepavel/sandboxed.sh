@@ -53,6 +53,7 @@ impl MissionStore for InMemoryMissionStore {
         workspace_id: Option<Uuid>,
         agent: Option<&str>,
         model_override: Option<&str>,
+        backend: Option<&str>,
     ) -> Result<Mission, String> {
         let now = now_string();
         let mission = Mission {
@@ -63,6 +64,7 @@ impl MissionStore for InMemoryMissionStore {
             workspace_name: None,
             agent: agent.map(|s| s.to_string()),
             model_override: model_override.map(|s| s.to_string()),
+            backend: backend.unwrap_or("opencode").to_string(),
             history: vec![],
             created_at: now.clone(),
             updated_at: now,

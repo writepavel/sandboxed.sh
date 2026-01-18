@@ -649,10 +649,7 @@ fn opencode_entry_from_mcp(
                         "OPEN_AGENT_CONTEXT_ROOT".to_string(),
                         "/root/context".to_string(),
                     );
-                    nspawn_env.insert(
-                        "OPEN_AGENT_CONTEXT_DIR_NAME".to_string(),
-                        context_dir_name,
-                    );
+                    nspawn_env.insert("OPEN_AGENT_CONTEXT_DIR_NAME".to_string(), context_dir_name);
                 }
 
                 // Network configuration based on shared_network setting:
@@ -770,7 +767,7 @@ async fn write_opencode_config(
             // which runs inside the container with container networking
             tools.insert("Bash".to_string(), json!(false)); // Claude Code built-in
             tools.insert("bash".to_string(), json!(false)); // lowercase variant
-            // Enable MCP-provided tools (workspace MCP runs inside container via nspawn)
+                                                            // Enable MCP-provided tools (workspace MCP runs inside container via nspawn)
             tools.insert("workspace_*".to_string(), json!(true));
             tools.insert("desktop_*".to_string(), json!(true));
             tools.insert("playwright_*".to_string(), json!(true));
@@ -802,6 +799,178 @@ async fn write_opencode_config(
     let opencode_config_path = opencode_dir.join("opencode.json");
     tokio::fs::write(opencode_config_path, config_payload).await?;
     Ok(())
+}
+
+/// Write Claude Code configuration to the workspace.
+/// Generates `.claude/settings.local.json` and `CLAUDE.md` files.
+async fn write_claudecode_config(
+    workspace_dir: &Path,
+    mcp_configs: Vec<McpServerConfig>,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+    skill_contents: Option<&[SkillContent]>,
+) -> anyhow::Result<()> {
+    // Create .claude directory
+    let claude_dir = workspace_dir.join(".claude");
+    tokio::fs::create_dir_all(&claude_dir).await?;
+
+    // Build MCP servers config in Claude Code format
+    let mut mcp_servers = serde_json::Map::new();
+
+    let filtered_configs = mcp_configs.into_iter().filter(|c| c.enabled);
+
+    for config in filtered_configs {
+        let server_config = match &config.transport {
+            McpTransport::Stdio(stdio) => {
+                // For container workspaces, wrap commands with nspawn
+                let (command, args) = match workspace_type {
+                    WorkspaceType::Chroot => {
+                        let container_name = workspace_root
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        let mut nspawn_args = vec![
+                            "-q".to_string(),
+                            "-D".to_string(),
+                            workspace_root.to_string_lossy().to_string(),
+                            "-M".to_string(),
+                            container_name,
+                            "--".to_string(),
+                        ];
+                        nspawn_args.extend(stdio.command.iter().cloned());
+                        nspawn_args.extend(stdio.args.iter().cloned());
+                        ("systemd-nspawn".to_string(), nspawn_args)
+                    }
+                    WorkspaceType::Host => {
+                        let command = stdio.command.first().cloned().unwrap_or_default();
+                        let args: Vec<String> = stdio
+                            .command
+                            .iter()
+                            .skip(1)
+                            .chain(stdio.args.iter())
+                            .cloned()
+                            .collect();
+                        (command, args)
+                    }
+                };
+
+                // Merge environment variables
+                let mut env = workspace_env.clone();
+                env.extend(stdio.env.clone());
+
+                json!({
+                    "command": command,
+                    "args": args,
+                    "env": env,
+                })
+            }
+            McpTransport::Http(http) => {
+                json!({
+                    "url": http.endpoint,
+                    "headers": http.headers,
+                })
+            }
+        };
+
+        let key = sanitize_key(&config.name);
+        mcp_servers.insert(key, server_config);
+    }
+
+    // Write settings.local.json
+    let settings = json!({
+        "mcpServers": mcp_servers,
+    });
+    let settings_path = claude_dir.join("settings.local.json");
+    let settings_content = serde_json::to_string_pretty(&settings)?;
+    tokio::fs::write(&settings_path, settings_content).await?;
+
+    // Generate CLAUDE.md from skills
+    if let Some(skills) = skill_contents {
+        if !skills.is_empty() {
+            let mut claude_md = String::new();
+            claude_md.push_str("# Project Context\n\n");
+            claude_md.push_str("This file was generated by Open Agent. It contains context from configured skills.\n\n");
+
+            for skill in skills {
+                claude_md.push_str(&format!("## {}\n\n", skill.name));
+                // Strip frontmatter if present
+                let content = if skill.content.starts_with("---") {
+                    if let Some(end) = skill.content[3..].find("---") {
+                        skill.content[3 + end + 3..].trim_start().to_string()
+                    } else {
+                        skill.content.clone()
+                    }
+                } else {
+                    skill.content.clone()
+                };
+                claude_md.push_str(&content);
+                claude_md.push_str("\n\n");
+            }
+
+            let claude_md_path = workspace_dir.join("CLAUDE.md");
+            tokio::fs::write(&claude_md_path, claude_md).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Write backend-specific configuration to the workspace.
+/// This is the main entry point for config generation.
+pub async fn write_backend_config(
+    workspace_dir: &Path,
+    backend_id: &str,
+    mcp_configs: Vec<McpServerConfig>,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+    skill_allowlist: Option<&[String]>,
+    skill_contents: Option<&[SkillContent]>,
+    shared_network: Option<bool>,
+) -> anyhow::Result<()> {
+    match backend_id {
+        "opencode" => {
+            write_opencode_config(
+                workspace_dir,
+                mcp_configs,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                skill_allowlist,
+                shared_network,
+            )
+            .await
+        }
+        "claudecode" => {
+            write_claudecode_config(
+                workspace_dir,
+                mcp_configs,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                skill_contents,
+            )
+            .await
+        }
+        _ => {
+            // Unknown backend - write OpenCode config as fallback
+            tracing::warn!(
+                backend = backend_id,
+                "Unknown backend, falling back to OpenCode config"
+            );
+            write_opencode_config(
+                workspace_dir,
+                mcp_configs,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                skill_allowlist,
+                shared_network,
+            )
+            .await
+        }
+    }
 }
 
 /// Skill content to be written to the workspace.

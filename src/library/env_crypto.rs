@@ -223,14 +223,16 @@ const VERSIONED_TAG_REGEX: &str = r#"<encrypted v="(\d+)">([^<]*)</encrypted>"#;
 /// Check if a value is an unversioned encrypted tag (user input format).
 pub fn is_unversioned_encrypted(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.starts_with("<encrypted>") && trimmed.ends_with("</encrypted>") && !trimmed.contains(" v=\"")
+    trimmed.starts_with("<encrypted>")
+        && trimmed.ends_with("</encrypted>")
+        && !trimmed.contains(" v=\"")
 }
 
 /// Encrypt all unversioned <encrypted>value</encrypted> tags in content.
 /// Transforms <encrypted>plaintext</encrypted> to <encrypted v="1">ciphertext</encrypted>.
 pub fn encrypt_content_tags(key: &[u8; KEY_LENGTH], content: &str) -> Result<String> {
-    let re = regex::Regex::new(UNVERSIONED_TAG_REGEX)
-        .map_err(|e| anyhow!("Invalid regex: {}", e))?;
+    let re =
+        regex::Regex::new(UNVERSIONED_TAG_REGEX).map_err(|e| anyhow!("Invalid regex: {}", e))?;
 
     let mut result = content.to_string();
     let mut offset: i64 = 0;
@@ -264,8 +266,7 @@ pub fn encrypt_content_tags(key: &[u8; KEY_LENGTH], content: &str) -> Result<Str
 /// Decrypt all versioned <encrypted v="N">ciphertext</encrypted> tags in content.
 /// Transforms <encrypted v="1">ciphertext</encrypted> to <encrypted>plaintext</encrypted>.
 pub fn decrypt_content_tags(key: &[u8; KEY_LENGTH], content: &str) -> Result<String> {
-    let re = regex::Regex::new(VERSIONED_TAG_REGEX)
-        .map_err(|e| anyhow!("Invalid regex: {}", e))?;
+    let re = regex::Regex::new(VERSIONED_TAG_REGEX).map_err(|e| anyhow!("Invalid regex: {}", e))?;
 
     let mut result = content.to_string();
     let mut offset: i64 = 0;
@@ -309,7 +310,10 @@ pub async fn load_or_create_private_key(env_file_path: &Path) -> Result<[u8; KEY
     let key_hex = hex::encode(key);
 
     // Append to .env file
-    let env_line = format!("\n# Auto-generated encryption key for template env vars\n{}={}\n", PRIVATE_KEY_ENV, key_hex);
+    let env_line = format!(
+        "\n# Auto-generated encryption key for template env vars\n{}={}\n",
+        PRIVATE_KEY_ENV, key_hex
+    );
 
     // Create or append to .env file
     let mut file = fs::OpenOptions::new()
@@ -475,7 +479,9 @@ mod tests {
         // Too short
         assert!(parse_key("abc").is_err());
         // Invalid hex
-        assert!(parse_key("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+        assert!(
+            parse_key("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err()
+        );
     }
 
     #[test]
@@ -502,8 +508,12 @@ mod tests {
     #[test]
     fn test_is_unversioned_encrypted() {
         assert!(is_unversioned_encrypted("<encrypted>secret</encrypted>"));
-        assert!(is_unversioned_encrypted("  <encrypted>secret</encrypted>  "));
-        assert!(!is_unversioned_encrypted("<encrypted v=\"1\">secret</encrypted>"));
+        assert!(is_unversioned_encrypted(
+            "  <encrypted>secret</encrypted>  "
+        ));
+        assert!(!is_unversioned_encrypted(
+            "<encrypted v=\"1\">secret</encrypted>"
+        ));
         assert!(!is_unversioned_encrypted("plaintext"));
     }
 

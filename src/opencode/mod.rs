@@ -759,7 +759,9 @@ impl OpenCodeClient {
             if let Some(updated_at) = &session.updated_at {
                 if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) {
                     let age = now.signed_duration_since(updated.with_timezone(&chrono::Utc));
-                    if age > chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::hours(1)) {
+                    if age
+                        > chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::hours(1))
+                    {
                         if let Err(e) = self.delete_session(&session.id).await {
                             tracing::warn!(
                                 session_id = %session.id,
@@ -802,29 +804,10 @@ pub struct ToolStatusInfo {
 }
 
 /// Events emitted by OpenCode during execution.
-#[derive(Debug, Clone)]
-pub enum OpenCodeEvent {
-    /// Agent is thinking/reasoning
-    Thinking { content: String },
-    /// Agent is calling a tool
-    ToolCall {
-        tool_call_id: String,
-        name: String,
-        args: serde_json::Value,
-    },
-    /// Tool execution completed
-    ToolResult {
-        tool_call_id: String,
-        name: String,
-        result: serde_json::Value,
-    },
-    /// Text content being streamed
-    TextDelta { content: String },
-    /// Message execution completed
-    MessageComplete { session_id: String },
-    /// Error occurred
-    Error { message: String },
-}
+///
+/// The concrete event type lives in the backend module so it can be shared
+/// across backends. We keep this alias for backwards compatibility.
+pub type OpenCodeEvent = crate::backend::events::ExecutionEvent;
 
 #[derive(Debug, Default)]
 struct SseState {
@@ -999,7 +982,7 @@ fn handle_tool_part_update(
             );
 
             Some(OpenCodeEvent::ToolCall {
-                tool_call_id,
+                id: tool_call_id,
                 name: tool_name,
                 args,
             })
@@ -1022,7 +1005,7 @@ fn handle_tool_part_update(
             );
 
             Some(OpenCodeEvent::ToolResult {
-                tool_call_id,
+                id: tool_call_id,
                 name: tool_name,
                 result,
             })
@@ -1047,7 +1030,7 @@ fn handle_tool_part_update(
             );
 
             Some(OpenCodeEvent::ToolResult {
-                tool_call_id,
+                id: tool_call_id,
                 name: tool_name,
                 result,
             })
@@ -1094,9 +1077,7 @@ fn parse_sse_event(
 
     let event_type = match json.get("type").and_then(|v| v.as_str()).or(event_name) {
         Some(event_type) => event_type,
-        None => {
-            return None
-        }
+        None => return None,
     };
     let props = json
         .get("properties")
@@ -1238,7 +1219,7 @@ fn parse_sse_event(
                         };
                         state.emitted_tool_calls.insert(call_id.clone(), ());
                         Some(OpenCodeEvent::ToolCall {
-                            tool_call_id: call_id,
+                            id: call_id,
                             name,
                             args,
                         })
@@ -1359,7 +1340,6 @@ impl Default for OpenCodeAssistantInfo {
         }
     }
 }
-
 
 pub fn extract_text(parts: &[serde_json::Value]) -> String {
     let mut out = Vec::new();

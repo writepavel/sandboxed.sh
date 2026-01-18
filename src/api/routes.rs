@@ -22,12 +22,14 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::agents::{AgentContext, AgentRef, OpenCodeAgent};
+use crate::backend::registry::BackendRegistry;
 use crate::config::{AuthMode, Config};
 use crate::mcp::McpRegistry;
 use crate::workspace;
 
 use super::ai_providers as ai_providers_api;
 use super::auth::{self, AuthUser};
+use super::backends as backends_api;
 use super::console;
 use super::control;
 use super::desktop;
@@ -72,6 +74,8 @@ pub struct AppState {
     pub console_pool: Arc<console::SessionPool>,
     /// Global settings store
     pub settings: Arc<crate::settings::SettingsStore>,
+    /// Backend registry for multi-backend support
+    pub backend_registry: Arc<RwLock<BackendRegistry>>,
 }
 
 /// Start the HTTP server.
@@ -136,12 +140,29 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Initialize global settings store
     let settings = Arc::new(crate::settings::SettingsStore::new(&config.working_dir).await);
 
+    // Initialize backend registry with OpenCode and Claude Code backends
+    let opencode_base_url =
+        std::env::var("OPENCODE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:4096".to_string());
+    let opencode_default_agent = std::env::var("OPENCODE_DEFAULT_AGENT").ok();
+    let opencode_permissive = std::env::var("OPENCODE_PERMISSIVE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let mut backend_registry = BackendRegistry::new("opencode");
+    backend_registry.register(crate::backend::opencode::registry_entry(
+        opencode_base_url.clone(),
+        opencode_default_agent,
+        opencode_permissive,
+    ));
+    backend_registry.register(crate::backend::claudecode::registry_entry());
+    let backend_registry = Arc::new(RwLock::new(backend_registry));
+    tracing::info!("Backend registry initialized with {} backends", 2);
+
     // Start background OpenCode session cleanup task
     {
-        let opencode_base_url = std::env::var("OPENCODE_BASE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:4096".to_string());
+        let opencode_base_url_clone = opencode_base_url.clone();
         tokio::spawn(async move {
-            opencode_session_cleanup_task(&opencode_base_url).await;
+            opencode_session_cleanup_task(&opencode_base_url_clone).await;
         });
     }
 
@@ -229,6 +250,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         secrets,
         console_pool,
         settings,
+        backend_registry,
     });
 
     // Start background desktop session cleanup task
@@ -403,6 +425,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .nest("/api/desktop", desktop::routes())
         // System component management endpoints
         .nest("/api/system", system_api::routes())
+        // Backend management endpoints
+        .route("/api/backends", get(backends_api::list_backends))
+        .route("/api/backends/:id", get(backends_api::get_backend))
+        .route(
+            "/api/backends/:id/agents",
+            get(backends_api::list_backend_agents),
+        )
+        .route(
+            "/api/backends/:id/config",
+            get(backends_api::get_backend_config),
+        )
+        .route(
+            "/api/backends/:id/config",
+            axum::routing::put(backends_api::update_backend_config),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_auth,
@@ -965,10 +1002,7 @@ async fn opencode_session_cleanup_task(base_url: &str) {
         match client.cleanup_old_sessions(MAX_SESSION_AGE).await {
             Ok(deleted) => {
                 if deleted > 0 {
-                    tracing::info!(
-                        deleted = deleted,
-                        "OpenCode session cleanup completed"
-                    );
+                    tracing::info!(deleted = deleted, "OpenCode session cleanup completed");
                 } else {
                     tracing::debug!("OpenCode session cleanup: no old sessions to delete");
                 }

@@ -17,6 +17,7 @@
 
 pub mod ai_providers;
 mod auth;
+pub mod backends;
 mod console;
 pub mod control;
 pub mod desktop;

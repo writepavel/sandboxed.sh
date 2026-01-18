@@ -159,8 +159,14 @@ impl McpRegistry {
         desktop.scope = McpScope::Workspace;
 
         let workspace_command = {
-            let release = working_dir.join("target").join("release").join("workspace-mcp");
-            let debug = working_dir.join("target").join("debug").join("workspace-mcp");
+            let release = working_dir
+                .join("target")
+                .join("release")
+                .join("workspace-mcp");
+            let debug = working_dir
+                .join("target")
+                .join("debug")
+                .join("workspace-mcp");
             if release.exists() {
                 release.to_string_lossy().to_string()
             } else if debug.exists() {
