@@ -123,13 +123,16 @@ export function NewMissionDialog({
   // Combine all agents from enabled backends
   const allAgents = useMemo((): CombinedAgent[] => {
     const result: CombinedAgent[] = [];
+    const openCodeHiddenAgents = config?.hidden_agents || [];
     const claudeCodeHiddenAgents = claudeCodeLibConfig?.hidden_agents || [];
 
     for (const backend of enabledBackends) {
       let agentNames: string[] = [];
 
       if (backend.id === 'opencode') {
-        agentNames = opencodeAgents?.map(a => a.name) || parseAgentNames(agentsPayload);
+        // Filter out hidden OpenCode agents
+        const allOpenCodeAgents = opencodeAgents?.map(a => a.name) || parseAgentNames(agentsPayload);
+        agentNames = allOpenCodeAgents.filter(name => !openCodeHiddenAgents.includes(name));
       } else if (backend.id === 'claudecode') {
         // Filter out hidden Claude Code agents
         const allClaudeAgents = claudecodeAgents?.map(a => a.name) || [];
@@ -147,7 +150,7 @@ export function NewMissionDialog({
     }
 
     return result;
-  }, [enabledBackends, opencodeAgents, claudecodeAgents, agentsPayload, claudeCodeLibConfig]);
+  }, [enabledBackends, opencodeAgents, claudecodeAgents, agentsPayload, config, claudeCodeLibConfig]);
 
   // Group agents by backend for display
   const agentsByBackend = useMemo(() => {

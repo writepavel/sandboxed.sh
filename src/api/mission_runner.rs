@@ -760,13 +760,10 @@ pub async fn run_claudecode_turn(
                                 for block in evt.message.content {
                                     match block {
                                         ContentBlock::Text { text } => {
+                                            // Text content is the final assistant response
+                                            // Don't send as Thinking - it will be in the final AssistantMessage
                                             if !text.is_empty() {
-                                                final_result = text.clone();
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: text,
-                                                    done: false,
-                                                    mission_id: Some(mission_id),
-                                                });
+                                                final_result = text;
                                             }
                                         }
                                         ContentBlock::ToolUse { id, name, input } => {
@@ -779,10 +776,13 @@ pub async fn run_claudecode_turn(
                                             });
                                         }
                                         ContentBlock::Thinking { thinking } => {
+                                            // Only send if this is new content not already streamed
+                                            // The streaming deltas already accumulated this, so this is
+                                            // typically the final complete thinking block
                                             if !thinking.is_empty() {
                                                 let _ = events_tx.send(AgentEvent::Thinking {
                                                     content: thinking,
-                                                    done: false,
+                                                    done: true, // Mark as done since this is the final block
                                                     mission_id: Some(mission_id),
                                                 });
                                             }

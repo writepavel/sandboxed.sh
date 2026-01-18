@@ -178,29 +178,85 @@ async fn resolve_path_for_workspace(
             )
         })?;
 
+    let workspace_root = workspace.path.canonicalize().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to canonicalize workspace path: {}", e),
+        )
+    })?;
+
     let input = Path::new(path);
 
-    // If the path is absolute, use it directly (but validate it's within workspace)
-    if input.is_absolute() {
-        return Ok(input.to_path_buf());
-    }
-
-    // Resolve relative path against workspace path
-    // For "context" paths, use the workspace's context directory
-    if path.starts_with("./context") || path.starts_with("context") {
+    // Resolve the final path based on input type
+    let resolved = if input.is_absolute() {
+        input.to_path_buf()
+    } else if path.starts_with("./context") || path.starts_with("context") {
+        // For "context" paths, use the workspace's context directory
         let suffix = path
             .trim_start_matches("./")
             .trim_start_matches("context/")
             .trim_start_matches("context");
-        let context_path = workspace.path.join("context");
+        let context_path = workspace_root.join("context");
         if suffix.is_empty() {
-            return Ok(context_path);
+            context_path
+        } else {
+            context_path.join(suffix)
         }
-        return Ok(context_path.join(suffix));
+    } else {
+        // Default: resolve relative to workspace path
+        workspace_root.join(path)
+    };
+
+    // Canonicalize to resolve ".." and symlinks, then validate within workspace
+    // For non-existent paths, we validate the parent directory exists and is within workspace
+    let canonical = if resolved.exists() {
+        resolved.canonicalize().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to resolve path: {}", e),
+            )
+        })?
+    } else {
+        // For new files, check that the parent is within workspace
+        let parent = resolved.parent().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid path: no parent directory".to_string(),
+            )
+        })?;
+        if !parent.exists() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Parent directory does not exist: {}", parent.display()),
+            ));
+        }
+        let canonical_parent = parent.canonicalize().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to resolve parent path: {}", e),
+            )
+        })?;
+        // Reconstruct the path with canonical parent + filename
+        if let Some(filename) = resolved.file_name() {
+            canonical_parent.join(filename)
+        } else {
+            return Err((StatusCode::BAD_REQUEST, "Invalid path".to_string()));
+        }
+    };
+
+    // Validate that the resolved path is within the workspace
+    if !canonical.starts_with(&workspace_root) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "Path traversal attempt: {} is outside workspace {}",
+                canonical.display(),
+                workspace_root.display()
+            ),
+        ));
     }
 
-    // Default: resolve relative to workspace path
-    Ok(workspace.path.join(path))
+    Ok(canonical)
 }
 
 fn resolve_upload_base(path: &str) -> Result<PathBuf, (StatusCode, String)> {
