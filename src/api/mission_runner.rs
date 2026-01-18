@@ -676,6 +676,13 @@ pub async fn run_claudecode_turn(
     let mut final_result = String::new();
     let mut had_error = false;
 
+    // Track content block types and accumulated content for Claude Code streaming
+    // This is needed because Claude sends incremental deltas that need to be accumulated
+    let mut block_types: HashMap<u32, String> = HashMap::new();
+    let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
+    let mut text_buffer: HashMap<u32, String> = HashMap::new();
+    let mut last_thinking_len: usize = 0; // Track last emitted length to avoid re-sending same content
+
     // Process events until completion or cancellation
     loop {
         tokio::select! {
@@ -698,18 +705,48 @@ pub async fn run_claudecode_turn(
                             }
                             ClaudeEvent::StreamEvent(wrapper) => {
                                 match wrapper.event {
-                                    StreamEvent::ContentBlockDelta { delta, .. } => {
+                                    StreamEvent::ContentBlockDelta { index, delta } => {
+                                        // Only process deltas that have text content
                                         if let Some(text) = delta.text {
-                                            if !text.is_empty() {
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: text,
-                                                    done: false,
-                                                    mission_id: Some(mission_id),
-                                                });
+                                            if text.is_empty() {
+                                                continue;
                                             }
+
+                                            // Check the delta type to determine where to route content
+                                            // "thinking_delta" -> thinking panel
+                                            // "text_delta" -> text output (not thinking)
+                                            if delta.delta_type == "thinking_delta" {
+                                                // Accumulate thinking content
+                                                let buffer = thinking_buffer.entry(index).or_default();
+                                                buffer.push_str(&text);
+
+                                                // Send accumulated thinking content (cumulative, like OpenCode)
+                                                // Only send if we have new content since last emit
+                                                let total_len = thinking_buffer.values().map(|s| s.len()).sum::<usize>();
+                                                if total_len > last_thinking_len {
+                                                    // Combine all thinking buffers for the cumulative content
+                                                    let accumulated: String = thinking_buffer.values().cloned().collect::<Vec<_>>().join("");
+                                                    last_thinking_len = total_len;
+
+                                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                                        content: accumulated,
+                                                        done: false,
+                                                        mission_id: Some(mission_id),
+                                                    });
+                                                }
+                                            } else if delta.delta_type == "text_delta" {
+                                                // Accumulate text content (will be used for final response)
+                                                let buffer = text_buffer.entry(index).or_default();
+                                                buffer.push_str(&text);
+                                                // Don't send text deltas as thinking events
+                                            }
+                                            // Ignore other delta types (e.g., input_json_delta for tool use)
                                         }
                                     }
-                                    StreamEvent::ContentBlockStart { content_block, .. } => {
+                                    StreamEvent::ContentBlockStart { index, content_block } => {
+                                        // Track the block type so we know how to handle deltas
+                                        block_types.insert(index, content_block.block_type.clone());
+
                                         if content_block.block_type == "tool_use" {
                                             if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
                                                 pending_tools.insert(id, name);
