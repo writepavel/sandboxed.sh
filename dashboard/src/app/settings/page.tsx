@@ -116,6 +116,7 @@ export default function SettingsPage() {
   const [claudeForm, setClaudeForm] = useState({
     api_key: '',
     default_model: '',
+    cli_path: '',
     api_key_configured: false,
     enabled: true,
   });
@@ -231,6 +232,7 @@ export default function SettingsPage() {
     setClaudeForm((prev) => ({
       ...prev,
       default_model: typeof settings.default_model === 'string' ? settings.default_model : '',
+      cli_path: typeof settings.cli_path === 'string' ? settings.cli_path : '',
       api_key_configured: Boolean(settings.api_key_configured),
       enabled: claudecodeBackendConfig.enabled,
     }));
@@ -350,6 +352,7 @@ export default function SettingsPage() {
     try {
       const settings: Record<string, unknown> = {
         default_model: claudeForm.default_model || null,
+        cli_path: claudeForm.cli_path || null,
       };
       if (claudeForm.api_key) {
         settings.api_key = claudeForm.api_key;
@@ -828,6 +831,21 @@ export default function SettingsPage() {
                     placeholder="claude-sonnet-4-20250514"
                     className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
                   />
+                </div>
+                <div>
+                  <label className="block text-xs text-white/60 mb-1.5">CLI Path</label>
+                  <input
+                    type="text"
+                    value={claudeForm.cli_path || ''}
+                    onChange={(e) =>
+                      setClaudeForm((prev) => ({ ...prev, cli_path: e.target.value }))
+                    }
+                    placeholder="claude (uses PATH) or /path/to/claude"
+                    className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
+                  />
+                  <p className="mt-1.5 text-xs text-white/30">
+                    Path to the Claude CLI executable. Leave blank to use default from PATH.
+                  </p>
                 </div>
                 <div className="flex items-center gap-2 pt-1">
                   <button

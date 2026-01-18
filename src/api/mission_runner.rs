@@ -19,8 +19,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agents::{AgentContext, AgentRef, AgentResult, TerminalReason};
+use crate::backend::claudecode::client::{ClaudeCodeClient, ClaudeCodeConfig, ClaudeEvent, ContentBlock, StreamEvent};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
+use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
 use crate::workspace;
 
@@ -225,6 +227,7 @@ impl MissionRunner {
         status: Arc<RwLock<ControlStatus>>,
         mission_cmd_tx: mpsc::Sender<crate::tools::mission::MissionControlCommand>,
         current_mission: Arc<RwLock<Option<Uuid>>>,
+        secrets: Option<Arc<SecretsStore>>,
     ) -> bool {
         // Don't start if already running
         if self.is_running() {
@@ -294,6 +297,7 @@ impl MissionRunner {
                 Some(workspace_id),
                 backend_id,
                 agent_override,
+                secrets,
             )
             .await;
             (msg_id, user_message, result)
@@ -397,10 +401,12 @@ async fn run_mission_turn(
     workspace_id: Option<Uuid>,
     backend_id: String,
     agent_override: Option<String>,
+    secrets: Option<Arc<SecretsStore>>,
 ) -> AgentResult {
     let mut config = config;
-    if let Some(agent) = agent_override {
-        config.opencode_agent = Some(agent);
+    let effective_agent = agent_override.clone();
+    if let Some(ref agent) = effective_agent {
+        config.opencode_agent = Some(agent.clone());
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -500,31 +506,45 @@ async fn run_mission_turn(
         }
     };
 
-    let mut ctx = AgentContext::new(config.clone(), mission_work_dir);
-    ctx.mission_control = mission_control;
-    ctx.control_events = Some(events_tx.clone());
-    ctx.frontend_tool_hub = Some(tool_hub);
-    ctx.control_status = Some(status);
-    ctx.cancel_token = Some(cancel);
-    ctx.tree_snapshot = Some(tree_snapshot);
-    ctx.progress_snapshot = Some(progress_snapshot);
-    ctx.mission_id = Some(mission_id);
-    ctx.mcp = Some(mcp);
+    // Execute based on backend
+    let result = match backend_id.as_str() {
+        "claudecode" => {
+            run_claudecode_turn(
+                &mission_work_dir,
+                &user_message,
+                config.default_model.as_deref(),
+                effective_agent.as_deref(),
+                mission_id,
+                events_tx.clone(),
+                cancel,
+                secrets,
+            )
+            .await
+        }
+        "opencode" => {
+            let mut ctx = AgentContext::new(config.clone(), mission_work_dir);
+            ctx.mission_control = mission_control;
+            ctx.control_events = Some(events_tx.clone());
+            ctx.frontend_tool_hub = Some(tool_hub);
+            ctx.control_status = Some(status);
+            ctx.cancel_token = Some(cancel);
+            ctx.tree_snapshot = Some(tree_snapshot);
+            ctx.progress_snapshot = Some(progress_snapshot);
+            ctx.mission_id = Some(mission_id);
+            ctx.mcp = Some(mcp);
+            root_agent.execute(&mut task, &ctx).await
+        }
+        _ => {
+            let _ = events_tx.send(AgentEvent::Error {
+                message: format!("Unsupported backend: {}", backend_id),
+                mission_id: Some(mission_id),
+                resumable: true,
+            });
+            AgentResult::failure(format!("Unsupported backend: {}", backend_id), 0)
+                .with_terminal_reason(TerminalReason::LlmError)
+        }
+    };
 
-    if backend_id != "opencode" {
-        let _ = events_tx.send(AgentEvent::Error {
-            message: format!(
-                "Backend '{}' is not supported for in-app execution yet. Please use OpenCode or run Claude Code locally.",
-                backend_id
-            ),
-            mission_id: Some(mission_id),
-            resumable: true,
-        });
-        return AgentResult::failure(format!("Unsupported backend: {}", backend_id), 0)
-            .with_terminal_reason(TerminalReason::LlmError);
-    }
-
-    let result = root_agent.execute(&mut task, &ctx).await;
     tracing::info!(
         mission_id = %mission_id,
         success = result.success,
@@ -534,6 +554,239 @@ async fn run_mission_turn(
         "Mission turn finished"
     );
     result
+}
+
+/// Execute a turn using Claude Code CLI backend.
+async fn run_claudecode_turn(
+    work_dir: &std::path::Path,
+    message: &str,
+    model: Option<&str>,
+    agent: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    secrets: Option<Arc<SecretsStore>>,
+) -> AgentResult {
+    use std::collections::HashMap;
+
+    // Get API key from secrets
+    let api_key = if let Some(ref store) = secrets {
+        match store.get_secret("claudecode", "api_key").await {
+            Ok(key) => Some(key),
+            Err(e) => {
+                tracing::warn!("Failed to get Claude API key from secrets: {}", e);
+                // Fall back to environment variable
+                std::env::var("ANTHROPIC_API_KEY").ok()
+            }
+        }
+    } else {
+        std::env::var("ANTHROPIC_API_KEY").ok()
+    };
+
+    // Determine CLI path
+    let cli_path = std::env::var("CLAUDE_CLI_PATH")
+        .unwrap_or_else(|_| "claude".to_string());
+
+    let config = ClaudeCodeConfig {
+        cli_path,
+        api_key,
+        default_model: model.map(|s| s.to_string()),
+    };
+
+    let client = ClaudeCodeClient::with_config(config);
+    let session_id = client.create_session_id();
+
+    tracing::info!(
+        mission_id = %mission_id,
+        session_id = %session_id,
+        work_dir = %work_dir.display(),
+        model = ?model,
+        agent = ?agent,
+        "Starting Claude Code execution"
+    );
+
+    // Execute the message
+    let (mut event_rx, process_handle) = match client
+        .execute_message(
+            work_dir.to_str().unwrap_or("."),
+            message,
+            model,
+            Some(&session_id),
+            agent,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let err_msg = format!("Failed to start Claude CLI: {}", e);
+            tracing::error!("{}", err_msg);
+            let _ = events_tx.send(AgentEvent::Error {
+                message: err_msg.clone(),
+                mission_id: Some(mission_id),
+                resumable: true,
+            });
+            return AgentResult::failure(err_msg, 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Track tool calls for result mapping
+    let mut pending_tools: HashMap<String, String> = HashMap::new();
+    let mut total_cost_usd = 0.0f64;
+    let mut final_result = String::new();
+    let mut had_error = false;
+
+    // Process events until completion or cancellation
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled");
+                // Process will be dropped and killed
+                return AgentResult::failure("Cancelled".to_string(), 0)
+                    .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Some(claude_event) => {
+                        match claude_event {
+                            ClaudeEvent::System(sys) => {
+                                tracing::debug!(
+                                    "Claude session init: session_id={}, model={:?}",
+                                    sys.session_id, sys.model
+                                );
+                            }
+                            ClaudeEvent::StreamEvent(wrapper) => {
+                                match wrapper.event {
+                                    StreamEvent::ContentBlockDelta { delta, .. } => {
+                                        if let Some(text) = delta.text {
+                                            if !text.is_empty() {
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: text,
+                                                    done: false,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    StreamEvent::ContentBlockStart { content_block, .. } => {
+                                        if content_block.block_type == "tool_use" {
+                                            if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
+                                                pending_tools.insert(id, name);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            ClaudeEvent::Assistant(evt) => {
+                                for block in evt.message.content {
+                                    match block {
+                                        ContentBlock::Text { text } => {
+                                            if !text.is_empty() {
+                                                final_result = text.clone();
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: text,
+                                                    done: false,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                            }
+                                        }
+                                        ContentBlock::ToolUse { id, name, input } => {
+                                            pending_tools.insert(id.clone(), name.clone());
+                                            let _ = events_tx.send(AgentEvent::ToolCall {
+                                                tool_call_id: id.clone(),
+                                                name: name.clone(),
+                                                args: input,
+                                                mission_id: Some(mission_id),
+                                            });
+                                        }
+                                        ContentBlock::Thinking { thinking } => {
+                                            if !thinking.is_empty() {
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: thinking,
+                                                    done: false,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            ClaudeEvent::User(evt) => {
+                                for block in evt.message.content {
+                                    if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                                        let name = pending_tools
+                                            .get(&tool_use_id)
+                                            .cloned()
+                                            .unwrap_or_else(|| "unknown".to_string());
+
+                                        let result_value = if let Some(ref extra) = evt.tool_use_result {
+                                            serde_json::json!({
+                                                "content": content,
+                                                "stdout": extra.stdout,
+                                                "stderr": extra.stderr,
+                                                "is_error": is_error,
+                                            })
+                                        } else {
+                                            serde_json::Value::String(content)
+                                        };
+
+                                        let _ = events_tx.send(AgentEvent::ToolResult {
+                                            tool_call_id: tool_use_id,
+                                            name,
+                                            result: result_value,
+                                            mission_id: Some(mission_id),
+                                        });
+                                    }
+                                }
+                            }
+                            ClaudeEvent::Result(res) => {
+                                if let Some(cost) = res.total_cost_usd {
+                                    total_cost_usd = cost;
+                                }
+                                if res.is_error || res.subtype == "error" {
+                                    had_error = true;
+                                    let err_msg = res.result.unwrap_or_else(|| "Unknown error".to_string());
+                                    let _ = events_tx.send(AgentEvent::Error {
+                                        message: err_msg.clone(),
+                                        mission_id: Some(mission_id),
+                                        resumable: true,
+                                    });
+                                    final_result = err_msg;
+                                } else if let Some(result) = res.result {
+                                    final_result = result;
+                                }
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    cost_usd = total_cost_usd,
+                                    "Claude Code execution completed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        // Channel closed - process finished
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Wait for process to finish
+    let _ = process_handle.await;
+
+    // Convert cost from USD to cents
+    let cost_cents = (total_cost_usd * 100.0) as u64;
+
+    if had_error {
+        AgentResult::failure(final_result, cost_cents)
+            .with_terminal_reason(TerminalReason::LlmError)
+    } else {
+        AgentResult::success(final_result, cost_cents)
+    }
 }
 
 /// Compact info about a running mission (for API responses).

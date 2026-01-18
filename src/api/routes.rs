@@ -276,6 +276,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         Arc::clone(&mcp),
         Arc::clone(&workspaces),
         Arc::clone(&library),
+        secrets.clone(),
     );
 
     let state = Arc::new(AppState {

@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::agents::{AgentContext, AgentRef, TerminalReason};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
+use crate::secrets::SecretsStore;
 use crate::workspace;
 
 use super::auth::AuthUser;
@@ -658,6 +659,7 @@ pub struct ControlHub {
     mcp: Arc<McpRegistry>,
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
+    secrets: Option<Arc<SecretsStore>>,
 }
 
 impl ControlHub {
@@ -667,6 +669,7 @@ impl ControlHub {
         mcp: Arc<McpRegistry>,
         workspaces: workspace::SharedWorkspaceStore,
         library: SharedLibrary,
+        secrets: Option<Arc<SecretsStore>>,
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -675,6 +678,7 @@ impl ControlHub {
             mcp,
             workspaces,
             library,
+            secrets,
         }
     }
 
@@ -713,6 +717,7 @@ impl ControlHub {
             Arc::clone(&self.workspaces),
             Arc::clone(&self.library),
             mission_store,
+            self.secrets.clone(),
         );
         sessions.insert(user.id.clone(), state.clone());
         state
@@ -1809,6 +1814,7 @@ fn spawn_control_session(
     workspaces: workspace::SharedWorkspaceStore,
     library: SharedLibrary,
     mission_store: Arc<dyn MissionStore>,
+    secrets: Option<Arc<SecretsStore>>,
 ) -> ControlState {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ControlCommand>(256);
     let (events_tx, events_rx) = broadcast::channel::<AgentEvent>(1024);
@@ -1860,6 +1866,7 @@ fn spawn_control_session(
         current_tree,
         progress,
         mission_store,
+        secrets,
     ));
 
     // Spawn background stale mission cleanup task (if enabled)
@@ -1968,6 +1975,7 @@ async fn control_actor_loop(
     current_tree: Arc<RwLock<Option<AgentTreeNode>>>,
     progress: Arc<RwLock<ExecutionProgress>>,
     mission_store: Arc<dyn MissionStore>,
+    secrets: Option<Arc<SecretsStore>>,
 ) {
     // Queue stores (id, content, agent) for the current/primary mission
     let mut queue: VecDeque<(Uuid, String, Option<String>)> = VecDeque::new();
@@ -2304,6 +2312,7 @@ async fn control_actor_loop(
                                             Arc::clone(&status),
                                             mission_cmd_tx.clone(),
                                             Arc::new(RwLock::new(Some(tid))),
+                                            secrets.clone(),
                                         );
                                     }
                                     let _ = respond.send(was_running);
@@ -2361,6 +2370,7 @@ async fn control_actor_loop(
                                                 Arc::clone(&status),
                                                 mission_cmd_tx.clone(),
                                                 Arc::new(RwLock::new(Some(tid))),
+                                                secrets.clone(),
                                             );
                                             tracing::info!("Auto-started mission {} in parallel", tid);
                                             parallel_runners.insert(tid, runner);
@@ -2722,6 +2732,7 @@ async fn control_actor_loop(
                                 Arc::clone(&status),
                                 mission_cmd_tx.clone(),
                                 Arc::new(RwLock::new(Some(mission_id))), // Each runner tracks its own mission
+                                secrets.clone(),
                             );
 
                             if started {

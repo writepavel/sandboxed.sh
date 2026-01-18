@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import useSWR from 'swr';
 import {
   getLibraryOpenCodeSettings,
   saveLibraryOpenCodeSettings,
@@ -10,8 +11,10 @@ import {
   saveOpenAgentConfig,
   listOpenCodeAgents,
   OpenAgentConfig,
+  listBackends,
+  getBackendConfig,
 } from '@/lib/api';
-import { Save, Loader, AlertCircle, Check, RefreshCw, RotateCcw, Eye, EyeOff, AlertTriangle, X, GitBranch, Upload } from 'lucide-react';
+import { Save, Loader, AlertCircle, Check, RefreshCw, RotateCcw, Eye, EyeOff, AlertTriangle, X, GitBranch, Upload, Info, FileCode, Terminal } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { useLibrary } from '@/contexts/library-context';
@@ -38,6 +41,31 @@ export default function SettingsPage() {
     pushing,
     refreshStatus,
   } = useLibrary();
+
+  // Harness tab state
+  const [activeHarness, setActiveHarness] = useState<'opencode' | 'claudecode'>('opencode');
+
+  // Fetch backends and their config to show enabled harnesses
+  const { data: backends = [] } = useSWR('backends', listBackends, {
+    revalidateOnFocus: false,
+    fallbackData: [
+      { id: 'opencode', name: 'OpenCode' },
+      { id: 'claudecode', name: 'Claude Code' },
+    ],
+  });
+  const { data: opencodeConfig } = useSWR('backend-opencode-config', () => getBackendConfig('opencode'), {
+    revalidateOnFocus: false,
+  });
+  const { data: claudecodeConfig } = useSWR('backend-claudecode-config', () => getBackendConfig('claudecode'), {
+    revalidateOnFocus: false,
+  });
+
+  // Filter to only enabled backends
+  const enabledBackends = backends.filter((b) => {
+    if (b.id === 'opencode') return opencodeConfig?.enabled !== false;
+    if (b.id === 'claudecode') return claudecodeConfig?.enabled !== false;
+    return true;
+  });
 
   // OpenCode settings state
   const [settings, setSettings] = useState<string>('');
@@ -407,7 +435,27 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {/* OpenCode Settings Section */}
+      {/* Harness Tabs */}
+      <div className="flex items-center gap-2 mb-2">
+        {enabledBackends.map((backend) => (
+          <button
+            key={backend.id}
+            onClick={() => setActiveHarness(backend.id === 'claudecode' ? 'claudecode' : 'opencode')}
+            className={cn(
+              'px-4 py-2 rounded-lg text-sm font-medium border transition-colors',
+              activeHarness === backend.id
+                ? 'bg-white/[0.08] border-white/[0.12] text-white'
+                : 'bg-white/[0.02] border-white/[0.06] text-white/50 hover:text-white/70'
+            )}
+          >
+            {backend.name}
+          </button>
+        ))}
+      </div>
+
+      {activeHarness === 'opencode' ? (
+        <>
+          {/* OpenCode Settings Section */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <div>
@@ -626,6 +674,125 @@ export default function SettingsPage() {
           </select>
         </div>
       </div>
+        </>
+      ) : (
+        /* Claude Code Section */
+        <div className="space-y-6">
+          {/* Claude Code Info Card */}
+          <div className="p-6 rounded-xl bg-white/[0.02] border border-white/[0.06]">
+            <div className="flex items-start gap-4">
+              <div className="p-3 rounded-xl bg-indigo-500/10">
+                <Terminal className="h-6 w-6 text-indigo-400" />
+              </div>
+              <div className="flex-1 space-y-3">
+                <div>
+                  <h2 className="text-lg font-medium text-white">Claude Code Configuration</h2>
+                  <p className="text-sm text-white/50 mt-1">
+                    Claude Code uses a workspace-centric configuration model that differs from OpenCode.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* How It Works */}
+          <div className="p-6 rounded-xl bg-white/[0.02] border border-white/[0.06] space-y-4">
+            <div className="flex items-center gap-2">
+              <Info className="h-5 w-5 text-blue-400" />
+              <h3 className="text-sm font-medium text-white">How Configuration Works</h3>
+            </div>
+            <div className="space-y-4 text-sm text-white/60">
+              <p>
+                Unlike OpenCode which uses a centralized <code className="text-amber-400 bg-white/[0.04] px-1.5 py-0.5 rounded">oh-my-opencode.json</code> configuration,
+                Claude Code generates configuration per-workspace from your Library.
+              </p>
+              <div className="space-y-2">
+                <p className="text-white/80 font-medium">Generated files in each workspace:</p>
+                <ul className="list-disc list-inside space-y-1 pl-2">
+                  <li>
+                    <code className="text-emerald-400 bg-white/[0.04] px-1.5 py-0.5 rounded">CLAUDE.md</code> —
+                    System prompt and context from Library skills
+                  </li>
+                  <li>
+                    <code className="text-emerald-400 bg-white/[0.04] px-1.5 py-0.5 rounded">.claude/settings.local.json</code> —
+                    MCP servers and tool permissions
+                  </li>
+                </ul>
+              </div>
+              <div className="space-y-2">
+                <p className="text-white/80 font-medium">Configuration sources from Library:</p>
+                <ul className="list-disc list-inside space-y-1 pl-2">
+                  <li>
+                    <code className="text-violet-400 bg-white/[0.04] px-1.5 py-0.5 rounded">skills/</code> —
+                    Markdown files become context in CLAUDE.md
+                  </li>
+                  <li>
+                    <code className="text-violet-400 bg-white/[0.04] px-1.5 py-0.5 rounded">mcps/</code> —
+                    MCP server definitions for tool access
+                  </li>
+                  <li>
+                    <code className="text-violet-400 bg-white/[0.04] px-1.5 py-0.5 rounded">tools/</code> —
+                    Custom tool definitions
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          {/* Configuration Location */}
+          <div className="p-6 rounded-xl bg-white/[0.02] border border-white/[0.06] space-y-4">
+            <div className="flex items-center gap-2">
+              <FileCode className="h-5 w-5 text-emerald-400" />
+              <h3 className="text-sm font-medium text-white">Where to Configure</h3>
+            </div>
+            <div className="space-y-3 text-sm text-white/60">
+              <p>
+                To configure Claude Code behavior, edit your Library files:
+              </p>
+              <div className="grid gap-3">
+                <a
+                  href="/config/skills"
+                  className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.06] hover:bg-white/[0.04] hover:border-white/[0.08] transition-colors"
+                >
+                  <div className="p-2 rounded-lg bg-violet-500/10">
+                    <FileCode className="h-4 w-4 text-violet-400" />
+                  </div>
+                  <div>
+                    <p className="text-white/80 font-medium">Skills</p>
+                    <p className="text-xs text-white/40">System prompts and context for Claude</p>
+                  </div>
+                </a>
+                <a
+                  href="/config/mcps"
+                  className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.06] hover:bg-white/[0.04] hover:border-white/[0.08] transition-colors"
+                >
+                  <div className="p-2 rounded-lg bg-emerald-500/10">
+                    <Terminal className="h-4 w-4 text-emerald-400" />
+                  </div>
+                  <div>
+                    <p className="text-white/80 font-medium">MCP Servers</p>
+                    <p className="text-xs text-white/40">Tool servers Claude can access</p>
+                  </div>
+                </a>
+              </div>
+            </div>
+          </div>
+
+          {/* Backend Settings Link */}
+          <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/20">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <div className="text-sm text-amber-400/80">
+                <p className="font-medium text-amber-400">Backend Settings</p>
+                <p className="mt-1">
+                  To configure Claude Code API key, default model, or CLI path, visit the{' '}
+                  <a href="/settings" className="underline hover:text-amber-300">Settings page</a> → Backends → Claude Code.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Commit Dialog */}
       {showCommitDialog && (
