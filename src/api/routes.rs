@@ -187,12 +187,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let root_agent: AgentRef = Arc::new(OpenCodeAgent::new(config.clone()));
 
     // Initialize backend registry with OpenCode and Claude Code backends
-    let opencode_base_url =
-        std::env::var("OPENCODE_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:4096".to_string());
-    let opencode_default_agent = std::env::var("OPENCODE_DEFAULT_AGENT").ok();
-    let opencode_permissive = std::env::var("OPENCODE_PERMISSIVE")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    let opencode_base_url = config.opencode_base_url.clone();
+    let opencode_default_agent = config.opencode_agent.clone();
+    let opencode_permissive = config.opencode_permissive;
 
     let mut backend_registry = BackendRegistry::new("opencode");
     backend_registry.register(crate::backend::opencode::registry_entry(
