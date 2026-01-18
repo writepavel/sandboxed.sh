@@ -75,6 +75,9 @@ pub struct MissionRunner {
     /// Workspace ID where this mission should run
     pub workspace_id: Uuid,
 
+    /// Backend ID used for this mission
+    pub backend_id: String,
+
     /// Current state
     pub state: MissionRunState,
 
@@ -111,10 +114,16 @@ pub struct MissionRunner {
 
 impl MissionRunner {
     /// Create a new mission runner.
-    pub fn new(mission_id: Uuid, workspace_id: Uuid, agent_override: Option<String>) -> Self {
+    pub fn new(
+        mission_id: Uuid,
+        workspace_id: Uuid,
+        agent_override: Option<String>,
+        backend_id: Option<String>,
+    ) -> Self {
         Self {
             mission_id,
             workspace_id,
+            backend_id: backend_id.unwrap_or_else(|| "opencode".to_string()),
             state: MissionRunState::Queued,
             agent_override,
             queue: VecDeque::new(),
@@ -239,6 +248,7 @@ impl MissionRunner {
         let mission_id = self.mission_id;
         let workspace_id = self.workspace_id;
         let agent_override = self.agent_override.clone();
+        let backend_id = self.backend_id.clone();
         let user_message = msg.content.clone();
         let msg_id = msg.id;
         tracing::info!(
@@ -282,6 +292,7 @@ impl MissionRunner {
                 progress_ref,
                 mission_id,
                 Some(workspace_id),
+                backend_id,
                 agent_override,
             )
             .await;
@@ -384,6 +395,7 @@ async fn run_mission_turn(
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
     mission_id: Uuid,
     workspace_id: Option<Uuid>,
+    backend_id: String,
     agent_override: Option<String>,
 ) -> AgentResult {
     let mut config = config;
@@ -465,8 +477,14 @@ async fn run_mission_turn(
     let mission_work_dir = match {
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        workspace::prepare_mission_workspace_with_skills(&workspace, &mcp, lib_ref, mission_id)
-            .await
+        workspace::prepare_mission_workspace_with_skills_backend(
+            &workspace,
+            &mcp,
+            lib_ref,
+            mission_id,
+            &backend_id,
+        )
+        .await
     } {
         Ok(dir) => {
             tracing::info!(

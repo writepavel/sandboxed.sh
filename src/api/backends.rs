@@ -132,9 +132,9 @@ pub async fn get_backend_config(
             let api_key_configured = state
                 .secrets
                 .as_ref()
-                .map(|s| {
-                    // Check async context
-                    false // TODO: implement proper secret check
+                .map(|_s| {
+                    // TODO: implement proper secret check
+                    false
                 })
                 .unwrap_or(false);
             serde_json::json!({

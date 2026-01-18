@@ -692,6 +692,62 @@ fn opencode_entry_from_mcp(
     }
 }
 
+fn claude_entry_from_mcp(
+    config: &McpServerConfig,
+    workspace_dir: &Path,
+    workspace_root: &Path,
+    workspace_type: WorkspaceType,
+    workspace_env: &HashMap<String, String>,
+    shared_network: Option<bool>,
+) -> serde_json::Value {
+    match &config.transport {
+        McpTransport::Http { endpoint, headers } => {
+            let mut entry = serde_json::Map::new();
+            entry.insert("url".to_string(), json!(endpoint));
+            if !headers.is_empty() {
+                entry.insert("headers".to_string(), json!(headers));
+            }
+            serde_json::Value::Object(entry)
+        }
+        McpTransport::Stdio { .. } => {
+            let opencode_entry = opencode_entry_from_mcp(
+                config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                shared_network,
+            );
+
+            let command_vec = opencode_entry
+                .get("command")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let command = command_vec
+                .first()
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let args: Vec<String> = command_vec
+                .iter()
+                .skip(1)
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+
+            let mut entry = serde_json::Map::new();
+            entry.insert("command".to_string(), json!(command));
+            entry.insert("args".to_string(), json!(args));
+
+            if let Some(env) = opencode_entry.get("environment").and_then(|v| v.as_object()) {
+                entry.insert("env".to_string(), serde_json::Value::Object(env.clone()));
+            }
+
+            serde_json::Value::Object(entry)
+        }
+    }
+}
+
 async fn write_opencode_config(
     workspace_dir: &Path,
     mcp_configs: Vec<McpServerConfig>,
@@ -810,6 +866,7 @@ async fn write_claudecode_config(
     workspace_type: WorkspaceType,
     workspace_env: &HashMap<String, String>,
     skill_contents: Option<&[SkillContent]>,
+    shared_network: Option<bool>,
 ) -> anyhow::Result<()> {
     // Create .claude directory
     let claude_dir = workspace_dir.join(".claude");
@@ -817,64 +874,24 @@ async fn write_claudecode_config(
 
     // Build MCP servers config in Claude Code format
     let mut mcp_servers = serde_json::Map::new();
+    let mut used = std::collections::HashSet::new();
 
     let filtered_configs = mcp_configs.into_iter().filter(|c| c.enabled);
 
     for config in filtered_configs {
-        let server_config = match &config.transport {
-            McpTransport::Stdio(stdio) => {
-                // For container workspaces, wrap commands with nspawn
-                let (command, args) = match workspace_type {
-                    WorkspaceType::Chroot => {
-                        let container_name = workspace_root
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "default".to_string());
-                        let mut nspawn_args = vec![
-                            "-q".to_string(),
-                            "-D".to_string(),
-                            workspace_root.to_string_lossy().to_string(),
-                            "-M".to_string(),
-                            container_name,
-                            "--".to_string(),
-                        ];
-                        nspawn_args.extend(stdio.command.iter().cloned());
-                        nspawn_args.extend(stdio.args.iter().cloned());
-                        ("systemd-nspawn".to_string(), nspawn_args)
-                    }
-                    WorkspaceType::Host => {
-                        let command = stdio.command.first().cloned().unwrap_or_default();
-                        let args: Vec<String> = stdio
-                            .command
-                            .iter()
-                            .skip(1)
-                            .chain(stdio.args.iter())
-                            .cloned()
-                            .collect();
-                        (command, args)
-                    }
-                };
-
-                // Merge environment variables
-                let mut env = workspace_env.clone();
-                env.extend(stdio.env.clone());
-
-                json!({
-                    "command": command,
-                    "args": args,
-                    "env": env,
-                })
-            }
-            McpTransport::Http(http) => {
-                json!({
-                    "url": http.endpoint,
-                    "headers": http.headers,
-                })
-            }
-        };
-
-        let key = sanitize_key(&config.name);
-        mcp_servers.insert(key, server_config);
+        let base = sanitize_key(&config.name);
+        let key = unique_key(&base, &mut used);
+        mcp_servers.insert(
+            key,
+            claude_entry_from_mcp(
+                &config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                shared_network,
+            ),
+        );
     }
 
     // Write settings.local.json
@@ -887,10 +904,15 @@ async fn write_claudecode_config(
 
     // Generate CLAUDE.md from skills
     if let Some(skills) = skill_contents {
-        if !skills.is_empty() {
+        let claude_md_path = workspace_dir.join("CLAUDE.md");
+        if skills.is_empty() {
+            let _ = tokio::fs::remove_file(&claude_md_path).await;
+        } else {
             let mut claude_md = String::new();
             claude_md.push_str("# Project Context\n\n");
-            claude_md.push_str("This file was generated by Open Agent. It contains context from configured skills.\n\n");
+            claude_md.push_str(
+                "This file was generated by Open Agent. It contains context from configured skills.\n\n",
+            );
 
             for skill in skills {
                 claude_md.push_str(&format!("## {}\n\n", skill.name));
@@ -908,7 +930,6 @@ async fn write_claudecode_config(
                 claude_md.push_str("\n\n");
             }
 
-            let claude_md_path = workspace_dir.join("CLAUDE.md");
             tokio::fs::write(&claude_md_path, claude_md).await?;
         }
     }
@@ -943,6 +964,17 @@ pub async fn write_backend_config(
             .await
         }
         "claudecode" => {
+            // Keep OpenCode config in sync for compatibility with existing execution pipeline.
+            write_opencode_config(
+                workspace_dir,
+                mcp_configs.clone(),
+                workspace_root,
+                workspace_type,
+                workspace_env,
+                skill_allowlist,
+                shared_network,
+            )
+            .await?;
             write_claudecode_config(
                 workspace_dir,
                 mcp_configs,
@@ -950,6 +982,7 @@ pub async fn write_backend_config(
                 workspace_type,
                 workspace_env,
                 skill_contents,
+                shared_network,
             )
             .await
         }
@@ -1173,6 +1206,25 @@ pub async fn sync_skills_to_dir(
         return Ok(());
     }
 
+    let skills_to_write = collect_skill_contents(skill_names, context_name, library).await;
+
+    write_skills_to_workspace(target_dir, &skills_to_write).await?;
+
+    tracing::info!(
+        context = %context_name,
+        skills = ?skill_names,
+        target = %target_dir.display(),
+        "Synced skills to directory"
+    );
+
+    Ok(())
+}
+
+async fn collect_skill_contents(
+    skill_names: &[String],
+    context_name: &str,
+    library: &LibraryStore,
+) -> Vec<SkillContent> {
     let mut skills_to_write: Vec<SkillContent> = Vec::new();
 
     for skill_name in skill_names {
@@ -1200,16 +1252,7 @@ pub async fn sync_skills_to_dir(
         }
     }
 
-    write_skills_to_workspace(target_dir, &skills_to_write).await?;
-
-    tracing::info!(
-        context = %context_name,
-        skills = ?skill_names,
-        target = %target_dir.display(),
-        "Synced skills to directory"
-    );
-
-    Ok(())
+    skills_to_write
 }
 
 /// Tool content to be written to the workspace.
@@ -1501,6 +1544,24 @@ pub async fn prepare_mission_workspace_with_skills(
     library: Option<&LibraryStore>,
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
+    prepare_mission_workspace_with_skills_backend(
+        workspace,
+        mcp,
+        library,
+        mission_id,
+        "opencode",
+    )
+    .await
+}
+
+/// Prepare a workspace directory for a mission with skill and tool syncing for a specific backend.
+pub async fn prepare_mission_workspace_with_skills_backend(
+    workspace: &Workspace,
+    mcp: &McpRegistry,
+    library: Option<&LibraryStore>,
+    mission_id: Uuid,
+    backend_id: &str,
+) -> anyhow::Result<PathBuf> {
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = mcp.list_configs().await;
@@ -1509,13 +1570,27 @@ pub async fn prepare_mission_workspace_with_skills(
     } else {
         Some(workspace.skills.as_slice())
     };
-    write_opencode_config(
+    let mut skill_contents: Option<Vec<SkillContent>> = None;
+
+    if backend_id == "claudecode" {
+        if let Some(lib) = library {
+            let context = format!("mission-{}", mission_id);
+            let skill_names =
+                resolve_workspace_skill_names(workspace, lib).await.unwrap_or_default();
+            let skills = collect_skill_contents(&skill_names, &context, lib).await;
+            skill_contents = Some(skills);
+        }
+    }
+
+    write_backend_config(
         &dir,
+        backend_id,
         mcp_configs,
         &workspace.path,
         workspace.workspace_type,
         &workspace.env_vars,
         skill_allowlist,
+        skill_contents.as_deref(),
         workspace.shared_network,
     )
     .await?;

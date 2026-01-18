@@ -1059,7 +1059,7 @@ pub async fn create_mission(
 ) -> Result<Json<Mission>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
 
-    let (title, workspace_id, agent, model_override, backend) = body
+    let (title, workspace_id, agent, model_override, mut backend) = body
         .map(|b| {
             (
                 b.title.clone(),
@@ -1071,11 +1071,27 @@ pub async fn create_mission(
         })
         .unwrap_or((None, None, None, None, None));
 
+    if let Some(value) = backend.as_ref() {
+        if value.trim().is_empty() {
+            backend = None;
+        }
+    }
+
     // Validate agent exists before creating mission (fail fast with clear error)
     if let Some(ref agent_name) = agent {
         super::library::validate_agent_exists(&state, agent_name)
             .await
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+
+    if let Some(ref backend_id) = backend {
+        let registry = state.backend_registry.read().await;
+        if registry.get(backend_id).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Unknown backend: {}", backend_id),
+            ));
+        }
     }
 
     let control = control_for_user(&state, &user).await;
@@ -2318,6 +2334,7 @@ async fn control_actor_loop(
                                                 tid,
                                                 mission.workspace_id,
                                                 mission.agent.clone(),
+                                                Some(mission.backend.clone()),
                                             );
                                             // Load existing history
                                             for entry in &mission.history {
@@ -2449,19 +2466,20 @@ async fn control_actor_loop(
                                 let progress_ref = Arc::clone(&progress);
                                 // Capture which mission this task is working on
                                 let mission_id = current_mission.read().await.clone();
-                                let (workspace_id, model_override, mission_agent) = if let Some(mid) = mission_id {
+                                let (workspace_id, model_override, mission_agent, backend_id) = if let Some(mid) = mission_id {
                                     match mission_store.get_mission(mid).await {
                                         Ok(Some(mission)) => (
                                             Some(mission.workspace_id),
                                             mission.model_override.clone(),
                                             mission.agent.clone(),
+                                            Some(mission.backend.clone()),
                                         ),
                                         Ok(None) => {
                                             tracing::warn!(
                                                 "Mission {} not found while resolving workspace",
                                                 mid
                                             );
-                                            (None, None, None)
+                                            (None, None, None, None)
                                         }
                                         Err(e) => {
                                             tracing::warn!(
@@ -2469,11 +2487,11 @@ async fn control_actor_loop(
                                                 mid,
                                                 e
                                             );
-                                            (None, None, None)
+                                            (None, None, None, None)
                                         }
                                     }
                                 } else {
-                                    (None, None, None)
+                                    (None, None, None, None)
                                 };
                                 // Per-message agent overrides mission agent
                                 let agent_override = per_msg_agent.or(mission_agent);
@@ -2499,6 +2517,7 @@ async fn control_actor_loop(
                                         progress_ref,
                                         mission_id,
                                         workspace_id,
+                                        backend_id,
                                         model_override,
                                         agent_override,
                                     )
@@ -2680,6 +2699,7 @@ async fn control_actor_loop(
                                 mission_id,
                                 mission.workspace_id,
                                 mission.agent.clone(),
+                                Some(mission.backend.clone()),
                             );
 
                             // Load existing history into runner to preserve conversation context
@@ -2847,6 +2867,7 @@ async fn control_actor_loop(
                                         let tree_ref = Arc::clone(&current_tree);
                                         let progress_ref = Arc::clone(&progress);
                                         let workspace_id = Some(mission.workspace_id);
+                                        let backend_id = Some(mission.backend.clone());
                                         let model_override = mission.model_override.clone();
                                         // Resume uses mission agent (no per-message override for resumes)
                                         let agent_override = mission.agent.clone();
@@ -2871,6 +2892,7 @@ async fn control_actor_loop(
                                                 progress_ref,
                                                 Some(mission_id),
                                                 workspace_id,
+                                                backend_id,
                                                 model_override,
                                                 agent_override,
                                             )
@@ -3303,19 +3325,20 @@ async fn control_actor_loop(
                     running_cancel = Some(cancel.clone());
                     // Capture which mission this task is working on
                     let mission_id = current_mission.read().await.clone();
-                    let (workspace_id, model_override, mission_agent) = if let Some(mid) = mission_id {
+                    let (workspace_id, model_override, mission_agent, backend_id) = if let Some(mid) = mission_id {
                         match mission_store.get_mission(mid).await {
                             Ok(Some(mission)) => (
                                 Some(mission.workspace_id),
                                 mission.model_override.clone(),
                                 mission.agent.clone(),
+                                Some(mission.backend.clone()),
                             ),
                             Ok(None) => {
                                 tracing::warn!(
                                     "Mission {} not found while resolving workspace",
                                     mid
                                 );
-                                (None, None, None)
+                                (None, None, None, None)
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -3323,11 +3346,11 @@ async fn control_actor_loop(
                                     mid,
                                     e
                                 );
-                                (None, None, None)
+                                (None, None, None, None)
                             }
                         }
                     } else {
-                        (None, None, None)
+                        (None, None, None, None)
                     };
                     // Per-message agent overrides mission agent
                     let agent_override = per_msg_agent.or(mission_agent);
@@ -3352,6 +3375,7 @@ async fn control_actor_loop(
                             progress_ref,
                             mission_id,
                             workspace_id,
+                            backend_id,
                             model_override,
                             agent_override,
                         )
@@ -3572,6 +3596,7 @@ async fn run_single_control_turn(
     progress_snapshot: Arc<RwLock<ExecutionProgress>>,
     mission_id: Option<Uuid>,
     workspace_id: Option<Uuid>,
+    backend_id: Option<String>,
     model_override: Option<String>,
     agent_override: Option<String>,
 ) -> crate::agents::AgentResult {
@@ -3587,13 +3612,20 @@ async fn run_single_control_turn(
         // Get library for skill syncing
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        let dir =
-            match workspace::prepare_mission_workspace_with_skills(&ws, &mcp, lib_ref, mid).await {
-                Ok(dir) => dir,
-                Err(e) => {
-                    tracing::warn!("Failed to prepare mission workspace: {}", e);
-                    ws.path.clone()
-                }
+        let dir = match workspace::prepare_mission_workspace_with_skills_backend(
+            &ws,
+            &mcp,
+            lib_ref,
+            mid,
+            backend_id.as_deref().unwrap_or("opencode"),
+        )
+        .await
+        {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!("Failed to prepare mission workspace: {}", e);
+                ws.path.clone()
+            }
             };
         (dir, Some(ws))
     } else {
