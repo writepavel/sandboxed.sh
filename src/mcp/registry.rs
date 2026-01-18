@@ -220,6 +220,25 @@ impl McpRegistry {
             None
         }
 
+        // Remove duplicate MCPs by name (keep the first one).
+        // This handles corrupted configs where the same MCP name appears twice.
+        let mut seen_names = std::collections::HashSet::new();
+        let mut duplicates = Vec::new();
+        for config in &configs {
+            if !seen_names.insert(config.name.clone()) {
+                duplicates.push(config.id);
+                tracing::warn!(
+                    "Removing duplicate MCP '{}' (id: {})",
+                    config.name,
+                    config.id
+                );
+            }
+        }
+        for dup_id in duplicates {
+            let _ = config_store.remove(dup_id).await;
+            configs.retain(|c| c.id != dup_id);
+        }
+
         let defaults = Self::default_configs(working_dir);
         for config in defaults {
             if configs.iter().any(|c| c.name == config.name) {
@@ -280,6 +299,24 @@ impl McpRegistry {
                 .await;
         }
 
+        // Ensure workspace/desktop MCPs have correct scope (migrate old configs).
+        // This must run even if the binary doesn't exist locally.
+        for config in configs.iter_mut() {
+            if !matches!(config.name.as_str(), "workspace" | "desktop") {
+                continue;
+            }
+
+            if config.scope != McpScope::Workspace {
+                config.scope = McpScope::Workspace;
+                let id = config.id;
+                let _ = config_store
+                    .update(id, |c| {
+                        c.scope = McpScope::Workspace;
+                    })
+                    .await;
+            }
+        }
+
         // Prefer repo-local MCP binaries for workspace/desktop (debug or release),
         // so default configs work without installing to PATH.
         for config in configs.iter_mut() {
@@ -308,16 +345,6 @@ impl McpRegistry {
                         })
                         .await;
                 }
-            }
-
-            if config.scope != McpScope::Workspace {
-                config.scope = McpScope::Workspace;
-                let id = config.id;
-                let _ = config_store
-                    .update(id, |c| {
-                        c.scope = McpScope::Workspace;
-                    })
-                    .await;
             }
         }
 
