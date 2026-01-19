@@ -1850,12 +1850,27 @@ pub async fn write_runtime_workspace_state(
         None => "current_workspace.json".to_string(),
     };
     let path = runtime_dir.join(&filename);
-    tokio::fs::write(&path, serde_json::to_string_pretty(&payload)?).await?;
+    let payload_str = serde_json::to_string_pretty(&payload)?;
+    tokio::fs::write(&path, &payload_str).await?;
+
+    // Also write to current_workspace.json so OPEN_AGENT_RUNTIME_WORKSPACE_FILE always works
+    // (that env var points to current_workspace.json, and oh-my-opencode reads it for container detection)
+    if mission_id.is_some() {
+        let current_path = runtime_dir.join("current_workspace.json");
+        if let Err(e) = tokio::fs::write(&current_path, &payload_str).await {
+            tracing::warn!(
+                workspace = %workspace.name,
+                path = %current_path.display(),
+                error = %e,
+                "Failed to write current_workspace.json"
+            );
+        }
+    }
 
     // Also write to the working directory itself so MCPs can find it
     // This allows MCPs to discover workspace context from cwd without racing on a shared file
     let context_file = working_dir.join(".openagent_context.json");
-    if let Err(e) = tokio::fs::write(&context_file, serde_json::to_string_pretty(&payload)?).await {
+    if let Err(e) = tokio::fs::write(&context_file, &payload_str).await {
         tracing::warn!(
             workspace = %workspace.name,
             path = %context_file.display(),
