@@ -186,6 +186,17 @@ This covers:
 
 **If asked to deploy Open Agent**: Read INSTALL.md first. It contains an "AI Agents" section at the top listing prerequisites to collect from the user (server IP, domain, SSH access, Library repo URL).
 
+### Build Mode
+
+**IMPORTANT: Always use debug builds unless release is explicitly requested.**
+
+Debug builds are preferred because:
+- Much faster compilation time
+- Better error messages and stack traces
+- Release builds are unnecessarily slow for this use case
+
+When deploying, use `cargo build` (not `cargo build --release`).
+
 ## Notes
 
 - OpenCode config files are generated per workspace; do not keep static `opencode.json` in the repo.
