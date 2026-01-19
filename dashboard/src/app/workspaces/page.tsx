@@ -274,10 +274,10 @@ export default function WorkspacesPage() {
       // even if the build step fails later
       await mutateWorkspaces();
 
-      // For chroot workspaces, trigger build BEFORE showing the modal
-      // This prevents the flicker where status briefly shows as non-building
+      // For chroot workspaces WITHOUT a template, trigger build manually.
+      // Template-based workspaces are auto-built by the backend, so skip the explicit build call.
       let workspaceToShow = created;
-      if (workspaceType === 'chroot') {
+      if (workspaceType === 'chroot' && !newWorkspaceTemplate) {
         try {
           workspaceToShow = await buildWorkspace(created.id, created.distro as ChrootDistro || 'ubuntu-noble', false);
         } catch (buildErr) {
@@ -725,10 +725,10 @@ export default function WorkspacesPage() {
                           <ConfigCodeEditor
                             value={initScript}
                             onChange={setInitScript}
-                            language="bash"
                             placeholder="#!/usr/bin/env bash&#10;# Install packages or setup files here"
                             className="min-h-[180px]"
                             minHeight={180}
+                            language="bash"
                           />
                           <p className="text-xs text-white/35 mt-3">
                             Runs during build. Save changes, then Rebuild to apply.

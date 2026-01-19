@@ -536,11 +536,8 @@ async fn run_mission_turn(
             root_agent.execute(&mut task, &ctx).await
         }
         _ => {
-            let _ = events_tx.send(AgentEvent::Error {
-                message: format!("Unsupported backend: {}", backend_id),
-                mission_id: Some(mission_id),
-                resumable: true,
-            });
+            // Don't send Error event - the failure will be emitted as an AssistantMessage
+            // with success=false by the caller (control.rs), avoiding duplicate messages.
             AgentResult::failure(format!("Unsupported backend: {}", backend_id), 0)
                 .with_terminal_reason(TerminalReason::LlmError)
         }
@@ -660,11 +657,8 @@ pub async fn run_claudecode_turn(
         Err(e) => {
             let err_msg = format!("Failed to start Claude CLI: {}", e);
             tracing::error!("{}", err_msg);
-            let _ = events_tx.send(AgentEvent::Error {
-                message: err_msg.clone(),
-                mission_id: Some(mission_id),
-                resumable: true,
-            });
+            // Don't send Error event - the failure will be emitted as an AssistantMessage
+            // with success=false by the caller (control.rs), avoiding duplicate messages.
             return AgentResult::failure(err_msg, 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
@@ -826,11 +820,10 @@ pub async fn run_claudecode_turn(
                                 if res.is_error || res.subtype == "error" {
                                     had_error = true;
                                     let err_msg = res.result.unwrap_or_else(|| "Unknown error".to_string());
-                                    let _ = events_tx.send(AgentEvent::Error {
-                                        message: err_msg.clone(),
-                                        mission_id: Some(mission_id),
-                                        resumable: true,
-                                    });
+                                    // Don't send an Error event here - let the failure propagate
+                                    // through the AgentResult. control.rs will emit an AssistantMessage
+                                    // with success=false which the UI displays as a failure message.
+                                    // Sending Error here would cause duplicate messages.
                                     final_result = err_msg;
                                 } else if let Some(result) = res.result {
                                     final_result = result;

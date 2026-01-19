@@ -332,6 +332,10 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value;
+    const currentValue = lockedAgent ? displayValue : value;
+
+    // Skip if no actual change (prevents infinite render loops)
+    if (newValue === currentValue) return;
 
     // If user types space after @agent pattern, lock it as badge
     if (!lockedAgent) {

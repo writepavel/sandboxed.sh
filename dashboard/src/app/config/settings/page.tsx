@@ -346,6 +346,7 @@ export default function SettingsPage() {
   };
 
   const visibleAgents = allAgents.filter((a) => !openAgentConfig.hidden_agents.includes(a));
+  const visibleClaudeCodeAgents = allClaudeCodeAgents.filter((a) => !claudeCodeConfig.hidden_agents.includes(a));
 
   if (loading) {
     return (
@@ -604,12 +605,12 @@ export default function SettingsPage() {
           <ConfigCodeEditor
             value={settings}
             onChange={setSettings}
-            language="json"
             placeholder='{\n  "agents": {\n    "Sisyphus": {\n      "model": "anthropic/claude-opus-4-5"\n    }\n  }\n}'
             disabled={saving}
             className="h-full"
             minHeight={400}
             padding={16}
+            language="json"
           />
         </div>
       </div>
@@ -799,8 +800,7 @@ export default function SettingsPage() {
           <div className="space-y-2">
             <h3 className="text-sm font-medium text-white/80">Default Agent</h3>
             <p className="text-xs text-white/50">Pre-selected agent when creating a new Claude Code mission.</p>
-            <input
-              type="text"
+            <select
               value={claudeCodeConfig.default_agent || ''}
               onChange={(e) =>
                 setClaudeCodeConfig((prev) => ({
@@ -808,9 +808,15 @@ export default function SettingsPage() {
                   default_agent: e.target.value || null,
                 }))
               }
-              placeholder="e.g. code-reviewer"
-              className="w-full max-w-md px-3 py-2 text-sm text-white bg-white/[0.04] border border-white/[0.08] rounded-lg placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
-            />
+              className="w-full max-w-xs px-3 py-2 text-sm text-white bg-white/[0.04] border border-white/[0.08] rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
+            >
+              <option value="">Default (Claude Code default)</option>
+              {visibleClaudeCodeAgents.map((agent) => (
+                <option key={agent} value={agent}>
+                  {agent}
+                </option>
+              ))}
+            </select>
           </div>
 
           {/* Agent Visibility */}

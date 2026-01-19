@@ -1,14 +1,15 @@
 'use client';
 
-import Editor from 'react-simple-code-editor';
-import { highlight, languages } from 'prismjs';
-import 'prismjs/components/prism-bash';
-import 'prismjs/components/prism-markdown';
-import 'prismjs/components/prism-yaml';
-import 'prismjs/components/prism-json';
+import dynamic from 'next/dynamic';
 import { cn } from '@/lib/utils';
 
-type SupportedLanguage = 'markdown' | 'bash' | 'text' | 'json';
+// Dynamic import to avoid SSR issues with react-simple-code-editor
+const Editor = dynamic(() => import('react-simple-code-editor').then(mod => mod.default), {
+  ssr: false,
+  loading: () => <div className="animate-pulse bg-white/5 rounded h-32" />,
+});
+
+type Language = 'json' | 'markdown' | 'bash' | 'plain';
 
 interface ConfigCodeEditorProps {
   value: string;
@@ -18,57 +19,151 @@ interface ConfigCodeEditorProps {
   className?: string;
   editorClassName?: string;
   minHeight?: number | string;
-  language?: SupportedLanguage;
   padding?: number;
   /** Enable highlighting of <encrypted>...</encrypted> tags */
   highlightEncrypted?: boolean;
-  /** Whether the editor should scroll internally. Set to false when parent handles scrolling. */
-  scrollable?: boolean;
+  /** Language for syntax highlighting */
+  language?: Language;
 }
 
-const languageMap: Record<SupportedLanguage, Prism.Grammar | undefined> = {
-  markdown: languages.markdown,
-  bash: languages.bash,
-  text: undefined,
-  json: languages.json,
-};
-
-const escapeHtml = (code: string) =>
-  code
+// Escape HTML special characters
+const escapeHtml = (str: string): string =>
+  str
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 
-/**
- * Encrypted tag highlighting using marker-based pre/post processing.
- * This approach handles PrismJS wrapping content in span tags.
- */
-const ENCRYPTED_TAG_RAW = /<encrypted(?:\s+v="\d+")?>(.*?)<\/encrypted>/g;
+// Simple JSON syntax highlighting
+function highlightJson(code: string): string {
+  let html = escapeHtml(code);
 
-// Unique markers that won't appear in normal content
-const MARKER_OPEN = '\u200B\u200BENCOPEN\u200B\u200B';
-const MARKER_CLOSE = '\u200B\u200BENCCLOSE\u200B\u200B';
-const MARKER_VALUE_START = '\u200B\u200BENCVAL\u200B\u200B';
-const MARKER_VALUE_END = '\u200B\u200BENCVALEND\u200B\u200B';
-
-/** Pre-process code to replace encrypted tags with markers before PrismJS */
-const preprocessEncryptedTags = (code: string): string => {
-  return code.replace(
-    ENCRYPTED_TAG_RAW,
-    `${MARKER_OPEN}${MARKER_VALUE_START}$1${MARKER_VALUE_END}${MARKER_CLOSE}`
+  // Strings (keys and values)
+  html = html.replace(
+    /(&quot;)((?:[^&]|&(?!quot;))*)(&quot;)/g,
+    (match, open, content, close) => {
+      return `<span class="token string">${open}${content}${close}</span>`;
+    }
   );
-};
 
-/** Post-process highlighted HTML to replace markers with styled content */
-const postprocessEncryptedTags = (html: string): string => {
-  // The markers get HTML-escaped by PrismJS, so we need to match the escaped versions
-  // Zero-width spaces are not escaped, so markers remain intact
-  return html
-    .replace(new RegExp(MARKER_OPEN, 'g'), '<span class="encrypted-tag" style="color: #fbbf24;">&lt;encrypted&gt;</span>')
-    .replace(new RegExp(MARKER_VALUE_START, 'g'), '<span class="encrypted-value" style="color: #f59e0b; background: rgba(251, 191, 36, 0.1); padding: 0 2px; border-radius: 2px;">')
-    .replace(new RegExp(MARKER_VALUE_END, 'g'), '</span>')
-    .replace(new RegExp(MARKER_CLOSE, 'g'), '<span class="encrypted-tag" style="color: #fbbf24;">&lt;/encrypted&gt;</span>');
-};
+  // Numbers
+  html = html.replace(
+    /\b(-?\d+\.?\d*)\b/g,
+    '<span class="token number">$1</span>'
+  );
+
+  // Booleans and null
+  html = html.replace(
+    /\b(true|false|null)\b/g,
+    '<span class="token boolean">$1</span>'
+  );
+
+  // Punctuation (braces, brackets, colons, commas)
+  html = html.replace(
+    /([{}\[\]:,])/g,
+    '<span class="token punctuation">$1</span>'
+  );
+
+  return html;
+}
+
+// Simple Markdown syntax highlighting
+function highlightMarkdown(code: string): string {
+  let html = escapeHtml(code);
+
+  // Code blocks (``` ... ```) - must be done first
+  html = html.replace(
+    /^(```)(\w*)([\s\S]*?)(```)$/gm,
+    '<span class="token comment">$1$2$3$4</span>'
+  );
+
+  // Inline code (`...`)
+  html = html.replace(
+    /(`[^`\n]+`)/g,
+    '<span class="token string">$1</span>'
+  );
+
+  // Headers (# ## ### etc)
+  html = html.replace(
+    /^(#{1,6}\s.*)$/gm,
+    '<span class="token keyword">$1</span>'
+  );
+
+  // Bold (**text** or __text__)
+  html = html.replace(
+    /(\*\*|__)([^*_]+)(\*\*|__)/g,
+    '<span class="token important">$1$2$3</span>'
+  );
+
+  // Links [text](url)
+  html = html.replace(
+    /(\[)([^\]]+)(\]\()([^)]+)(\))/g,
+    '<span class="token punctuation">$1</span><span class="token string">$2</span><span class="token punctuation">$3</span><span class="token url">$4</span><span class="token punctuation">$5</span>'
+  );
+
+  // List items (- or * or numbers)
+  html = html.replace(
+    /^(\s*)([-*]|\d+\.)\s/gm,
+    '$1<span class="token punctuation">$2</span> '
+  );
+
+  // YAML frontmatter delimiter
+  html = html.replace(
+    /^(---)\s*$/gm,
+    '<span class="token comment">$1</span>'
+  );
+
+  // YAML-style keys in frontmatter (key: value)
+  html = html.replace(
+    /^(\s*)(\w+)(:)/gm,
+    '$1<span class="token property">$2</span><span class="token punctuation">$3</span>'
+  );
+
+  return html;
+}
+
+// Simple Bash syntax highlighting
+function highlightBash(code: string): string {
+  let html = escapeHtml(code);
+
+  // Comments
+  html = html.replace(
+    /^(\s*)(#.*)$/gm,
+    '$1<span class="token comment">$2</span>'
+  );
+
+  // Strings
+  html = html.replace(
+    /(&quot;[^&]*(?:&(?!quot;)[^&]*)*&quot;)/g,
+    '<span class="token string">$1</span>'
+  );
+  html = html.replace(
+    /('[^']*')/g,
+    '<span class="token string">$1</span>'
+  );
+
+  // Variables
+  html = html.replace(
+    /(\$\w+|\$\{[^}]+\})/g,
+    '<span class="token variable">$1</span>'
+  );
+
+  // Keywords
+  html = html.replace(
+    /\b(if|then|else|elif|fi|for|while|do|done|case|esac|function|return|exit|export|source|alias)\b/g,
+    '<span class="token keyword">$1</span>'
+  );
+
+  return html;
+}
+
+// Highlight encrypted tags
+function highlightEncryptedTags(html: string): string {
+  return html.replace(
+    /&lt;encrypted(?:\s+v=&quot;\d+&quot;)?&gt;(.*?)&lt;\/encrypted&gt;/g,
+    '<span class="token-encrypted-tag">&lt;encrypted&gt;</span><span class="token-encrypted-value">$1</span><span class="token-encrypted-tag">&lt;/encrypted&gt;</span>'
+  );
+}
 
 export function ConfigCodeEditor({
   value,
@@ -78,40 +173,52 @@ export function ConfigCodeEditor({
   className,
   editorClassName,
   minHeight = '100%',
-  language = 'markdown',
   padding = 12,
   highlightEncrypted = false,
-  scrollable = true,
+  language = 'plain',
 }: ConfigCodeEditorProps) {
-  const grammar = languageMap[language];
-  const highlightCode = (code: string) => {
-    // Pre-process to replace encrypted tags with markers
-    let processedCode = highlightEncrypted ? preprocessEncryptedTags(code) : code;
-
+  const highlightCode = (code: string): string => {
     let html: string;
-    if (!grammar) {
-      html = escapeHtml(processedCode);
-    } else {
-      html = highlight(processedCode, grammar, language);
+
+    switch (language) {
+      case 'json':
+        html = highlightJson(code);
+        break;
+      case 'markdown':
+        html = highlightMarkdown(code);
+        break;
+      case 'bash':
+        html = highlightBash(code);
+        break;
+      default:
+        html = escapeHtml(code);
     }
 
-    // Post-process to replace markers with styled HTML
+    // Apply encrypted tag highlighting if enabled
     if (highlightEncrypted) {
-      html = postprocessEncryptedTags(html);
+      html = highlightEncryptedTags(html);
     }
+
     return html;
   };
+
+  // Check if value contains encrypted tags for visual indicator
+  const hasEncryptedContent = highlightEncrypted && /<encrypted(?:\s+v="\d+")?>/i.test(value);
 
   return (
     <div
       className={cn(
-        'rounded-lg bg-[#0d0d0e] border border-white/[0.06] focus-within:border-indigo-500/50 transition-colors',
-        scrollable ? 'overflow-auto' : 'overflow-hidden',
+        'rounded-lg bg-[#0d0d0e] border border-white/[0.06] focus-within:border-indigo-500/50 transition-colors overflow-auto relative',
         disabled && 'opacity-60',
         className
       )}
       aria-disabled={disabled}
     >
+      {hasEncryptedContent && (
+        <div className="absolute top-2 right-2 px-2 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30 pointer-events-none z-10">
+          Contains encrypted values
+        </div>
+      )}
       <Editor
         value={value}
         onValueChange={onChange}
@@ -119,19 +226,15 @@ export function ConfigCodeEditor({
         padding={padding}
         placeholder={placeholder}
         readOnly={disabled}
-        spellCheck={false}
         className={cn('config-code-editor', editorClassName)}
         textareaClassName="focus:outline-none"
-        preClassName="whitespace-pre-wrap break-words"
         style={{
           fontFamily:
             'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
           fontSize: 14,
-          lineHeight: 1.6,
+          lineHeight: 1.5,
           color: 'rgba(255, 255, 255, 0.9)',
           minHeight,
-          wordBreak: 'break-word',
-          overflowWrap: 'break-word',
         }}
       />
     </div>

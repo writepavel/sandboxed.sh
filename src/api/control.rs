@@ -3706,11 +3706,8 @@ async fn run_single_control_turn(
             let mid = match mission_id {
                 Some(id) => id,
                 None => {
-                    let _ = events_tx.send(AgentEvent::Error {
-                        message: "Claude Code backend requires a mission ID".to_string(),
-                        mission_id: None,
-                        resumable: false,
-                    });
+                    // Don't send Error event - the failure will be emitted as an AssistantMessage
+                    // with success=false after this function returns, avoiding duplicate messages.
                     return crate::agents::AgentResult::failure(
                         "Claude Code backend requires a mission ID".to_string(),
                         0,
@@ -3732,11 +3729,8 @@ async fn run_single_control_turn(
             .await
         }
         Some(backend) if backend != "opencode" => {
-            let _ = events_tx.send(AgentEvent::Error {
-                message: format!("Unsupported backend: {}", backend),
-                mission_id,
-                resumable: mission_id.is_some(),
-            });
+            // Don't send Error event - the failure will be emitted as an AssistantMessage
+            // with success=false after this function returns, avoiding duplicate messages.
             crate::agents::AgentResult::failure(format!("Unsupported backend: {}", backend), 0)
                 .with_terminal_reason(TerminalReason::LlmError)
         }

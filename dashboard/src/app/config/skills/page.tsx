@@ -1051,23 +1051,30 @@ Describe what this skill does.
                 </button>
               </div>
             ) : (
-              skills.map((skill) => (
-                <button
-                  key={skill.name}
-                  onClick={() => loadSkill(skill.name)}
-                  className={cn(
-                    'w-full text-left p-2.5 rounded-lg transition-colors mb-1',
-                    selectedSkill?.name === skill.name
-                      ? 'bg-white/[0.08] text-white'
-                      : 'text-white/60 hover:bg-white/[0.04] hover:text-white'
-                  )}
-                >
-                  <p className="text-sm font-medium truncate">{skill.name}</p>
-                  {skill.description && (
-                    <p className="text-xs text-white/40 truncate">{skill.description}</p>
-                  )}
-                </button>
-              ))
+              skills.map((skill) => {
+                // Use frontmatter description for selected skill as fallback
+                // (backend YAML parser may fail on special chars, but frontend parser succeeds)
+                const description = selectedSkill?.name === skill.name
+                  ? (skill.description || frontmatter.description)
+                  : skill.description;
+                return (
+                  <button
+                    key={skill.name}
+                    onClick={() => loadSkill(skill.name)}
+                    className={cn(
+                      'w-full text-left p-2.5 rounded-lg transition-colors mb-1',
+                      selectedSkill?.name === skill.name
+                        ? 'bg-white/[0.08] text-white'
+                        : 'text-white/60 hover:bg-white/[0.04] hover:text-white'
+                    )}
+                  >
+                    <p className="text-sm font-medium truncate">{skill.name}</p>
+                    {description && (
+                      <p className="text-xs text-white/40 truncate">{description}</p>
+                    )}
+                  </button>
+                );
+              })
             )}
           </div>
         </div>
@@ -1173,20 +1180,19 @@ Describe what this skill does.
                         value={bodyContent}
                         onChange={handleBodyChange}
                         disabled={saving}
-                        scrollable={false}
-                        language={
-                          selectedFile === 'SKILL.md' ||
-                          selectedFile?.toLowerCase().endsWith('.md') ||
-                          selectedFile?.toLowerCase().endsWith('.mdx') ||
-                          selectedFile?.toLowerCase().endsWith('.markdown')
-                            ? 'markdown'
-                            : 'text'
-                        }
                         highlightEncrypted={
                           selectedFile === 'SKILL.md' ||
                           selectedFile?.toLowerCase().endsWith('.md') ||
                           selectedFile?.toLowerCase().endsWith('.mdx') ||
                           selectedFile?.toLowerCase().endsWith('.markdown')
+                        }
+                        language={
+                          selectedFile?.toLowerCase().endsWith('.json')
+                            ? 'json'
+                            : selectedFile?.toLowerCase().endsWith('.sh') ||
+                                selectedFile?.toLowerCase().endsWith('.bash')
+                              ? 'bash'
+                              : 'markdown'
                         }
                       />
                     </div>

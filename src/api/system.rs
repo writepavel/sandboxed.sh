@@ -206,11 +206,17 @@ async fn get_claude_code_info() -> ComponentInfo {
     match Command::new("claude").arg("--version").output().await {
         Ok(output) if output.status.success() => {
             let version_str = String::from_utf8_lossy(&output.stdout);
-            // Parse version from output like "claude 1.0.3"
-            let version = version_str
-                .lines()
-                .next()
-                .map(|l| l.trim().replace("claude ", "").replace("Claude ", ""));
+            // Parse version from output like "claude 2.1.12 (Code)"
+            // We need to extract just the version number, stripping any suffix like "(Code)"
+            let version = version_str.lines().next().map(|l| {
+                let trimmed = l.trim().replace("claude ", "").replace("Claude ", "");
+                // Take only the first whitespace-separated token (the version number)
+                trimmed
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&trimmed)
+                    .to_string()
+            });
 
             let update_available = check_claude_code_update(version.as_deref()).await;
             let status = if update_available.is_some() {

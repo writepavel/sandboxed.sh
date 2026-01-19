@@ -1,12 +1,13 @@
 import { Suspense } from 'react';
+import { Loader } from 'lucide-react';
 import { ConsoleWrapper } from './console-wrapper';
 
 export default function ConsolePage() {
   return (
     <Suspense
       fallback={
-        <div className="panel rounded-lg border border-[var(--border)] bg-[var(--background-secondary)]/70 p-4 backdrop-blur-xl">
-          <div className="text-sm text-[var(--foreground-muted)]">Loading console…</div>
+        <div className="flex items-center justify-center min-h-[calc(100vh-4rem)]">
+          <Loader className="h-8 w-8 animate-spin text-white/40" />
         </div>
       }
     >

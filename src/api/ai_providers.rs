@@ -151,15 +151,12 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
 /// - No credentials are available (neither API key nor OAuth)
 /// - Any error occurs reading the config
 pub fn get_anthropic_api_key_for_claudecode(working_dir: &Path) -> Option<String> {
-    // Read the OpenCode config to check use_for_backends
-    let config_path = get_opencode_config_path(working_dir);
-    let opencode_config = read_opencode_config(&config_path).ok()?;
+    // Read the provider backends state to check use_for_backends
+    let backends_state = read_provider_backends_state(working_dir);
 
     // Check if Anthropic provider has claudecode in use_for_backends
-    let anthropic_config = get_provider_config_entry(&opencode_config, ProviderType::Anthropic);
-    let use_for_claudecode = anthropic_config
-        .as_ref()
-        .and_then(|c| c.use_for_backends.as_ref())
+    let use_for_claudecode = backends_state
+        .get(ProviderType::Anthropic.id())
         .map(|backends| backends.iter().any(|b| b == "claudecode"))
         .unwrap_or(false);
 
@@ -251,15 +248,9 @@ fn get_anthropic_key_from_ai_providers(working_dir: &Path) -> Option<String> {
 
 /// Check if the Anthropic provider is configured for the Claude Code backend.
 pub fn is_anthropic_configured_for_claudecode(working_dir: &Path) -> bool {
-    let config_path = get_opencode_config_path(working_dir);
-    let Ok(opencode_config) = read_opencode_config(&config_path) else {
-        return false;
-    };
-
-    let anthropic_config = get_provider_config_entry(&opencode_config, ProviderType::Anthropic);
-    anthropic_config
-        .as_ref()
-        .and_then(|c| c.use_for_backends.as_ref())
+    let backends_state = read_provider_backends_state(working_dir);
+    backends_state
+        .get(ProviderType::Anthropic.id())
         .map(|backends| backends.iter().any(|b| b == "claudecode"))
         .unwrap_or(false)
 }
@@ -346,8 +337,6 @@ struct ProviderConfigEntry {
     name: Option<String>,
     base_url: Option<String>,
     enabled: Option<bool>,
-    /// Which backends this provider is used for (e.g., ["opencode", "claudecode"])
-    use_for_backends: Option<Vec<String>>,
 }
 
 fn build_provider_response(
@@ -355,6 +344,7 @@ fn build_provider_response(
     config: Option<ProviderConfigEntry>,
     auth: Option<AuthKind>,
     default_provider: Option<ProviderType>,
+    backends: Option<Vec<String>>,
 ) -> ProviderResponse {
     let now = chrono::Utc::now();
     let name = config
@@ -380,10 +370,7 @@ fn build_provider_response(
     // For Anthropic, use configured backends or default to ["opencode"]
     // For other providers, always use ["opencode"]
     let use_for_backends = if provider_type == ProviderType::Anthropic {
-        config
-            .as_ref()
-            .and_then(|c| c.use_for_backends.clone())
-            .unwrap_or_else(|| vec!["opencode".to_string()])
+        backends.unwrap_or_else(|| vec!["opencode".to_string()])
     } else {
         vec!["opencode".to_string()]
     };
@@ -841,19 +828,12 @@ fn get_provider_config_entry(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let enabled = entry.get("enabled").and_then(|v| v.as_bool());
-    let use_for_backends = entry
-        .get("useForBackends")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        });
+    // Note: use_for_backends is now stored separately in .openagent/provider_backends.json
+    // and should be read using read_provider_backends_state() instead
     Some(ProviderConfigEntry {
         name,
         base_url,
         enabled,
-        use_for_backends,
     })
 }
 
@@ -905,17 +885,11 @@ fn set_provider_config_entry(
     let _ = enabled;
     entry_obj.remove("enabled");
 
-    // Store which backends this provider is used for (only for Anthropic)
-    if let Some(backends) = use_for_backends {
-        let backends_json: Vec<serde_json::Value> = backends
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect();
-        entry_obj.insert(
-            "useForBackends".to_string(),
-            serde_json::Value::Array(backends_json),
-        );
-    }
+    // OpenCode's config schema doesn't accept "useForBackends" under provider entries.
+    // This field is now stored separately in .openagent/provider_backends.json.
+    // Remove any existing useForBackends for migration/cleanup.
+    let _ = use_for_backends;
+    entry_obj.remove("useForBackends");
 }
 
 fn remove_provider_config_entry(config: &mut serde_json::Value, provider: ProviderType) {
@@ -971,6 +945,78 @@ fn clear_default_provider_state(working_dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to remove default provider file: {}", e))?;
     }
     Ok(())
+}
+
+/// Path to the provider backends state file.
+/// This stores which backends each provider is used for (e.g., opencode, claudecode).
+/// This is stored separately from the OpenCode config because OpenCode doesn't recognize this field.
+fn provider_backends_state_path(working_dir: &Path) -> PathBuf {
+    working_dir.join(".openagent").join("provider_backends.json")
+}
+
+/// Read provider backends state from the separate state file.
+/// Returns a map of provider_id -> backends (e.g., "anthropic" -> ["opencode", "claudecode"])
+fn read_provider_backends_state(working_dir: &Path) -> HashMap<String, Vec<String>> {
+    let path = provider_backends_state_path(working_dir);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return HashMap::new(),
+    };
+    obj.iter()
+        .filter_map(|(k, v)| {
+            v.as_array().map(|arr| {
+                let backends: Vec<String> = arr
+                    .iter()
+                    .filter_map(|b| b.as_str().map(|s| s.to_string()))
+                    .collect();
+                (k.clone(), backends)
+            })
+        })
+        .collect()
+}
+
+/// Write provider backends state to the separate state file.
+fn write_provider_backends_state(
+    working_dir: &Path,
+    backends: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let path = provider_backends_state_path(working_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create provider backends directory: {}", e))?;
+    }
+    let payload = serde_json::json!(backends);
+    let contents = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("Failed to serialize provider backends: {}", e))?;
+    std::fs::write(path, contents)
+        .map_err(|e| format!("Failed to write provider backends: {}", e))?;
+    Ok(())
+}
+
+/// Update backends for a specific provider in the state file.
+fn update_provider_backends(
+    working_dir: &Path,
+    provider_id: &str,
+    backends: Vec<String>,
+) -> Result<(), String> {
+    let mut state = read_provider_backends_state(working_dir);
+    state.insert(provider_id.to_string(), backends);
+    write_provider_backends_state(working_dir, &state)
+}
+
+/// Remove a provider from the backends state file.
+fn remove_provider_backends(working_dir: &Path, provider_id: &str) -> Result<(), String> {
+    let mut state = read_provider_backends_state(working_dir);
+    state.remove(provider_id);
+    write_provider_backends_state(working_dir, &state)
 }
 
 /// Read OpenCode's current auth.json contents.
@@ -1200,6 +1246,7 @@ async fn list_providers(
     let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
+    let backends_state = read_provider_backends_state(&state.config.working_dir);
 
     let mut provider_ids: BTreeSet<String> = BTreeSet::new();
     for provider in auth_map.keys() {
@@ -1220,11 +1267,13 @@ async fn list_providers(
             let provider_type = ProviderType::from_id(&provider_id)?;
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
             let auth_kind = auth_map.get(&provider_type).copied();
+            let backends = backends_state.get(provider_type.id()).cloned();
             Some(build_provider_response(
                 provider_type,
                 config_entry,
                 auth_kind,
                 default_provider,
+                backends,
             ))
         })
         .collect();
@@ -1252,16 +1301,12 @@ async fn get_provider_for_backend(
         }));
     }
 
-    // Read the OpenCode config to find provider with claudecode in use_for_backends
-    let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config =
-        read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Read the provider backends state to find provider with claudecode in use_for_backends
+    let backends_state = read_provider_backends_state(&state.config.working_dir);
 
     // Check if Anthropic provider has claudecode in use_for_backends
-    let anthropic_config = get_provider_config_entry(&opencode_config, ProviderType::Anthropic);
-    let use_for_claudecode = anthropic_config
-        .as_ref()
-        .and_then(|c| c.use_for_backends.as_ref())
+    let use_for_claudecode = backends_state
+        .get(ProviderType::Anthropic.id())
         .map(|backends| backends.iter().any(|b| b == "claudecode"))
         .unwrap_or(false);
 
@@ -1345,10 +1390,18 @@ async fn get_provider_for_backend(
         (None, None, false)
     };
 
+    // Get provider name from OpenCode config if available
+    let config_path = get_opencode_config_path(&state.config.working_dir);
+    let provider_name = read_opencode_config(&config_path)
+        .ok()
+        .and_then(|config| get_provider_config_entry(&config, ProviderType::Anthropic))
+        .and_then(|entry| entry.name)
+        .unwrap_or_else(|| "Anthropic".to_string());
+
     Ok(Json(BackendProviderResponse {
         configured: true,
         provider_type: Some("anthropic".to_string()),
-        provider_name: anthropic_config.and_then(|c| c.name).or_else(|| Some("Anthropic".to_string())),
+        provider_name: Some(provider_name),
         api_key,
         oauth,
         has_credentials,
@@ -1390,11 +1443,22 @@ async fn create_provider(
         Some(req.name),
         Some(req.base_url),
         Some(req.enabled),
-        use_for_backends,
+        use_for_backends.clone(),
     );
 
     write_opencode_config(&config_path, &opencode_config)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Save backends to separate state file (not in opencode.json)
+    if let Some(ref backends) = use_for_backends {
+        if let Err(e) = update_provider_backends(
+            &state.config.working_dir,
+            provider_type.id(),
+            backends.clone(),
+        ) {
+            tracing::error!("Failed to save provider backends: {}", e);
+        }
+    }
 
     if let Some(ref api_key) = req.api_key {
         if let Err(e) = sync_api_key_to_opencode_auth(provider_type, api_key) {
@@ -1410,8 +1474,13 @@ async fn create_provider(
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
-    let response =
-        build_provider_response(provider_type, config_entry, auth_kind, default_provider);
+    let response = build_provider_response(
+        provider_type,
+        config_entry,
+        auth_kind,
+        default_provider,
+        use_for_backends,
+    );
 
     tracing::info!(
         "Created AI provider config for: {} ({})",
@@ -1435,10 +1504,17 @@ async fn get_provider(
     let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
+    let backends_state = read_provider_backends_state(&state.config.working_dir);
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
     let auth_kind = auth_map.get(&provider_type).copied();
-    let response =
-        build_provider_response(provider_type, config_entry, auth_kind, default_provider);
+    let backends = backends_state.get(provider_type.id()).cloned();
+    let response = build_provider_response(
+        provider_type,
+        config_entry,
+        auth_kind,
+        default_provider,
+        backends,
+    );
     Ok(Json(response))
 }
 
@@ -1475,11 +1551,20 @@ async fn update_provider(
         req.name,
         req.base_url,
         req.enabled,
-        req.use_for_backends,
+        req.use_for_backends.clone(),
     );
 
     write_opencode_config(&config_path, &opencode_config)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Save backends to separate state file if provided
+    if let Some(ref backends) = req.use_for_backends {
+        if let Err(e) =
+            update_provider_backends(&state.config.working_dir, provider_type.id(), backends.clone())
+        {
+            tracing::error!("Failed to save provider backends: {}", e);
+        }
+    }
 
     if let Some(api_key_update) = req.api_key {
         match api_key_update {
@@ -1499,10 +1584,17 @@ async fn update_provider(
     let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
+    let backends_state = read_provider_backends_state(&state.config.working_dir);
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
     let auth_kind = auth_map.get(&provider_type).copied();
-    let response =
-        build_provider_response(provider_type, config_entry, auth_kind, default_provider);
+    let backends = backends_state.get(provider_type.id()).cloned();
+    let response = build_provider_response(
+        provider_type,
+        config_entry,
+        auth_kind,
+        default_provider,
+        backends,
+    );
 
     tracing::info!("Updated AI provider config: {} ({})", response.name, id);
 
@@ -1532,6 +1624,11 @@ async fn delete_provider(
         if let Err(e) = clear_default_provider_state(&state.config.working_dir) {
             tracing::error!("Failed to clear default provider state: {}", e);
         }
+    }
+
+    // Remove provider backends state
+    if let Err(e) = remove_provider_backends(&state.config.working_dir, provider_type.id()) {
+        tracing::error!("Failed to remove provider backends state: {}", e);
     }
 
     Ok((
@@ -1604,11 +1701,18 @@ async fn set_default(
     let opencode_config =
         read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let backends_state = read_provider_backends_state(&state.config.working_dir);
     let default_provider = Some(provider_type);
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
     let auth_kind = auth_map.get(&provider_type).copied();
-    let response =
-        build_provider_response(provider_type, config_entry, auth_kind, default_provider);
+    let backends = backends_state.get(provider_type.id()).cloned();
+    let response = build_provider_response(
+        provider_type,
+        config_entry,
+        auth_kind,
+        default_provider,
+        backends,
+    );
 
     tracing::info!("Set default AI provider: {} ({})", response.name, id);
 
@@ -2022,7 +2126,7 @@ async fn oauth_callback_inner(
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
                 // Update use_for_backends if specified
-                if req.use_for_backends.is_some() {
+                if let Some(ref backends) = req.use_for_backends {
                     set_provider_config_entry(
                         &mut opencode_config,
                         provider_type,
@@ -2034,15 +2138,26 @@ async fn oauth_callback_inner(
                     if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
                         tracing::error!("Failed to write OpenCode config: {}", e);
                     }
+                    // Save backends to separate state file
+                    if let Err(e) = update_provider_backends(
+                        &state.config.working_dir,
+                        provider_type.id(),
+                        backends.clone(),
+                    ) {
+                        tracing::error!("Failed to save provider backends: {}", e);
+                    }
                 }
 
                 let default_provider = get_default_provider(&opencode_config);
+                let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+                let backends = backends_state.get(provider_type.id()).cloned();
                 let response = build_provider_response(
                     provider_type,
                     config_entry,
                     Some(AuthKind::ApiKey),
                     default_provider,
+                    backends,
                 );
 
                 tracing::info!("Created API key for provider: {} ({})", response.name, id);
@@ -2086,7 +2201,7 @@ async fn oauth_callback_inner(
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
                 // Update use_for_backends if specified
-                if req.use_for_backends.is_some() {
+                if let Some(ref backends) = req.use_for_backends {
                     set_provider_config_entry(
                         &mut opencode_config,
                         provider_type,
@@ -2098,15 +2213,26 @@ async fn oauth_callback_inner(
                     if let Err(e) = write_opencode_config(&config_path, &opencode_config) {
                         tracing::error!("Failed to write OpenCode config: {}", e);
                     }
+                    // Save backends to separate state file
+                    if let Err(e) = update_provider_backends(
+                        &state.config.working_dir,
+                        provider_type.id(),
+                        backends.clone(),
+                    ) {
+                        tracing::error!("Failed to save provider backends: {}", e);
+                    }
                 }
 
                 let default_provider = get_default_provider(&opencode_config);
+                let backends_state = read_provider_backends_state(&state.config.working_dir);
                 let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+                let backends = backends_state.get(provider_type.id()).cloned();
                 let response = build_provider_response(
                     provider_type,
                     config_entry,
                     Some(AuthKind::OAuth),
                     default_provider,
+                    backends,
                 );
 
                 Ok(Json(response))
@@ -2194,13 +2320,16 @@ async fn oauth_callback_inner(
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let opencode_config = read_opencode_config(&config_path)
                 .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+            let backends = backends_state.get(provider_type.id()).cloned();
             let response = build_provider_response(
                 provider_type,
                 config_entry,
                 Some(AuthKind::OAuth),
                 default_provider,
+                backends,
             );
 
             Ok(Json(response))
@@ -2294,13 +2423,16 @@ async fn oauth_callback_inner(
             let config_path = get_opencode_config_path(&state.config.working_dir);
             let opencode_config = read_opencode_config(&config_path)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+            let backends = backends_state.get(provider_type.id()).cloned();
             let response = build_provider_response(
                 provider_type,
                 config_entry,
                 Some(AuthKind::OAuth),
                 default_provider,
+                backends,
             );
 
             tracing::info!("Google OAuth credentials saved for provider: {}", id);

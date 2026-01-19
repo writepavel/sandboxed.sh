@@ -577,12 +577,33 @@ select:focus-visible {
   caret-color: white;
 }
 
-.config-code-editor textarea {
+.config-code-editor::placeholder {
+  color: rgba(255, 255, 255, 0.25);
+}
+
+textarea.config-code-editor {
   caret-color: white !important;
 }
 
-.config-code-editor textarea::placeholder {
+textarea.config-code-editor::placeholder {
   color: rgba(255, 255, 255, 0.25);
+}
+
+/* Encrypted tag highlighting */
+.token-encrypted-tag {
+  color: #fbbf24;
+}
+
+.token-encrypted-value {
+  color: #f59e0b;
+  background: rgba(251, 191, 36, 0.1);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+/* URL token for markdown links */
+.token.url {
+  color: #4fc1ff;
 }
 
 /* Prism tokens */

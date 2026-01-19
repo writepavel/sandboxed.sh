@@ -354,9 +354,9 @@ Describe what this command does.
                             setCommandContent(value);
                             setCommandDirty(true);
                           }}
-                          language="markdown"
                           className="h-full"
                           disabled={commandSaving}
+                          language="markdown"
                         />
                       )}
                     </div>

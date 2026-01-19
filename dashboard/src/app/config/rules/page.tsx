@@ -374,9 +374,9 @@ Describe what this rule does.
                             setRuleContent(value);
                             setRuleDirty(true);
                           }}
-                          language="markdown"
                           className="h-full"
                           disabled={ruleSaving}
+                          language="markdown"
                           placeholder="---
 description: Rule description
 ---
