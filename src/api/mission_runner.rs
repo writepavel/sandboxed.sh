@@ -649,14 +649,16 @@ pub async fn run_claudecode_turn(
                 Err(e) => {
                     tracing::warn!("Failed to get Claude API key from secrets: {}", e);
                     // Fall back to environment variable
-                    std::env::var("ANTHROPIC_API_KEY")
+                    std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
                         .ok()
+                        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                         .map(classify_claudecode_secret)
                 }
             }
         } else {
-            std::env::var("ANTHROPIC_API_KEY")
+            std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
                 .ok()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
                 .map(classify_claudecode_secret)
         }
     };
@@ -790,12 +792,17 @@ pub async fn run_claudecode_turn(
     let mut text_buffer: HashMap<u32, String> = HashMap::new();
     let mut last_thinking_len: usize = 0; // Track last emitted length to avoid re-sending same content
 
+    let auth_missing = api_auth.is_none();
+    let auth_timeout = std::time::Duration::from_secs(45);
+
     // Create a buffered reader for stdout
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
 
     // Process events until completion or cancellation
     loop {
+        let mut timeout = tokio::time::sleep(auth_timeout);
+        tokio::pin!(timeout);
         tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
@@ -803,6 +810,13 @@ pub async fn run_claudecode_turn(
                 let _ = child.kill().await;
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            _ = &mut timeout, if auth_missing => {
+                let err_msg = "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                let _ = child.kill().await;
+                return AgentResult::failure(err_msg.to_string(), 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
             }
             line_result = lines.next_line() => {
                 match line_result {

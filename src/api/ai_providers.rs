@@ -168,6 +168,14 @@ pub fn get_anthropic_auth_for_claudecode(working_dir: &Path) -> Option<ClaudeCod
         .unwrap_or(false);
 
     if !use_for_claudecode {
+        if let Some(auth) = get_anthropic_auth_from_opencode_auth()
+            .or_else(|| get_anthropic_auth_from_ai_providers(working_dir))
+        {
+            tracing::warn!(
+                "Anthropic credentials found but not marked for Claude Code; using them anyway"
+            );
+            return Some(auth);
+        }
         return None;
     }
 
