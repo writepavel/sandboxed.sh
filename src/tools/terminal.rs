@@ -226,10 +226,10 @@ fn validate_command(cmd: &str) -> Result<(), String> {
 
 fn container_root_from_env() -> Option<PathBuf> {
     let workspace_type = env::var("OPEN_AGENT_WORKSPACE_TYPE").ok()?;
-    if workspace_type != "chroot" && workspace_type != "nspawn" && workspace_type != "container" {
+    if workspace_type != "container" {
         return None;
     }
-    if let Ok(flag) = env::var("OPEN_AGENT_CHROOT_FALLBACK") {
+    if let Ok(flag) = env::var("OPEN_AGENT_CONTAINER_FALLBACK") {
         if matches!(flag.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on") {
             return None;
         }

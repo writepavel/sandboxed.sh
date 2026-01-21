@@ -1,4 +1,4 @@
-//! MCP Server for core host tools (filesystem + command execution).
+//! MCP Server for core host tools (filesystem + library updates).
 //!
 //! Exposes a minimal set of Open Agent tools to OpenCode via MCP.
 //! Communicates over stdio using JSON-RPC 2.0.
@@ -185,7 +185,7 @@ fn hydrate_workspace_env(override_path: Option<PathBuf>) -> PathBuf {
 
     if std::env::var("OPEN_AGENT_WORKSPACE_TYPE").is_err() {
         if let Some(root) = container_root_from_path(&workspace) {
-            std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", "chroot");
+            std::env::set_var("OPEN_AGENT_WORKSPACE_TYPE", "container");
             if std::env::var("OPEN_AGENT_WORKSPACE_ROOT").is_err() {
                 std::env::set_var(
                     "OPEN_AGENT_WORKSPACE_ROOT",
@@ -376,33 +376,6 @@ fn debug_log(tag: &str, payload: &Value) {
     }
 }
 
-struct BashTool {
-    delegate: tools::RunCommand,
-}
-
-#[async_trait]
-impl Tool for BashTool {
-    fn name(&self) -> &str {
-        "bash"
-    }
-
-    fn description(&self) -> &str {
-        "Execute a bash command. Runs in the active workspace or isolated environment."
-    }
-
-    fn parameters_schema(&self) -> Value {
-        self.delegate.parameters_schema()
-    }
-
-    async fn execute(&self, mut args: Value, working_dir: &Path) -> anyhow::Result<String> {
-        if let Some(obj) = args.as_object_mut() {
-            obj.entry("shell".to_string())
-                .or_insert_with(|| Value::String("/bin/bash".to_string()));
-        }
-        self.delegate.execute(args, working_dir).await
-    }
-}
-
 /// Tool for updating skill content in the library.
 ///
 /// Updates the skill file directly in the library directory and triggers
@@ -524,12 +497,6 @@ fn tool_set() -> HashMap<String, Arc<dyn Tool>> {
     tools.insert("list_directory".to_string(), Arc::new(tools::ListDirectory));
     tools.insert("search_files".to_string(), Arc::new(tools::SearchFiles));
     tools.insert("grep_search".to_string(), Arc::new(tools::GrepSearch));
-    tools.insert(
-        "bash".to_string(),
-        Arc::new(BashTool {
-            delegate: tools::RunCommand,
-        }),
-    );
     tools.insert("fetch_url".to_string(), Arc::new(tools::FetchUrl));
     tools.insert("update_skill".to_string(), Arc::new(UpdateSkillTool));
 

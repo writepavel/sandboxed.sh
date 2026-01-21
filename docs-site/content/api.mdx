@@ -167,8 +167,8 @@ POST /api/workspaces
 | Field | Required | Description |
 |-------|----------|-------------|
 | `name` | Yes | Human-readable name |
-| `workspace_type` | No | `host` or `chroot` (default: `host`) |
-| `template` | No | Template name (forces `chroot`) |
+| `workspace_type` | No | `host` or `container` (default: `host`) |
+| `template` | No | Template name (forces `container`) |
 | `distro` | No | `ubuntu-noble`, `ubuntu-jammy`, `debian-bookworm`, `arch-linux` |
 | `skills` | No | Library skill names |
 | `init_script` | No | Script to run on container build |
@@ -247,7 +247,7 @@ POST /api/workspaces/:id/rerun-init # Re-run init without rebuild
 {
   "id": "uuid",
   "name": "my-workspace",
-  "workspace_type": "chroot",
+  "workspace_type": "container",
   "path": "/path/to/workspace",
   "status": "ready",
   "error_message": null,

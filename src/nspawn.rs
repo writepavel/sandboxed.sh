@@ -74,11 +74,11 @@ pub fn nspawn_available() -> bool {
     command_on_path("systemd-nspawn")
 }
 
-/// Whether we should allow chroot workspaces to fall back to host execution.
+/// Whether we should allow container workspaces to fall back to host execution.
 /// Default: enabled on non-Linux hosts, disabled on Linux unless explicitly set.
-pub fn allow_chroot_fallback() -> bool {
+pub fn allow_container_fallback() -> bool {
     let default = !cfg!(target_os = "linux");
-    env_var_bool("OPEN_AGENT_ALLOW_CHROOT_FALLBACK", default)
+    env_var_bool("OPEN_AGENT_ALLOW_CONTAINER_FALLBACK", default)
 }
 
 /// Supported Linux distributions for container environments.

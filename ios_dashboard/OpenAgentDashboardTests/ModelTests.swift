@@ -17,7 +17,7 @@ final class ModelTests: XCTestCase {
         {
             "id": "workspace-id",
             "name": "test-workspace",
-            "workspace_type": "chroot",
+            "workspace_type": "container",
             "path": "/var/lib/workspace",
             "status": "ready",
             "error_message": null,
@@ -30,14 +30,14 @@ final class ModelTests: XCTestCase {
 
         XCTAssertEqual(workspace.id, "workspace-id")
         XCTAssertEqual(workspace.name, "test-workspace")
-        XCTAssertEqual(workspace.workspaceType, .chroot)
+        XCTAssertEqual(workspace.workspaceType, .container)
         XCTAssertEqual(workspace.status, .ready)
         XCTAssertNil(workspace.errorMessage)
     }
 
     func testWorkspaceTypeDisplayName() {
         XCTAssertEqual(WorkspaceType.host.displayName, "Host")
-        XCTAssertEqual(WorkspaceType.chroot.displayName, "Chroot")
+        XCTAssertEqual(WorkspaceType.container.displayName, "Container")
     }
 
     func testWorkspaceStatusProperties() {
@@ -51,7 +51,7 @@ final class ModelTests: XCTestCase {
         let defaultWorkspace = Workspace.defaultHost
         XCTAssertTrue(defaultWorkspace.isDefault)
 
-        let customWorkspace = Workspace.previewChroot
+        let customWorkspace = Workspace.previewContainer
         XCTAssertFalse(customWorkspace.isDefault)
     }
 

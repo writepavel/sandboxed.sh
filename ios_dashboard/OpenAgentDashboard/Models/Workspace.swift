@@ -10,19 +10,19 @@ import Foundation
 /// Type of workspace execution environment.
 enum WorkspaceType: String, Codable, CaseIterable {
     case host
-    case chroot
+    case container
 
     var displayName: String {
         switch self {
         case .host: return "Host"
-        case .chroot: return "Chroot"
+        case .container: return "Container"
         }
     }
 
     var icon: String {
         switch self {
         case .host: return "desktopcomputer"
-        case .chroot: return "cube.box"
+        case .container: return "cube.box"
         }
     }
 }
@@ -152,10 +152,10 @@ extension Workspace {
         plugins: []
     )
 
-    static let previewChroot = Workspace(
+    static let previewContainer = Workspace(
         id: "12345678-1234-1234-1234-123456789012",
         name: "project-sandbox",
-        workspaceType: .chroot,
+        workspaceType: .container,
         path: "/var/lib/openagent/containers/project-sandbox",
         status: .ready,
         errorMessage: nil,

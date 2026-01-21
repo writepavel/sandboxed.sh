@@ -1981,7 +1981,7 @@ export async function migrateLibrary(): Promise<MigrationReport> {
 
 // ==================== Workspaces ====================
 
-export type WorkspaceType = "host" | "chroot";
+export type WorkspaceType = "host" | "container";
 export type WorkspaceStatus = "pending" | "building" | "ready" | "error";
 
 export interface Workspace {
@@ -2075,24 +2075,24 @@ export async function deleteWorkspace(id: string): Promise<void> {
   if (!res.ok) throw new Error("Failed to delete workspace");
 }
 
-// Supported Linux distributions for chroot workspaces
-export type ChrootDistro =
+// Supported Linux distributions for container workspaces
+export type ContainerDistro =
   | "ubuntu-noble"
   | "ubuntu-jammy"
   | "debian-bookworm"
   | "arch-linux";
 
-export const CHROOT_DISTROS: { value: ChrootDistro; label: string }[] = [
+export const CONTAINER_DISTROS: { value: ContainerDistro; label: string }[] = [
   { value: "ubuntu-noble", label: "Ubuntu 24.04 LTS (Noble)" },
   { value: "ubuntu-jammy", label: "Ubuntu 22.04 LTS (Jammy)" },
   { value: "debian-bookworm", label: "Debian 12 (Bookworm)" },
   { value: "arch-linux", label: "Arch Linux (Base)" },
 ];
 
-// Build a chroot workspace
+// Build a container workspace
 export async function buildWorkspace(
   id: string,
-  distro?: ChrootDistro,
+  distro?: ContainerDistro,
   rebuild?: boolean
 ): Promise<Workspace> {
   const res = await apiFetch(`/api/workspaces/${id}/build`, {

@@ -68,7 +68,7 @@ test.describe('Workspaces Page', () => {
     const select = page.getByText('Type').locator('..').locator('select');
     await expect(select).toBeVisible();
 
-    // Should have Host and Chroot options
+    // Should have Host and Container options
     const options = await select.locator('option').allTextContents();
     expect(options.some(opt => opt.toLowerCase().includes('host'))).toBeTruthy();
     expect(options.some(opt => opt.toLowerCase().includes('isolated'))).toBeTruthy();

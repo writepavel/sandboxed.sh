@@ -601,7 +601,7 @@ fn get_claudecode_cli_path_from_config(_app_working_dir: &std::path::Path) -> Op
 /// Execute a turn using Claude Code CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
-/// For Chroot workspaces: spawns the CLI inside the container using systemd-nspawn.
+/// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
 pub async fn run_claudecode_turn(
     workspace: &Workspace,
     work_dir: &std::path::Path,
@@ -1063,7 +1063,7 @@ fn workspace_path_for_env(
     workspace: &Workspace,
     host_path: &std::path::Path,
 ) -> std::path::PathBuf {
-    if workspace.workspace_type == workspace::WorkspaceType::Chroot
+    if workspace.workspace_type == workspace::WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
         if let Ok(rel) = host_path.strip_prefix(&workspace.path) {
@@ -1114,7 +1114,7 @@ fn parse_opencode_session_token(value: &str) -> Option<String> {
 }
 
 fn prepend_opencode_bin_to_path(env: &mut HashMap<String, String>, workspace: &Workspace) {
-    let home = if workspace.workspace_type == WorkspaceType::Chroot
+    let home = if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
         "/root".to_string()
@@ -1934,7 +1934,7 @@ fn sync_opencode_agent_config(
 }
 
 fn workspace_abs_path(workspace: &Workspace, path: &std::path::Path) -> std::path::PathBuf {
-    if workspace.workspace_type == WorkspaceType::Chroot
+    if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
         if let Ok(relative) = path.strip_prefix(std::path::Path::new("/")) {
@@ -2019,7 +2019,7 @@ fn patch_oh_my_opencode_port_override(workspace: &Workspace) -> bool {
 }
 
 fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
-    if workspace.workspace_type == WorkspaceType::Chroot
+    if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
         let mut roots = Vec::new();
@@ -2129,7 +2129,7 @@ fn host_opencode_provider_auth_dir() -> Option<std::path::PathBuf> {
 }
 
 fn workspace_opencode_auth_path(workspace: &Workspace) -> Option<std::path::PathBuf> {
-    if workspace.workspace_type == WorkspaceType::Chroot
+    if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
         return Some(
@@ -2146,7 +2146,7 @@ fn workspace_opencode_auth_path(workspace: &Workspace) -> Option<std::path::Path
 }
 
 fn workspace_opencode_provider_auth_dir(workspace: &Workspace) -> Option<std::path::PathBuf> {
-    if workspace.workspace_type == WorkspaceType::Chroot
+    if workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(workspace)
     {
         return Some(workspace.path.join("root").join(".opencode").join("auth"));
@@ -2655,7 +2655,7 @@ async fn opencode_binary_available(
     if command_available(workspace_exec, cwd, "/usr/local/bin/opencode").await {
         return true;
     }
-    if workspace_exec.workspace.workspace_type == WorkspaceType::Chroot
+    if workspace_exec.workspace.workspace_type == WorkspaceType::Container
         && workspace::use_nspawn_for_workspace(&workspace_exec.workspace)
     {
         if command_available(workspace_exec, cwd, "/root/.opencode/bin/opencode").await {
@@ -2756,7 +2756,7 @@ async fn ensure_opencode_cli_available(
 /// Execute a turn using OpenCode CLI backend.
 ///
 /// For Host workspaces: spawns the CLI directly on the host.
-/// For Chroot workspaces: spawns the CLI inside the container using systemd-nspawn.
+/// For Container workspaces: spawns the CLI inside the container using systemd-nspawn.
 ///
 /// This uses the `oh-my-opencode run` CLI which creates an embedded OpenCode server,
 /// enabling per-workspace isolation without network issues.

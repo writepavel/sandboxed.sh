@@ -2,7 +2,7 @@
 
 Open Agent supports multiple execution backends ("harnesses") for running agent
 missions. The current architecture is **per-workspace execution**: OpenCode and
-Claude Code run inside the selected workspace (host, container, or remote).
+Claude Code run inside the selected workspace (host or container).
 
 This document explains the harness architecture, configuration, and how to add
 new backends.
@@ -30,8 +30,7 @@ missions. Open Agent currently supports:
 │                     Workspace Execution Layer                   │
 │                 (src/workspace_exec.rs)                         │
 │  - host: spawn process directly                                 │
-│  - chroot: systemd-nspawn                                        │
-│  - ssh: remote exec                                             │
+│  - container: systemd-nspawn                                    │
 └──────────────┬───────────────────────────────┬──────────────────┘
                │                               │
                ▼                               ▼
@@ -96,7 +95,7 @@ Claude Code is executed **per workspace** using the CLI:
 
 ### Harness bootstrap (auto-install)
 
-For **chroot workspaces**, Open Agent can automatically install the required
+For **container workspaces**, Open Agent can automatically install the required
 CLIs during container build (best-effort):
 
 - `OPEN_AGENT_BOOTSTRAP_CLAUDECODE=true` (default)
@@ -148,6 +147,23 @@ Default per-workspace tool settings:
 - **Claude Code**: built-in `Bash` enabled via permissions.
 
 MCP tools (desktop/playwright/workspace) can be enabled when needed.
+
+## MCP execution scope (current)
+
+Workspace-scoped MCP servers (desktop/playwright/workspace) run **alongside the
+harness process**:
+
+- When the harness runs inside a container (per-workspace runner enabled), MCPs
+  execute directly in that container.
+- When the harness runs on the host (`OPEN_AGENT_PER_WORKSPACE_RUNNER=false`),
+  container workspaces wrap MCP commands with systemd-nspawn (when available) so
+  tools still execute inside the container.
+
+Desktop streaming note:
+- The UI streams X11 from the **host** (Xvfb + MJPEG).
+- Container-local X servers are not visible to the host unless `/tmp/.X11-unix`
+  is bind-mounted and `DISPLAY` is set. Open Agent only does this for
+  interactive shells, not for harness/MCP execution by default.
 
 ## Adding a new backend
 

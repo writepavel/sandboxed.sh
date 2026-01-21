@@ -2,7 +2,7 @@
 //!
 //! Spawns processes inside a workspace execution context so that:
 //! - Host workspaces execute directly on the host
-//! - Chroot workspaces execute via systemd-nspawn in the container filesystem
+//! - Container workspaces execute via systemd-nspawn in the container filesystem
 //!
 //! This is used for per-workspace Claude Code and OpenCode execution.
 
@@ -42,7 +42,7 @@ impl WorkspaceExec {
         merged
             .entry("OPEN_AGENT_WORKSPACE_TYPE".to_string())
             .or_insert_with(|| self.workspace.workspace_type.as_str().to_string());
-        if self.workspace.workspace_type == WorkspaceType::Chroot {
+        if self.workspace.workspace_type == WorkspaceType::Container {
             if let Some(name) = self
                 .workspace
                 .path
@@ -72,9 +72,9 @@ impl WorkspaceExec {
                 .entry("XDG_CACHE_HOME".to_string())
                 .or_insert_with(|| "/root/.cache".to_string());
         }
-        if self.workspace.workspace_type == WorkspaceType::Chroot && !use_nspawn_for_workspace(&self.workspace) {
+        if self.workspace.workspace_type == WorkspaceType::Container && !use_nspawn_for_workspace(&self.workspace) {
             merged
-                .entry("OPEN_AGENT_CHROOT_FALLBACK".to_string())
+                .entry("OPEN_AGENT_CONTAINER_FALLBACK".to_string())
                 .or_insert_with(|| "1".to_string());
         }
         merged
@@ -203,7 +203,7 @@ impl WorkspaceExec {
                 cmd.stdin(stdin).stdout(stdout).stderr(stderr);
                 Ok(cmd)
             }
-            WorkspaceType::Chroot => {
+            WorkspaceType::Container => {
                 if !use_nspawn_for_workspace(&self.workspace) {
                     // Fallback: execute on host when systemd-nspawn isn't available.
                     let mut cmd = Command::new(program);
@@ -228,7 +228,7 @@ impl WorkspaceExec {
                     );
                 }
 
-                // For chroot workspaces we execute via systemd-nspawn.
+                // For container workspaces we execute via systemd-nspawn.
                 // Note: this requires systemd-nspawn on the host at runtime.
                 let root = self.workspace.path.clone();
                 let rel_cwd = self.rel_path_in_container(cwd);

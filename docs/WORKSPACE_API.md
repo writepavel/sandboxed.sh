@@ -35,12 +35,12 @@ POST /api/workspaces
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Human-readable workspace name |
-| `workspace_type` | string | No | `host` or `chroot` (default: `host`) |
+| `workspace_type` | string | No | `host` or `container` (default: `host`) |
 | `path` | string | No | Custom working directory path |
 | `skills` | string[] | No | Library skill names to sync |
 | `tools` | string[] | No | Library tool names to sync |
 | `plugins` | string[] | No | Plugin identifiers for hooks |
-| `template` | string | No | Template name (forces `chroot` type) |
+| `template` | string | No | Template name (forces `container` type) |
 | `distro` | string | No | Linux distro for containers |
 | `env_vars` | object | No | Environment variables |
 | `init_script` | string | No | Script to run on container build |
@@ -95,7 +95,7 @@ Deletes the workspace. For container workspaces, this also destroys the containe
 POST /api/workspaces/:id/build
 ```
 
-Builds or rebuilds a container workspace. Only valid for `chroot` type workspaces.
+Builds or rebuilds a container workspace. Only valid for `container` type workspaces.
 
 **Body** (optional):
 ```json
@@ -278,7 +278,7 @@ POST /api/workspaces/:id/rerun-init
 Re-runs the init script without rebuilding the container from scratch. This is much faster for iterating on init script development.
 
 **Requirements**:
-- Workspace must be `chroot` type
+- Workspace must be `container` type
 - Container must already exist (debootstrap completed)
 - Workspace must have an init script configured
 
@@ -406,7 +406,7 @@ DELETE /api/library/workspace-template/:name
 {
   "id": "uuid",
   "name": "my-workspace",
-  "workspace_type": "chroot",
+  "workspace_type": "container",
   "path": "/path/to/workspace",
   "status": "ready",
   "error_message": null,
@@ -426,7 +426,7 @@ DELETE /api/library/workspace-template/:name
 | Type | Description |
 |------|-------------|
 | `host` | Executes commands directly on the host machine |
-| `chroot` | Executes commands in an isolated container (systemd-nspawn) |
+| `container` | Executes commands in an isolated container (systemd-nspawn) |
 
 ### Workspace Status
 
@@ -450,7 +450,7 @@ curl -X POST "http://localhost:3000/api/workspaces" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "my-dev-env",
-    "workspace_type": "chroot",
+    "workspace_type": "container",
     "distro": "ubuntu-noble",
     "skills": ["python-dev"],
     "init_script": "#!/bin/bash\napt install -y python3 python3-pip"

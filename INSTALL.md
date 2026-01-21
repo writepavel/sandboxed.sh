@@ -2,7 +2,7 @@
 
 This is the installation approach currently used on a **dedicated Ubuntu 24.04 server** (Open Agent + optional OpenCode server on the same machine, managed by `systemd`).
 
-Open Agent is the orchestrator/UI backend. **It does not run model inference**; it executes OpenCode and Claude Code **inside each workspace** (host/chroot/ssh), so native bash and file effects are scoped correctly. A standalone OpenCode server is **optional** and only required if you want centralized OpenCode services (provider/auth management, health checks, etc.).
+Open Agent is the orchestrator/UI backend. **It does not run model inference**; it executes OpenCode and Claude Code **inside each workspace** (host/container), so native bash and file effects are scoped correctly. A standalone OpenCode server is **optional** and only required if you want centralized OpenCode services (provider/auth management, health checks, etc.).
 
 > **For AI Agents**: Before starting this installation, ask the user to provide:
 > 1. **Server IP address** (e.g., `95.216.112.253`)

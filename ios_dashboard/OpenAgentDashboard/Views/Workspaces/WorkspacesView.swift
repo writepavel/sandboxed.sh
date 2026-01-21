@@ -245,7 +245,7 @@ struct WorkspaceDetailView: View {
 struct NewWorkspaceSheet: View {
     let onDismiss: () -> Void
     @State private var name = ""
-    @State private var workspaceType: WorkspaceType = .chroot
+    @State private var workspaceType: WorkspaceType = .container
     @State private var isCreating = false
 
     var body: some View {
@@ -259,13 +259,13 @@ struct NewWorkspaceSheet: View {
 
                     Picker("Type", selection: $workspaceType) {
                         Text("Host").tag(WorkspaceType.host)
-                        Text("Chroot").tag(WorkspaceType.chroot)
+                        Text("Container").tag(WorkspaceType.container)
                     }
                     .pickerStyle(.segmented)
 
                     Text(workspaceType == .host
                         ? "Runs directly on the host machine filesystem"
-                        : "Creates an isolated chroot environment")
+                        : "Creates an isolated container environment")
                         .font(.caption)
                         .foregroundColor(.white.opacity(0.5))
 

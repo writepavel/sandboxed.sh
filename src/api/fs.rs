@@ -47,7 +47,7 @@ fn load_runtime_workspace() -> Option<RuntimeWorkspace> {
 }
 
 fn is_container_workspace(state: &RuntimeWorkspace) -> bool {
-    matches!(state.workspace_type.as_deref(), Some("chroot"))
+    matches!(state.workspace_type.as_deref(), Some("container"))
 }
 
 fn workspace_root_path(state: &RuntimeWorkspace) -> Option<PathBuf> {

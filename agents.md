@@ -14,7 +14,7 @@ missions.
 3. Open Agent writes **per-workspace config files** (`opencode.json`,
    `.opencode/opencode.json`, `.claude/settings.local.json`, `CLAUDE.md`).
 4. The mission runner launches the chosen harness **inside the workspace** using
-   a workspace-aware execution layer (host, chroot, or SSH).
+   a workspace-aware execution layer (host or container).
 5. The harness streams JSON events; Open Agent converts these into a unified
    event stream for the UI.
 
@@ -25,9 +25,7 @@ execution context:
 
 - **Host workspace**: process runs directly on the host with the mission working
   directory as `cwd`.
-- **Chroot workspace**: process runs inside the container via `systemd-nspawn`.
-- **Remote workspace**: process runs via SSH in the remote working directory.
-
+- **Container workspace**: process runs inside the container via `systemd-nspawn`.
 This guarantees that built-in bash (OpenCode `bash` / Claude Code `Bash`) executes
 **inside the workspace**. File creation, git operations, and shell commands land
 in the correct workspace without a host-proxy tool.
@@ -61,6 +59,15 @@ in the correct workspace without a host-proxy tool.
 
 If a mission truly requires MCP tools, re-enable them per workspace or per
 backend in configuration. The default is to avoid host-proxy tooling.
+
+## Desktop streaming (X11)
+
+- The desktop stream is hosted on the **Open Agent host** (Xvfb + MJPEG).
+- Container workspaces do **not** see the host desktop by default because the
+  X11 socket (`/tmp/.X11-unix`) is not bind-mounted for harness/MCP execution.
+- Interactive shells bind X11 when a runtime display is present, but harnesses
+  and MCPs do not. If you need container agents to drive the shared desktop,
+  add an explicit X11 bind + `DISPLAY`, or run the mission on a host workspace.
 
 ## Configuration sources
 

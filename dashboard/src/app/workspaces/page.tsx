@@ -15,9 +15,9 @@ import {
   listLibrarySkills,
   getWorkspaceDebug,
   getWorkspaceInitLog,
-  CHROOT_DISTROS,
+  CONTAINER_DISTROS,
   type Workspace,
-  type ChrootDistro,
+  type ContainerDistro,
   type WorkspaceTemplateSummary,
   type SkillSummary,
   type WorkspaceDebugInfo,
@@ -68,7 +68,7 @@ export default function WorkspacesPage() {
 
   const [showNewWorkspaceDialog, setShowNewWorkspaceDialog] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState('');
-  const [newWorkspaceType, setNewWorkspaceType] = useState<'host' | 'chroot'>('chroot');
+  const [newWorkspaceType, setNewWorkspaceType] = useState<'host' | 'container'>('container');
   const [newWorkspaceTemplate, setNewWorkspaceTemplate] = useState('');
   const [skillsFilter, setSkillsFilter] = useState('');
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
@@ -76,7 +76,7 @@ export default function WorkspacesPage() {
 
   // Build state
   const [building, setBuilding] = useState(false);
-  const [selectedDistro, setSelectedDistro] = useState<ChrootDistro>('ubuntu-noble');
+  const [selectedDistro, setSelectedDistro] = useState<ContainerDistro>('ubuntu-noble');
   const [buildDebug, setBuildDebug] = useState<WorkspaceDebugInfo | null>(null);
   const [buildLog, setBuildLog] = useState<InitLogResponse | null>(null);
   const buildLogRef = useRef<HTMLPreElement>(null);
@@ -111,15 +111,15 @@ export default function WorkspacesPage() {
     { revalidateOnFocus: false }
   );
 
-  // Dynamic tabs based on workspace state - Build tab only shows for chroot workspaces
+  // Dynamic tabs based on workspace state - Build tab only shows for container workspaces
   const getWorkspaceTabs = (workspace: Workspace | null) => {
     const tabs: { id: 'overview' | 'skills' | 'environment' | 'template' | 'build'; label: string }[] = [
       { id: 'overview', label: 'Overview' },
       { id: 'skills', label: 'Skills' },
       { id: 'environment', label: 'Env' },
     ];
-    // Add Build tab for chroot workspaces
-    if (workspace?.workspace_type === 'chroot') {
+    // Add Build tab for container workspaces
+    if (workspace?.workspace_type === 'container') {
       tabs.push({ id: 'build', label: 'Build' });
     }
     tabs.push({ id: 'template', label: 'Template' });
@@ -157,7 +157,7 @@ export default function WorkspacesPage() {
     if (isDifferentWorkspace) {
       setLastSelectedId(selectedWorkspace.id);
       if (selectedWorkspace.distro) {
-        setSelectedDistro(selectedWorkspace.distro as ChrootDistro);
+        setSelectedDistro(selectedWorkspace.distro as ContainerDistro);
       } else {
         setSelectedDistro('ubuntu-noble');
       }
@@ -173,7 +173,7 @@ export default function WorkspacesPage() {
 
   useEffect(() => {
     if (newWorkspaceTemplate) {
-      setNewWorkspaceType('chroot');
+      setNewWorkspaceType('container');
     }
   }, [newWorkspaceTemplate]);
 
@@ -263,7 +263,7 @@ export default function WorkspacesPage() {
     if (!newWorkspaceName.trim()) return;
     try {
       setCreating(true);
-      const workspaceType = newWorkspaceTemplate ? 'chroot' : newWorkspaceType;
+      const workspaceType = newWorkspaceTemplate ? 'container' : newWorkspaceType;
       const created = await createWorkspace({
         name: newWorkspaceName,
         workspace_type: workspaceType,
@@ -274,12 +274,16 @@ export default function WorkspacesPage() {
       // even if the build step fails later
       await mutateWorkspaces();
 
-      // For chroot workspaces WITHOUT a template, trigger build manually.
+      // For container workspaces WITHOUT a template, trigger build manually.
       // Template-based workspaces are auto-built by the backend, so skip the explicit build call.
       let workspaceToShow = created;
-      if (workspaceType === 'chroot' && !newWorkspaceTemplate) {
+      if (workspaceType === 'container' && !newWorkspaceTemplate) {
         try {
-          workspaceToShow = await buildWorkspace(created.id, created.distro as ChrootDistro || 'ubuntu-noble', false);
+          workspaceToShow = await buildWorkspace(
+            created.id,
+            (created.distro as ContainerDistro) || 'ubuntu-noble',
+            false
+          );
         } catch (buildErr) {
           showError(buildErr instanceof Error ? buildErr.message : 'Failed to start build');
           // Refresh workspace to get error status
@@ -604,8 +608,8 @@ export default function WorkspacesPage() {
                     </div>
                   )}
 
-                  {/* Network settings for chroot workspaces */}
-                  {selectedWorkspace.workspace_type === 'chroot' && (
+                  {/* Network settings for container workspaces */}
+                  {selectedWorkspace.workspace_type === 'container' && (
                     <div className="rounded-lg bg-white/[0.02] border border-white/[0.05] p-3">
                       <div className="flex items-center justify-between">
                         <div>
@@ -649,8 +653,8 @@ export default function WorkspacesPage() {
                     </div>
                   )}
 
-                  {/* Action hint for chroot workspaces */}
-                  {selectedWorkspace.workspace_type === 'chroot' && selectedWorkspace.status !== 'building' && selectedWorkspace.status !== 'ready' && (
+                  {/* Action hint for container workspaces */}
+                  {selectedWorkspace.workspace_type === 'container' && selectedWorkspace.status !== 'building' && selectedWorkspace.status !== 'ready' && (
                     <div className="rounded-lg bg-amber-500/5 border border-amber-500/15 p-3">
                       <p className="text-xs text-amber-300/80">
                         Go to the <button onClick={() => setWorkspaceTab('build')} className="underline hover:text-amber-200">Build</button> tab to create the container environment.
@@ -660,7 +664,7 @@ export default function WorkspacesPage() {
                 </div>
               )}
 
-              {workspaceTab === 'build' && selectedWorkspace.workspace_type === 'chroot' && (
+              {workspaceTab === 'build' && selectedWorkspace.workspace_type === 'container' && (
                 <div className="px-5 py-4 flex flex-col h-full">
                   {/* Build controls - shown when not building */}
                   {selectedWorkspace.status !== 'building' && (
@@ -668,7 +672,7 @@ export default function WorkspacesPage() {
                       <div className="flex items-center gap-3">
                         <select
                           value={selectedDistro}
-                          onChange={(e) => setSelectedDistro(e.target.value as ChrootDistro)}
+                          onChange={(e) => setSelectedDistro(e.target.value as ContainerDistro)}
                           disabled={building}
                           className="px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-sm text-white focus:outline-none focus:border-indigo-500/50 disabled:opacity-50 appearance-none cursor-pointer"
                           style={{
@@ -680,7 +684,7 @@ export default function WorkspacesPage() {
                             paddingRight: '2rem',
                           }}
                         >
-                          {CHROOT_DISTROS.map((distro) => (
+                          {CONTAINER_DISTROS.map((distro) => (
                             <option key={distro.value} value={distro.value} className="bg-[#161618]">
                               {distro.label}
                             </option>
@@ -1090,7 +1094,7 @@ export default function WorkspacesPage() {
                 <label className="text-xs text-white/40 mb-2 block">Type</label>
                 <select
                   value={newWorkspaceType}
-                  onChange={(e) => setNewWorkspaceType(e.target.value as 'host' | 'chroot')}
+                  onChange={(e) => setNewWorkspaceType(e.target.value as 'host' | 'container')}
                   disabled={Boolean(newWorkspaceTemplate)}
                   className="w-full px-3 py-2.5 rounded-lg bg-black/20 border border-white/[0.06] text-sm text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer disabled:opacity-50"
                   style={{
@@ -1102,7 +1106,7 @@ export default function WorkspacesPage() {
                   }}
                 >
                   <option value="host" className="bg-[#161618]">Host (main filesystem)</option>
-                  <option value="chroot" className="bg-[#161618]">Isolated (root filesystem)</option>
+                  <option value="container" className="bg-[#161618]">Isolated (container)</option>
                 </select>
                 <p className="text-xs text-white/35 mt-2">
                   {newWorkspaceTemplate

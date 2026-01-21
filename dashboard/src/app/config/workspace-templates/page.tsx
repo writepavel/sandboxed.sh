@@ -8,7 +8,7 @@ import {
   deleteWorkspaceTemplate,
   renameWorkspaceTemplate,
   listLibrarySkills,
-  CHROOT_DISTROS,
+  CONTAINER_DISTROS,
   type WorkspaceTemplate,
   type WorkspaceTemplateSummary,
   type SkillSummary,
@@ -593,7 +593,7 @@ export default function WorkspaceTemplatesPage() {
                         }}
                       >
                         <option value="">Default (Workspace setting)</option>
-                        {CHROOT_DISTROS.map((option) => (
+                        {CONTAINER_DISTROS.map((option) => (
                           <option key={option.value} value={option.value}>
                             {option.label}
                           </option>

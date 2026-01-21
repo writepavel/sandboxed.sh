@@ -538,7 +538,7 @@ pub async fn workspace_shell_ws(
     };
 
     // For container workspaces, verify it's ready
-    if workspace.workspace_type == WorkspaceType::Chroot
+    if workspace.workspace_type == WorkspaceType::Container
         && workspace.status != crate::workspace::WorkspaceStatus::Ready
     {
         return (
@@ -754,7 +754,7 @@ async fn handle_new_workspace_shell(
 
     // Build command based on workspace type
     let mut cmd = match workspace.workspace_type {
-        WorkspaceType::Chroot if use_nspawn_for_workspace(&workspace) => {
+        WorkspaceType::Container if use_nspawn_for_workspace(&workspace) => {
             // For container workspaces, use systemd-nspawn to enter the isolated environment
             // First, terminate any stale container that might be holding the directory lock
             terminate_stale_container(&workspace.name).await;

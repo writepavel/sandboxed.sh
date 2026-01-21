@@ -248,8 +248,8 @@ async fn create_workspace(
     let mut template_data: Option<WorkspaceTemplate> = None;
 
     if let Some(template_name) = req.template.as_ref() {
-        // Templates always require an isolated (chroot) workspace
-        workspace_type = WorkspaceType::Chroot;
+        // Templates always require an isolated (container) workspace
+        workspace_type = WorkspaceType::Container;
 
         let library = {
             let guard = state.library.read().await;
@@ -290,7 +290,7 @@ async fn create_workspace(
                     "Host workspaces require a custom path".to_string(),
                 ));
             }
-            WorkspaceType::Chroot => {
+            WorkspaceType::Container => {
                 // Container workspaces go in a dedicated directory
                 state
                     .config
@@ -358,8 +358,8 @@ async fn create_workspace(
             plugins: req.plugins,
             shared_network,
         },
-        WorkspaceType::Chroot => {
-            let mut ws = Workspace::new_chroot(req.name, path);
+        WorkspaceType::Container => {
+            let mut ws = Workspace::new_container(req.name, path);
             ws.skills = skills;
             ws.tools = req.tools;
             ws.plugins = req.plugins;
@@ -403,9 +403,9 @@ async fn create_workspace(
     }
     drop(library_guard);
 
-    // Auto-start build for template-based chroot workspaces
+    // Auto-start build for template-based container workspaces
     // This improves UX by not requiring a separate build API call
-    if workspace.workspace_type == WorkspaceType::Chroot && req.template.is_some() {
+    if workspace.workspace_type == WorkspaceType::Container && req.template.is_some() {
         let distro = workspace
             .distro
             .as_ref()
@@ -424,7 +424,7 @@ async fn create_workspace(
         let mut workspace_for_build = workspace.clone();
 
         tokio::spawn(async move {
-            let result = crate::workspace::build_chroot_workspace(
+            let result = crate::workspace::build_container_workspace(
                 &mut workspace_for_build,
                 distro,
                 false, // don't force rebuild
@@ -639,8 +639,8 @@ async fn delete_workspace(
 
     // If it's a container workspace, destroy the container first
     if let Some(ws) = state.workspaces.get(id).await {
-        if ws.workspace_type == WorkspaceType::Chroot {
-            if let Err(e) = crate::workspace::destroy_chroot_workspace(&ws).await {
+        if ws.workspace_type == WorkspaceType::Container {
+            if let Err(e) = crate::workspace::destroy_container_workspace(&ws).await {
                 tracing::error!("Failed to destroy container for workspace {}: {}", id, e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -742,7 +742,7 @@ async fn build_workspace(
         .await
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
 
-    if workspace.workspace_type != WorkspaceType::Chroot {
+    if workspace.workspace_type != WorkspaceType::Container {
         return Err((
             StatusCode::BAD_REQUEST,
             "Workspace is not a container type".to_string(),
@@ -788,7 +788,7 @@ async fn build_workspace(
     let mut workspace_for_build = workspace.clone();
 
     tokio::spawn(async move {
-        let result = crate::workspace::build_chroot_workspace(
+        let result = crate::workspace::build_container_workspace(
             &mut workspace_for_build,
             distro,
             force_rebuild,
@@ -926,7 +926,7 @@ async fn exec_workspace_command(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
 
     // For container workspaces, ensure container is ready
-    if workspace.workspace_type == WorkspaceType::Chroot {
+    if workspace.workspace_type == WorkspaceType::Container {
         if workspace.status != WorkspaceStatus::Ready {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -958,7 +958,7 @@ async fn exec_workspace_command(
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
             (shell, vec!["-c".to_string(), req.command.clone()])
         }
-        WorkspaceType::Chroot => {
+        WorkspaceType::Container => {
             // For container workspaces, use systemd-nspawn
             let container_root = workspace.path.clone();
             let rel_cwd = if cwd.starts_with(&container_root) {
@@ -1111,9 +1111,9 @@ async fn get_workspace_debug(
     let path = &workspace.path;
     let path_exists = path.exists();
 
-    // Calculate container size (only for chroot workspaces)
+    // Calculate container size (only for container workspaces)
     // Use du -sk (kilobytes) for portability, then convert to bytes
-    let size_bytes = if workspace.workspace_type == WorkspaceType::Chroot && path_exists {
+    let size_bytes = if workspace.workspace_type == WorkspaceType::Container && path_exists {
         let output = tokio::process::Command::new("du")
             .args(["-sk", &path.to_string_lossy()])
             .output()
@@ -1256,7 +1256,7 @@ async fn rerun_init_script(
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Workspace {} not found", id)))?;
 
     // Only works for container workspaces
-    if workspace.workspace_type != WorkspaceType::Chroot {
+    if workspace.workspace_type != WorkspaceType::Container {
         return Err((
             StatusCode::BAD_REQUEST,
             "Rerun init only works for container workspaces".to_string(),

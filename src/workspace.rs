@@ -7,7 +7,7 @@
 //! ## Workspace Types
 //!
 //! - **Host**: Execute directly on the remote host environment
-//! - **Chroot**: Execute inside an isolated container environment (systemd-nspawn)
+//! - **Container**: Execute inside an isolated container environment (systemd-nspawn)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ pub enum WorkspaceType {
     /// Execute directly on remote host
     Host,
     /// Execute inside isolated container environment
-    Chroot,
+    Container,
 }
 
 impl Default for WorkspaceType {
@@ -53,24 +53,24 @@ impl WorkspaceType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Host => "host",
-            Self::Chroot => "chroot",
+            Self::Container => "container",
         }
     }
 }
 
-pub fn is_chroot_fallback(workspace: &Workspace) -> bool {
+pub fn is_container_fallback(workspace: &Workspace) -> bool {
     workspace
         .config
-        .get("chroot_fallback")
+        .get("container_fallback")
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
 
 pub fn use_nspawn_for_workspace(workspace: &Workspace) -> bool {
-    if workspace.workspace_type != WorkspaceType::Chroot {
+    if workspace.workspace_type != WorkspaceType::Container {
         return false;
     }
-    if is_chroot_fallback(workspace) {
+    if is_container_fallback(workspace) {
         return false;
     }
     nspawn::nspawn_available()
@@ -168,11 +168,11 @@ impl Workspace {
     }
 
     /// Create a new container workspace (pending build).
-    pub fn new_chroot(name: String, path: PathBuf) -> Self {
+    pub fn new_container(name: String, path: PathBuf) -> Self {
         Self {
             id: Uuid::new_v4(),
             name,
-            workspace_type: WorkspaceType::Chroot,
+            workspace_type: WorkspaceType::Container,
             path,
             status: WorkspaceStatus::Pending,
             error_message: None,
@@ -304,7 +304,7 @@ impl WorkspaceStore {
         // Get all known container paths
         let known_paths: std::collections::HashSet<PathBuf> = known
             .values()
-            .filter(|w| w.workspace_type == WorkspaceType::Chroot)
+            .filter(|w| w.workspace_type == WorkspaceType::Container)
             .map(|w| w.path.clone())
             .collect();
 
@@ -360,7 +360,7 @@ impl WorkspaceStore {
                 let workspace = Workspace {
                     id: Uuid::new_v4(),
                     name,
-                    workspace_type: WorkspaceType::Chroot,
+                    workspace_type: WorkspaceType::Container,
                     path,
                     status,
                     error_message: None,
@@ -597,7 +597,7 @@ fn opencode_entry_from_mcp(
             merged_env
                 .entry("WORKING_DIR".to_string())
                 .or_insert_with(|| workspace_dir.to_string_lossy().to_string());
-            if workspace_type == WorkspaceType::Chroot {
+            if workspace_type == WorkspaceType::Container {
                 if let Some(name) = workspace_root.file_name().and_then(|n| n.to_str()) {
                     if !name.trim().is_empty() {
                         merged_env
@@ -614,22 +614,22 @@ fn opencode_entry_from_mcp(
                 }
             }
 
-            let chroot_fallback = workspace_env
-                .get("OPEN_AGENT_CHROOT_FALLBACK")
+            let container_fallback = workspace_env
+                .get("OPEN_AGENT_CONTAINER_FALLBACK")
                 .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
                 .unwrap_or(false)
-                || (workspace_type == WorkspaceType::Chroot && !nspawn::nspawn_available());
+                || (workspace_type == WorkspaceType::Container && !nspawn::nspawn_available());
             let per_workspace_runner =
                 env_var_bool("OPEN_AGENT_PER_WORKSPACE_RUNNER", true);
-            if chroot_fallback {
+            if container_fallback {
                 merged_env
-                    .entry("OPEN_AGENT_CHROOT_FALLBACK".to_string())
+                    .entry("OPEN_AGENT_CONTAINER_FALLBACK".to_string())
                     .or_insert_with(|| "1".to_string());
             }
 
             let use_nspawn = config.scope == McpScope::Workspace
-                && workspace_type == WorkspaceType::Chroot
-                && !chroot_fallback
+                && workspace_type == WorkspaceType::Container
+                && !container_fallback
                 && !per_workspace_runner
                 && nspawn::nspawn_available();
 
@@ -658,7 +658,7 @@ fn opencode_entry_from_mcp(
                     "--chdir".to_string(),
                     rel_str,
                 ];
-                // For chroot workspaces, bind-mount the GLOBAL context root into the container.
+                // For container workspaces, bind-mount the GLOBAL context root into the container.
                 // Mission context files are stored in the global context root (e.g., /root/context/{mission_id}),
                 // NOT in a workspace-specific directory. The global context root must be bind-mounted
                 // so that the symlink inside the container (`context -> /root/context/{mission_id}`) resolves.
@@ -920,19 +920,19 @@ async fn write_opencode_config(
     }
     // Tool policy:
     // - We want shell/file effects scoped to the workspace by running the agent process
-    //   inside the workspace execution context (host/chroot/ssh).
+    //   inside the workspace execution context (host/container).
     // - Therefore, OpenCode built-in bash MUST be enabled for all workspace types.
     // - The legacy workspace-mcp/desktop-mcp proxy tools are no longer required for core flows.
     let enable_desktop_tools =
         env_var_bool("OPEN_AGENT_ENABLE_DESKTOP_TOOLS", false) || env_var_bool("DESKTOP_ENABLED", false);
-    let chroot_fallback = workspace_env
-        .get("OPEN_AGENT_CHROOT_FALLBACK")
+    let container_fallback = workspace_env
+        .get("OPEN_AGENT_CONTAINER_FALLBACK")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
         .unwrap_or(false);
     let per_workspace_runner = env_var_bool("OPEN_AGENT_PER_WORKSPACE_RUNNER", true);
     let mut tools = serde_json::Map::new();
     match workspace_type {
-        WorkspaceType::Chroot => {
+        WorkspaceType::Container => {
             // Container workspace: OpenCode runs inside the container, so built-in bash is safe.
             tools.insert("Bash".to_string(), json!(true));
             tools.insert("bash".to_string(), json!(true));
@@ -940,7 +940,7 @@ async fn write_opencode_config(
             tools.insert("workspace_*".to_string(), json!(false));
             tools.insert(
                 "desktop_*".to_string(),
-                json!(enable_desktop_tools && (chroot_fallback || per_workspace_runner)),
+                json!(enable_desktop_tools && (container_fallback || per_workspace_runner)),
             );
             tools.insert("playwright_*".to_string(), json!(true));
             tools.insert("browser_*".to_string(), json!(true));
@@ -1078,7 +1078,7 @@ async fn write_claudecode_config(
     // - Therefore, built-in Bash is safe to allow for both host + container workspaces.
     // - Legacy MCP tools are still allowed as a wildcard for compatibility.
     let permissions: Vec<&str> = match workspace_type {
-        WorkspaceType::Chroot => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
+        WorkspaceType::Container => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
         WorkspaceType::Host => vec!["Bash", "Edit", "Write", "Read", "mcp__*"],
     };
     let settings = json!({
@@ -1103,9 +1103,9 @@ async fn write_claudecode_config(
                 "This file was generated by Open Agent. It contains context from configured skills.\n\n",
             );
 
-            // Add workspace instructions for using MCP bash tool
+            // Add workspace instructions for using the built-in Bash tool
             match workspace_type {
-                WorkspaceType::Chroot => {
+                WorkspaceType::Container => {
                     claude_md.push_str("## Container Workspace\n\n");
                     claude_md.push_str(
                         "This is an isolated container workspace. Shell commands execute inside the container workspace context.\n\n\
@@ -1969,7 +1969,7 @@ fn translate_to_container_path(host_path: &Path, workspace_root: &Path) -> PathB
 
 /// Write the current workspace context to a runtime file for MCP tools.
 ///
-/// For chroot workspaces, paths are translated to container-relative paths so that
+/// For container workspaces, paths are translated to container-relative paths so that
 /// commands executed inside the container can use them directly.
 pub async fn write_runtime_workspace_state(
     working_dir_root: &Path,
@@ -1991,9 +1991,9 @@ pub async fn write_runtime_workspace_state(
         if !context_link.exists() {
             #[cfg(unix)]
             {
-                // For chroot workspaces, the symlink must point to the container path
+                // For container workspaces, the symlink must point to the container path
                 // since /root/context is bind-mounted, not the host path
-                let symlink_target = if workspace.workspace_type == WorkspaceType::Chroot {
+                let symlink_target = if workspace.workspace_type == WorkspaceType::Container {
                     PathBuf::from("/root")
                         .join(context_dir_name)
                         .join(mission_id.unwrap().to_string())
@@ -2017,7 +2017,7 @@ pub async fn write_runtime_workspace_state(
         }
     }
 
-    // For chroot workspaces, translate paths to container-relative paths.
+    // For container workspaces, translate paths to container-relative paths.
     // Inside the container:
     // - working_dir becomes relative to container root (e.g., /workspaces/mission-xxx)
     // - context is bind-mounted at /root/context
@@ -2025,7 +2025,7 @@ pub async fn write_runtime_workspace_state(
         PathBuf,
         PathBuf,
         Option<PathBuf>,
-    ) = if workspace.workspace_type == WorkspaceType::Chroot {
+    ) = if workspace.workspace_type == WorkspaceType::Container {
         let container_working_dir = translate_to_container_path(working_dir, &workspace.path);
         // Context is bind-mounted at /root/context inside the container
         let container_context_root = PathBuf::from("/root").join(context_dir_name);
@@ -2242,24 +2242,24 @@ async fn sync_workspace_mcp_binaries(
     Ok(())
 }
 
-fn mark_chroot_fallback(workspace: &mut Workspace, reason: &str) {
+fn mark_container_fallback(workspace: &mut Workspace, reason: &str) {
     let mut obj = workspace.config.as_object().cloned().unwrap_or_default();
-    obj.insert("chroot_fallback".to_string(), json!(true));
+    obj.insert("container_fallback".to_string(), json!(true));
     if !reason.trim().is_empty() {
-        obj.insert("chroot_fallback_reason".to_string(), json!(reason));
+        obj.insert("container_fallback_reason".to_string(), json!(reason));
     }
     workspace.config = serde_json::Value::Object(obj);
     workspace
         .env_vars
-        .entry("OPEN_AGENT_CHROOT_FALLBACK".to_string())
+        .entry("OPEN_AGENT_CONTAINER_FALLBACK".to_string())
         .or_insert_with(|| "1".to_string());
 }
 
-async fn build_chroot_fallback(workspace: &mut Workspace, reason: &str) -> anyhow::Result<()> {
+async fn build_container_fallback(workspace: &mut Workspace, reason: &str) -> anyhow::Result<()> {
     tracing::warn!(
         workspace = %workspace.name,
         reason = %reason,
-        "Chroot fallback enabled; workspace will run on host without systemd-nspawn"
+        "Container fallback enabled; workspace will run on host without systemd-nspawn"
     );
 
     tokio::fs::create_dir_all(&workspace.path).await?;
@@ -2267,29 +2267,29 @@ async fn build_chroot_fallback(workspace: &mut Workspace, reason: &str) -> anyho
         let _ = tokio::fs::create_dir_all(workspace.path.join(dir)).await;
     }
 
-    mark_chroot_fallback(workspace, reason);
+    mark_container_fallback(workspace, reason);
     workspace.status = WorkspaceStatus::Ready;
     workspace.error_message = None;
     Ok(())
 }
 
 /// Build a container workspace.
-pub async fn build_chroot_workspace(
+pub async fn build_container_workspace(
     workspace: &mut Workspace,
     distro: Option<NspawnDistro>,
     force_rebuild: bool,
     working_dir: &Path,
 ) -> anyhow::Result<()> {
-    if workspace.workspace_type != WorkspaceType::Chroot {
+    if workspace.workspace_type != WorkspaceType::Container {
         return Err(anyhow::anyhow!("Workspace is not a container type"));
     }
 
     if !nspawn::nspawn_available() {
-        if nspawn::allow_chroot_fallback() {
-            return build_chroot_fallback(workspace, "systemd-nspawn not available").await;
+        if nspawn::allow_container_fallback() {
+            return build_container_fallback(workspace, "systemd-nspawn not available").await;
         }
         return Err(anyhow::anyhow!(
-            "systemd-nspawn not available; install systemd-container or set OPEN_AGENT_ALLOW_CHROOT_FALLBACK=1"
+            "systemd-nspawn not available; install systemd-container or set OPEN_AGENT_ALLOW_CONTAINER_FALLBACK=1"
         ));
     }
 
@@ -2395,9 +2395,9 @@ pub async fn build_chroot_workspace(
             workspace.status = WorkspaceStatus::Error;
             workspace.error_message = Some(format!("Container build failed: {}", e));
             tracing::error!("Failed to build container: {}", e);
-            if nspawn::allow_chroot_fallback() {
+            if nspawn::allow_container_fallback() {
                 let reason = format!("container build failed: {}", e);
-                build_chroot_fallback(workspace, &reason).await
+                build_container_fallback(workspace, &reason).await
             } else {
                 Err(anyhow::anyhow!("Container build failed: {}", e))
             }
@@ -2474,7 +2474,7 @@ fn env_var_bool(name: &str, default: bool) -> bool {
 }
 
 async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<()> {
-    if workspace.workspace_type != WorkspaceType::Chroot || !use_nspawn_for_workspace(workspace) {
+    if workspace.workspace_type != WorkspaceType::Container || !use_nspawn_for_workspace(workspace) {
         return Ok(());
     }
 
@@ -2646,8 +2646,8 @@ async fn run_workspace_init_script(workspace: &Workspace) -> anyhow::Result<()> 
 }
 
 /// Destroy a container workspace.
-pub async fn destroy_chroot_workspace(workspace: &Workspace) -> anyhow::Result<()> {
-    if workspace.workspace_type != WorkspaceType::Chroot {
+pub async fn destroy_container_workspace(workspace: &Workspace) -> anyhow::Result<()> {
+    if workspace.workspace_type != WorkspaceType::Container {
         return Err(anyhow::anyhow!("Workspace is not a container type"));
     }
 
