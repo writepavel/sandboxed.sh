@@ -615,7 +615,9 @@ pub async fn run_claudecode_turn(
     app_working_dir: &std::path::Path,
 ) -> AgentResult {
     use super::ai_providers::{
-        ClaudeCodeAuth, ensure_anthropic_oauth_token_valid, get_anthropic_auth_for_claudecode,
+        get_anthropic_auth_from_workspace, get_anthropic_auth_from_host_with_expiry,
+        get_workspace_auth_path, ClaudeCodeAuth, ensure_anthropic_oauth_token_valid,
+        get_anthropic_auth_for_claudecode, refresh_workspace_anthropic_auth,
     };
     use std::collections::HashMap;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -634,32 +636,152 @@ pub async fn run_claudecode_turn(
         tracing::warn!("Failed to refresh Anthropic OAuth token: {}", e);
     }
 
-    // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend
-    let api_auth = if let Some(auth) = get_anthropic_auth_for_claudecode(app_working_dir) {
-        tracing::info!("Using Anthropic credentials from provider for Claude Code");
-        Some(auth)
-    } else {
-        // Fall back to secrets vault (legacy support)
-        if let Some(ref store) = secrets {
-            match store.get_secret("claudecode", "api_key").await {
-                Ok(key) => {
-                    tracing::info!("Using Claude Code credentials from secrets vault (legacy)");
-                    Some(classify_claudecode_secret(key))
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get Claude API key from secrets: {}", e);
-                    // Fall back to environment variable
-                    std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-                        .ok()
-                        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                        .map(classify_claudecode_secret)
+    // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
+    // For container workspaces, compare workspace auth vs host auth and use the fresher one.
+    // If workspace auth is expired, try to refresh it using the refresh token.
+    let api_auth = {
+        // For container workspaces, get both workspace and host auth with expiry info
+        let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
+            get_anthropic_auth_from_workspace(&workspace.path)
+        } else {
+            None
+        };
+
+        let host_auth = get_anthropic_auth_from_host_with_expiry();
+        let now = chrono::Utc::now().timestamp_millis();
+
+        // If workspace auth is expired and we have no fresh host auth, try to refresh the workspace auth
+        if let Some(ref ws) = workspace_auth {
+            let ws_expiry = ws.expires_at.unwrap_or(i64::MAX);
+            let ws_expired = ws_expiry < now;
+            let host_has_fresh_auth = host_auth.as_ref()
+                .map(|h| h.expires_at.unwrap_or(i64::MAX) > now)
+                .unwrap_or(false);
+
+            if ws_expired && !host_has_fresh_auth {
+                // Workspace auth is expired and no fresh host auth - try to refresh workspace auth
+                tracing::info!(
+                    workspace_path = %workspace.path.display(),
+                    ws_expiry = ws_expiry,
+                    "Workspace auth is expired, attempting to refresh"
+                );
+                match refresh_workspace_anthropic_auth(&workspace.path).await {
+                    Ok(refreshed) => {
+                        tracing::info!(
+                            workspace_path = %workspace.path.display(),
+                            "Successfully refreshed workspace Anthropic auth"
+                        );
+                        workspace_auth = Some(refreshed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace_path = %workspace.path.display(),
+                            error = %e,
+                            "Failed to refresh workspace auth, will try other sources"
+                        );
+                        // Clear the stale workspace auth so we don't keep trying
+                        workspace_auth = None;
+                    }
                 }
             }
+        }
+
+        // Choose the fresher auth based on expiry timestamps
+        let chosen_auth: Option<ClaudeCodeAuth> = match (&workspace_auth, &host_auth) {
+            (Some(ws), Some(host)) => {
+                // Both available - compare expiry timestamps
+                let ws_expiry = ws.expires_at.unwrap_or(i64::MAX); // API keys never expire
+                let host_expiry = host.expires_at.unwrap_or(i64::MAX);
+
+                // Check if workspace auth is expired
+                let ws_expired = ws_expiry < now;
+                let host_expired = host_expiry < now;
+
+                if ws_expired && !host_expired {
+                    // Workspace auth is expired but host auth is fresh - use host auth
+                    // Also delete the stale workspace auth file
+                    let ws_auth_path = get_workspace_auth_path(&workspace.path);
+                    if ws_auth_path.exists() {
+                        tracing::info!(
+                            workspace_path = %workspace.path.display(),
+                            ws_expiry = ws_expiry,
+                            host_expiry = host_expiry,
+                            "Workspace auth is expired, using fresher host auth and removing stale workspace auth"
+                        );
+                        if let Err(e) = std::fs::remove_file(&ws_auth_path) {
+                            tracing::warn!(
+                                path = %ws_auth_path.display(),
+                                error = %e,
+                                "Failed to remove stale workspace auth file"
+                            );
+                        }
+                    }
+                    Some(host.auth.clone())
+                } else if host_expiry > ws_expiry {
+                    // Host auth has later expiry - use it (it was likely just refreshed)
+                    tracing::info!(
+                        workspace_path = %workspace.path.display(),
+                        ws_expiry = ws_expiry,
+                        host_expiry = host_expiry,
+                        "Using fresher host auth (expires later than workspace auth)"
+                    );
+                    Some(host.auth.clone())
+                } else {
+                    // Workspace auth is fresher or equal - use it
+                    tracing::info!(
+                        workspace_path = %workspace.path.display(),
+                        ws_expiry = ws_expiry,
+                        host_expiry = host_expiry,
+                        "Using workspace auth"
+                    );
+                    Some(ws.auth.clone())
+                }
+            }
+            (Some(ws), None) => {
+                // Only workspace auth available
+                tracing::info!(
+                    workspace_path = %workspace.path.display(),
+                    "Using Anthropic credentials from container workspace"
+                );
+                Some(ws.auth.clone())
+            }
+            (None, Some(host)) => {
+                // Only host auth available
+                tracing::info!("Using Anthropic credentials from host");
+                Some(host.auth.clone())
+            }
+            (None, None) => None,
+        };
+
+        // If we found auth from workspace/host comparison, use it
+        if let Some(auth) = chosen_auth {
+            Some(auth)
+        } else if let Some(auth) = get_anthropic_auth_for_claudecode(app_working_dir) {
+            tracing::info!("Using Anthropic credentials from provider for Claude Code");
+            Some(auth)
         } else {
-            std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-                .ok()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .map(classify_claudecode_secret)
+            // Fall back to secrets vault (legacy support)
+            if let Some(ref store) = secrets {
+                match store.get_secret("claudecode", "api_key").await {
+                    Ok(key) => {
+                        tracing::info!("Using Claude Code credentials from secrets vault (legacy)");
+                        Some(classify_claudecode_secret(key))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to get Claude API key from secrets: {}", e);
+                        // Fall back to environment variable
+                        std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+                            .ok()
+                            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                            .map(classify_claudecode_secret)
+                    }
+                }
+            } else {
+                std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+                    .ok()
+                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                    .map(classify_claudecode_secret)
+            }
         }
     };
 
@@ -672,6 +794,14 @@ pub async fn run_claudecode_turn(
             tracing::warn!(mission_id = %mission_id, "{}", err_msg);
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
+    }
+
+    // Fail fast if no auth is available
+    if api_auth.is_none() {
+        let err_msg = "No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
+        tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+        return AgentResult::failure(err_msg.to_string(), 0)
+            .with_terminal_reason(TerminalReason::LlmError);
     }
 
     // Determine CLI path: prefer backend config, then env var, then default
@@ -708,11 +838,18 @@ pub async fn run_claudecode_turn(
         "--include-partial-messages".to_string(),
     ];
 
+    // NOTE: --dangerously-skip-permissions cannot be used when running as root.
+    // The container runs as root, so we rely on the permissions in settings.local.json instead.
+    // The "mcp__*" permission pattern should allow all MCP tools.
+
     // Ensure per-workspace MCP config is loaded (Claude CLI may not auto-load .claude in --print mode).
+    // For container workspaces, we must translate the path to be relative to the container filesystem.
     let mcp_config_path = work_dir.join(".claude").join("settings.local.json");
     if mcp_config_path.exists() {
         args.push("--mcp-config".to_string());
-        args.push(mcp_config_path.to_string_lossy().to_string());
+        // Translate the path for container execution (host path -> container-relative path)
+        let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
+        args.push(translated_path);
     }
 
     if let Some(m) = model {
@@ -944,15 +1081,18 @@ pub async fn run_claudecode_turn(
                                             .cloned()
                                             .unwrap_or_else(|| "unknown".to_string());
 
+                                        // Convert content to string representation (handles both text and image results)
+                                        let content_str = content.to_string_lossy();
+
                                         let result_value = if let Some(ref extra) = evt.tool_use_result {
                                             serde_json::json!({
-                                                "content": content,
+                                                "content": content_str,
                                                 "stdout": extra.stdout,
                                                 "stderr": extra.stderr,
                                                 "is_error": is_error,
                                             })
                                         } else {
-                                            serde_json::Value::String(content)
+                                            serde_json::Value::String(content_str)
                                         };
 
                                         let _ = events_tx.send(AgentEvent::ToolResult {
@@ -2566,20 +2706,33 @@ async fn ensure_claudecode_cli_available(
         ));
     }
 
-    if !command_available(workspace_exec, cwd, "npm").await {
+    // Check for npm or bun as package manager (bun is preferred for speed)
+    let has_npm = command_available(workspace_exec, cwd, "npm").await;
+    let has_bun = command_available(workspace_exec, cwd, "bun").await
+        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+
+    if !has_npm && !has_bun {
         return Err(format!(
-            "Claude Code CLI '{}' not found and npm is missing in the workspace. Install Node.js/npm in the workspace template or set CLAUDE_CLI_PATH.",
+            "Claude Code CLI '{}' not found and neither npm nor bun is available in the workspace. Install Node.js/npm or Bun in the workspace template, or set CLAUDE_CLI_PATH.",
             cli_path
         ));
     }
 
+    // Use bun if available (faster), otherwise npm
+    let install_cmd = if has_bun {
+        // Ensure Bun's bin is in PATH, then install globally
+        "export PATH=\"/root/.bun/bin:$PATH\" && bun install -g @anthropic-ai/claude-code@latest"
+    } else {
+        "npm install -g @anthropic-ai/claude-code@latest"
+    };
+
     let mut args = Vec::new();
     args.push("-lc".to_string());
-    args.push("npm install -g @anthropic-ai/claude-code@latest".to_string());
+    args.push(install_cmd.to_string());
     let output = workspace_exec
         .output(cwd, "/bin/sh", &args, HashMap::new())
         .await
-        .map_err(|e| format!("Failed to run npm install for Claude Code: {}", e))?;
+        .map_err(|e| format!("Failed to install Claude Code: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2595,7 +2748,7 @@ async fn ensure_claudecode_cli_available(
             message.push_str(stdout.trim());
         }
         if message.is_empty() {
-            message = "npm install for Claude Code failed with no output".to_string();
+            message = "Claude Code install failed with no output".to_string();
         }
         return Err(format!("Claude Code install failed: {}", message));
     }

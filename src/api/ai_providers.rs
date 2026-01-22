@@ -144,6 +144,14 @@ pub enum ClaudeCodeAuth {
     OAuthToken(String),
 }
 
+/// Claude Code authentication with expiry info for comparing freshness.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeAuthWithExpiry {
+    pub auth: ClaudeCodeAuth,
+    /// Expiry timestamp in milliseconds. None for API keys (never expire).
+    pub expires_at: Option<i64>,
+}
+
 /// Get the Anthropic API key or OAuth access token for the Claude Code backend.
 ///
 /// This checks if the Anthropic provider has "claudecode" in its use_for_backends
@@ -160,14 +168,25 @@ pub enum ClaudeCodeAuth {
 pub fn get_anthropic_auth_for_claudecode(working_dir: &Path) -> Option<ClaudeCodeAuth> {
     // Read the provider backends state to check use_for_backends
     let backends_state = read_provider_backends_state(working_dir);
+    tracing::debug!(
+        working_dir = %working_dir.display(),
+        backends_state = ?backends_state,
+        "Claude Code auth lookup: read provider backends state"
+    );
 
     // Check if Anthropic provider has claudecode in use_for_backends
-    let use_for_claudecode = backends_state
-        .get(ProviderType::Anthropic.id())
+    let anthropic_backends = backends_state.get(ProviderType::Anthropic.id());
+    let use_for_claudecode = anthropic_backends
         .map(|backends| backends.iter().any(|b| b == "claudecode"))
         .unwrap_or(false);
+    tracing::debug!(
+        anthropic_backends = ?anthropic_backends,
+        use_for_claudecode = use_for_claudecode,
+        "Claude Code auth lookup: checked backends"
+    );
 
     if !use_for_claudecode {
+        tracing::debug!("Claude Code not in Anthropic backends, trying fallback auth sources");
         if let Some(auth) = get_anthropic_auth_from_opencode_auth()
             .or_else(|| get_anthropic_auth_from_ai_providers(working_dir))
         {
@@ -176,22 +195,302 @@ pub fn get_anthropic_auth_for_claudecode(working_dir: &Path) -> Option<ClaudeCod
             );
             return Some(auth);
         }
+        tracing::debug!("No Anthropic credentials found in fallback sources");
         return None;
     }
 
     // Try to get credentials from OpenCode auth.json first
     if let Some(auth) = get_anthropic_auth_from_opencode_auth() {
+        tracing::debug!("Found Anthropic credentials in OpenCode auth.json");
         return Some(auth);
     }
+    tracing::debug!("No Anthropic credentials in OpenCode auth.json, trying ai_providers.json");
 
     // Fall back to ai_providers.json
-    get_anthropic_auth_from_ai_providers(working_dir)
+    let result = get_anthropic_auth_from_ai_providers(working_dir);
+    if result.is_none() {
+        tracing::debug!("No Anthropic credentials found in ai_providers.json either");
+    }
+    result
+}
+
+/// Get Anthropic auth from a workspace's OpenCode auth file.
+///
+/// For container workspaces, the auth is stored inside the container filesystem at:
+/// `<workspace_root>/root/.opencode/auth/anthropic.json`
+///
+/// This function handles:
+/// - Container workspaces: checks `<workspace_root>/root/.opencode/auth/anthropic.json`
+/// - Host workspaces: checks nothing (standard paths are handled by get_anthropic_auth_from_opencode_auth)
+///
+/// Returns auth with expiry info to enable freshness comparison.
+pub fn get_anthropic_auth_from_workspace(workspace_root: &std::path::Path) -> Option<ClaudeCodeAuthWithExpiry> {
+    // For container workspaces, look inside the container's root filesystem
+    // The auth file is at: <workspace_root>/root/.opencode/auth/anthropic.json
+    let auth_path = workspace_root
+        .join("root")
+        .join(".opencode")
+        .join("auth")
+        .join("anthropic.json");
+
+    if !auth_path.exists() {
+        tracing::debug!(
+            auth_path = %auth_path.display(),
+            "No workspace auth file found"
+        );
+        return None;
+    }
+
+    tracing::debug!(
+        auth_path = %auth_path.display(),
+        "Found workspace auth file"
+    );
+
+    let contents = match std::fs::read_to_string(&auth_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                auth_path = %auth_path.display(),
+                error = %e,
+                "Failed to read workspace auth file"
+            );
+            return None;
+        }
+    };
+
+    let anthropic_auth: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                auth_path = %auth_path.display(),
+                error = %e,
+                "Failed to parse workspace auth file"
+            );
+            return None;
+        }
+    };
+
+    // Extract expiry timestamp (for OAuth tokens)
+    let expires_at = anthropic_auth.get("expires").and_then(|v| v.as_i64());
+
+    // Check auth type and extract credentials
+    let auth_type = anthropic_auth.get("type").and_then(|v| v.as_str());
+
+    // Determine if this is an OAuth token (for expiry handling)
+    let is_oauth = matches!(auth_type, Some("oauth")) ||
+        (auth_type.is_none() && anthropic_auth.get("access").is_some() && anthropic_auth.get("key").is_none());
+
+    let auth = match auth_type {
+        Some("api_key") | Some("api") => anthropic_auth
+            .get("key")
+            .or_else(|| anthropic_auth.get("api_key"))
+            .and_then(|v| v.as_str())
+            .map(|s| ClaudeCodeAuth::ApiKey(s.to_string())),
+        Some("oauth") => anthropic_auth
+            .get("access")
+            .and_then(|v| v.as_str())
+            .map(|s| ClaudeCodeAuth::OAuthToken(s.to_string())),
+        _ => {
+            // Try key first, then OAuth access token
+            if let Some(key) = anthropic_auth.get("key").and_then(|v| v.as_str()) {
+                Some(ClaudeCodeAuth::ApiKey(key.to_string()))
+            } else {
+                anthropic_auth
+                    .get("access")
+                    .and_then(|v| v.as_str())
+                    .map(|s| ClaudeCodeAuth::OAuthToken(s.to_string()))
+            }
+        }
+    };
+
+    auth.map(|a| ClaudeCodeAuthWithExpiry {
+        auth: a,
+        // API keys don't expire, OAuth tokens have expiry
+        expires_at: if is_oauth { expires_at } else { None },
+    })
+}
+
+/// Get the path to the workspace auth file for container workspaces.
+pub fn get_workspace_auth_path(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    workspace_root
+        .join("root")
+        .join(".opencode")
+        .join("auth")
+        .join("anthropic.json")
+}
+
+/// Get Anthropic auth from host OpenCode auth.json with expiry info.
+pub fn get_anthropic_auth_from_host_with_expiry() -> Option<ClaudeCodeAuthWithExpiry> {
+    let entry = read_oauth_token_entry(ProviderType::Anthropic)?;
+
+    // If there's an OAuth entry with access token
+    if !entry.access_token.is_empty() {
+        return Some(ClaudeCodeAuthWithExpiry {
+            auth: ClaudeCodeAuth::OAuthToken(entry.access_token),
+            expires_at: Some(entry.expires_at),
+        });
+    }
+
+    // Otherwise try to get auth from OpenCode auth.json (might be API key)
+    get_anthropic_auth_from_opencode_auth().map(|auth| ClaudeCodeAuthWithExpiry {
+        auth,
+        expires_at: None, // API keys don't expire
+    })
+}
+
+/// Refresh an expired workspace Anthropic OAuth token.
+/// Reads the refresh token from the workspace auth file, refreshes it via Anthropic API,
+/// and writes the new token back to the same file.
+pub async fn refresh_workspace_anthropic_auth(workspace_root: &std::path::Path) -> Result<ClaudeCodeAuthWithExpiry, String> {
+    let auth_path = get_workspace_auth_path(workspace_root);
+    if !auth_path.exists() {
+        return Err("No workspace auth file found".to_string());
+    }
+
+    // Read the current auth file
+    let contents = std::fs::read_to_string(&auth_path)
+        .map_err(|e| format!("Failed to read workspace auth file: {}", e))?;
+    let anthropic_auth: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Failed to parse workspace auth file: {}", e))?;
+
+    // Check if it's OAuth and get the refresh token
+    let auth_type = anthropic_auth.get("type").and_then(|v| v.as_str());
+    if auth_type != Some("oauth") {
+        return Err("Workspace auth is not OAuth".to_string());
+    }
+
+    let refresh_token = anthropic_auth
+        .get("refresh")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "No refresh token in workspace auth".to_string())?;
+
+    tracing::info!(
+        workspace_path = %workspace_root.display(),
+        "Refreshing expired workspace Anthropic OAuth token"
+    );
+
+    // Exchange refresh token for new access token
+    let client = reqwest::Client::new();
+    let token_response = client
+        .post("https://console.anthropic.com/v1/oauth/token")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", ANTHROPIC_CLIENT_ID),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Failed to refresh token: {}", e))?;
+
+    if !token_response.status().is_success() {
+        let status = token_response.status();
+        let error_text = token_response.text().await.unwrap_or_default();
+        tracing::error!(
+            "Workspace token refresh failed with status {}: {}",
+            status,
+            error_text
+        );
+        // If invalid_grant, delete the stale workspace auth file
+        let lower = error_text.to_lowercase();
+        if (status == reqwest::StatusCode::BAD_REQUEST
+            || status == reqwest::StatusCode::UNAUTHORIZED)
+            && lower.contains("invalid_grant")
+        {
+            if let Err(e) = std::fs::remove_file(&auth_path) {
+                tracing::warn!(
+                    path = %auth_path.display(),
+                    error = %e,
+                    "Failed to remove invalid workspace auth file"
+                );
+            } else {
+                tracing::info!(
+                    path = %auth_path.display(),
+                    "Removed invalid workspace auth file"
+                );
+            }
+        }
+        return Err(format!(
+            "Token refresh failed ({}): {}. You may need to re-authenticate.",
+            status, error_text
+        ));
+    }
+
+    let token_data: serde_json::Value = token_response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+    let new_access_token = token_data["access_token"]
+        .as_str()
+        .ok_or_else(|| "No access token in refresh response".to_string())?;
+
+    let new_refresh_token = token_data["refresh_token"]
+        .as_str()
+        .unwrap_or(refresh_token); // Use old refresh token if not provided
+
+    let expires_in = token_data["expires_in"].as_i64().unwrap_or(3600);
+    let expires_at = chrono::Utc::now().timestamp_millis() + (expires_in * 1000);
+
+    // Write the new token back to the workspace auth file
+    let new_auth = serde_json::json!({
+        "type": "oauth",
+        "access": new_access_token,
+        "refresh": new_refresh_token,
+        "expires": expires_at
+    });
+
+    if let Some(parent) = auth_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create workspace auth directory: {}", e))?;
+    }
+
+    let contents = serde_json::to_string_pretty(&new_auth)
+        .map_err(|e| format!("Failed to serialize auth: {}", e))?;
+    std::fs::write(&auth_path, contents)
+        .map_err(|e| format!("Failed to write workspace auth file: {}", e))?;
+
+    // Also sync to host paths so future missions can use it
+    if let Err(e) = sync_to_opencode_auth(
+        ProviderType::Anthropic,
+        new_refresh_token,
+        new_access_token,
+        expires_at,
+    ) {
+        tracing::warn!("Failed to sync refreshed token to host paths: {}", e);
+    }
+
+    tracing::info!(
+        workspace_path = %workspace_root.display(),
+        "Successfully refreshed workspace Anthropic OAuth token, expires in {} seconds",
+        expires_in
+    );
+
+    Ok(ClaudeCodeAuthWithExpiry {
+        auth: ClaudeCodeAuth::OAuthToken(new_access_token.to_string()),
+        expires_at: Some(expires_at),
+    })
 }
 
 /// Get Anthropic API key or OAuth access token from OpenCode auth.json.
 fn get_anthropic_auth_from_opencode_auth() -> Option<ClaudeCodeAuth> {
-    let auth = read_opencode_auth().ok()?;
-    let anthropic_auth = auth.get("anthropic")?;
+    let auth = match read_opencode_auth() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::debug!("Failed to read OpenCode auth.json: {}", e);
+            return None;
+        }
+    };
+    let anthropic_auth = match auth.get("anthropic") {
+        Some(a) => a,
+        None => {
+            tracing::debug!(
+                "No 'anthropic' key in OpenCode auth.json (keys: {:?})",
+                auth.as_object().map(|o| o.keys().collect::<Vec<_>>())
+            );
+            return None;
+        }
+    };
 
     // Check for API key first
     let auth_type = anthropic_auth.get("type").and_then(|v| v.as_str());
@@ -580,29 +879,88 @@ struct OAuthTokenEntry {
 }
 
 fn read_oauth_token_entry(provider_type: ProviderType) -> Option<OAuthTokenEntry> {
-    let auth = read_opencode_auth().ok()?;
-    for key in opencode_auth_keys(provider_type) {
-        let entry = match auth.get(key) {
-            Some(entry) => entry,
-            None => continue,
-        };
-        let auth_type = entry.get("type").and_then(|v| v.as_str());
-        if auth_type != Some("oauth") {
+    // Search ALL potential auth file paths for the requested provider.
+    // This is important because auth files might be split across different locations
+    // (e.g., /root/.local/share/opencode/auth.json for OpenAI, /var/lib/opencode/... for Anthropic)
+    let auth_paths = get_all_opencode_auth_paths();
+
+    for auth_path in auth_paths {
+        if !auth_path.exists() {
             continue;
         }
 
-        let refresh_token = entry.get("refresh").and_then(|v| v.as_str())?;
-        let access_token = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
-        let expires_at = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+        let contents = match std::fs::read_to_string(&auth_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
 
-        return Some(OAuthTokenEntry {
-            refresh_token: refresh_token.to_string(),
-            access_token: access_token.to_string(),
-            expires_at,
-        });
+        let auth: serde_json::Value = match serde_json::from_str(&contents) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+
+        for key in opencode_auth_keys(provider_type) {
+            let entry = match auth.get(key) {
+                Some(entry) => entry,
+                None => continue,
+            };
+            let auth_type = entry.get("type").and_then(|v| v.as_str());
+            if auth_type != Some("oauth") {
+                continue;
+            }
+
+            let refresh_token = match entry.get("refresh").and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => continue,
+            };
+            let access_token = entry.get("access").and_then(|v| v.as_str()).unwrap_or("");
+            let expires_at = entry.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            tracing::debug!(
+                provider = ?provider_type,
+                auth_path = %auth_path.display(),
+                expires_at = expires_at,
+                "Found OAuth token entry"
+            );
+
+            return Some(OAuthTokenEntry {
+                refresh_token: refresh_token.to_string(),
+                access_token: access_token.to_string(),
+                expires_at,
+            });
+        }
     }
 
     None
+}
+
+/// Get all potential OpenCode auth.json paths to search.
+fn get_all_opencode_auth_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        paths.push(PathBuf::from(data_home).join("opencode").join("auth.json"));
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    paths.push(
+        PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+
+    // OpenCode server's auth path (runs as opencode user)
+    paths.push(
+        PathBuf::from("/var/lib/opencode")
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("auth.json"),
+    );
+
+    paths
 }
 
 fn oauth_token_expired(expires_at: i64) -> bool {
