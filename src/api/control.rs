@@ -3707,8 +3707,10 @@ async fn run_single_control_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             };
-            // Check if this is a continuation turn (has prior history)
-            let is_continuation = !history.is_empty();
+            // Check if this is a continuation turn (has prior assistant response).
+            // Note: history may include the current user message before the turn runs,
+            // so we check for assistant messages to determine if this is truly a continuation.
+            let is_continuation = history.iter().any(|(role, _)| role == "assistant");
             super::mission_runner::run_claudecode_turn(
                 exec_workspace,
                 &ctx.working_dir,

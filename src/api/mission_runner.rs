@@ -942,8 +942,10 @@ async fn run_mission_turn(
     };
 
     // Execute based on backend
-    // For Claude Code, check if this is a continuation turn (has prior history)
-    let is_continuation = !history.is_empty();
+    // For Claude Code, check if this is a continuation turn (has prior assistant response).
+    // Note: history may include the current user message before the turn runs,
+    // so we check for assistant messages to determine if this is truly a continuation.
+    let is_continuation = history.iter().any(|(role, _)| role == "assistant");
     let result = match backend_id.as_str() {
         "claudecode" => {
             run_claudecode_turn(
