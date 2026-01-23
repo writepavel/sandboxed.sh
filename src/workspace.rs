@@ -1815,6 +1815,17 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                             let dest_path = opencode_dir.join("oh-my-opencode.json");
                             match serde_json::to_string_pretty(&settings) {
                                 Ok(content) => {
+                                    let jsonc_path = opencode_dir.join("oh-my-opencode.jsonc");
+                                    if jsonc_path.exists() {
+                                        if let Err(e) = tokio::fs::remove_file(&jsonc_path).await {
+                                            tracing::warn!(
+                                                mission = %mission_id,
+                                                workspace = %workspace.name,
+                                                error = %e,
+                                                "Failed to remove oh-my-opencode.jsonc"
+                                            );
+                                        }
+                                    }
                                     if let Err(e) = tokio::fs::write(&dest_path, content).await {
                                         tracing::warn!(
                                             mission = %mission_id,

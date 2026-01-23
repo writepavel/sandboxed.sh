@@ -17,8 +17,9 @@ import {
   saveClaudeCodeConfig,
   ClaudeCodeConfig,
   listBackendAgents,
+  listProviders,
 } from '@/lib/api';
-import { Save, Loader, AlertCircle, Check, RefreshCw, RotateCcw, Eye, EyeOff, AlertTriangle, X, GitBranch, Upload, Info, FileCode, Terminal } from 'lucide-react';
+import { Save, Loader, AlertCircle, Check, RefreshCw, RotateCcw, Eye, EyeOff, AlertTriangle, X, GitBranch, Upload, Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { ConfigCodeEditor } from '@/components/config-code-editor';
 import { useLibrary } from '@/contexts/library-context';
@@ -63,6 +64,16 @@ export default function SettingsPage() {
   const { data: claudecodeConfig } = useSWR('backend-claudecode-config', () => getBackendConfig('claudecode'), {
     revalidateOnFocus: false,
   });
+
+  const {
+    data: providerCatalogData,
+    isLoading: providerCatalogLoading,
+    mutate: mutateProviderCatalog,
+  } = useSWR('providers-catalog', () => listProviders({ includeAll: true }), {
+    revalidateOnFocus: false,
+  });
+
+  const providerCatalog = providerCatalogData?.providers ?? [];
 
   // Filter to only enabled backends
   const enabledBackends = backends.filter((b) => {
@@ -121,6 +132,13 @@ export default function SettingsPage() {
     JSON.stringify(openAgentConfig) !== JSON.stringify(originalOpenAgentConfig);
   const isClaudeCodeDirty =
     JSON.stringify(claudeCodeConfig) !== JSON.stringify(originalClaudeCodeConfig);
+
+  const anthropicModels =
+    providerCatalog.find((provider) => provider.id === 'anthropic')?.models ?? [];
+  const claudeDefaultModel = claudeCodeConfig.default_model || '';
+  const claudeDefaultModelKnown =
+    claudeDefaultModel.length === 0 ||
+    anthropicModels.some((model) => model.id === claudeDefaultModel);
 
   // Check if Library and System settings are in sync (ignoring whitespace differences)
   const normalizeJson = (s: string) => {
@@ -613,6 +631,67 @@ export default function SettingsPage() {
             language="json"
           />
         </div>
+
+        {/* Supported Models */}
+        <div className="rounded-xl bg-white/[0.02] border border-white/[0.06] p-5 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-medium text-white/80">Supported Models</h3>
+              <p className="text-xs text-white/50">Available model overrides for OpenCode agents.</p>
+            </div>
+            <button
+              onClick={() => mutateProviderCatalog()}
+              disabled={providerCatalogLoading}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={cn('h-3 w-3', providerCatalogLoading && 'animate-spin')} />
+              Refresh
+            </button>
+          </div>
+
+          {providerCatalogLoading ? (
+            <div className="text-xs text-white/40 flex items-center gap-2">
+              <Loader className="h-3 w-3 animate-spin" />
+              Loading models…
+            </div>
+          ) : providerCatalog.length === 0 ? (
+            <p className="text-xs text-white/40">
+              No providers found. Connect providers in Settings → AI Providers.
+            </p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {providerCatalog.map((provider) => (
+                <div
+                  key={provider.id}
+                  className="rounded-lg border border-white/[0.06] bg-white/[0.03] p-3"
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm text-white/80">{provider.name}</span>
+                    <span className="text-[10px] uppercase tracking-wide text-white/40">
+                      {provider.id}
+                    </span>
+                  </div>
+                  {provider.models.length === 0 ? (
+                    <span className="text-xs text-white/40">No models listed</span>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {provider.models.map((model) => (
+                        <div
+                          key={`${provider.id}/${model.id}`}
+                          className="px-2 py-1 rounded-md border border-white/[0.06] bg-white/[0.02] text-xs text-white/80"
+                          title={`${provider.id}/${model.id}`}
+                        >
+                          <div className="font-medium">{model.name || model.id}</div>
+                          <div className="text-[10px] text-white/40">{model.id}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* OpenAgent Settings Section */}
@@ -782,18 +861,35 @@ export default function SettingsPage() {
           <div className="space-y-2">
             <h3 className="text-sm font-medium text-white/80">Default Model</h3>
             <p className="text-xs text-white/50">Model used for new Claude Code missions if not overridden.</p>
-            <input
-              type="text"
-              value={claudeCodeConfig.default_model || ''}
+            <select
+              value={claudeDefaultModel}
               onChange={(e) =>
                 setClaudeCodeConfig((prev) => ({
                   ...prev,
                   default_model: e.target.value || null,
                 }))
               }
-              placeholder="claude-sonnet-4-20250514"
-              className="w-full max-w-md px-3 py-2 text-sm text-white bg-white/[0.04] border border-white/[0.08] rounded-lg placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
-            />
+              className="w-full max-w-md px-3 py-2 text-sm text-white bg-white/[0.04] border border-white/[0.08] rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/50"
+            >
+              <option value="">Default (Claude Code default)</option>
+              {anthropicModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.name || model.id}
+                </option>
+              ))}
+              {!claudeDefaultModelKnown && claudeDefaultModel && (
+                <option value={claudeDefaultModel}>
+                  {claudeDefaultModel} (custom)
+                </option>
+              )}
+            </select>
+            <p className="text-xs text-white/30">
+              {providerCatalogLoading
+                ? 'Loading Anthropic models…'
+                : anthropicModels.length === 0
+                  ? 'No Anthropic models found. Connect Anthropic in Settings → AI Providers.'
+                  : 'Choose from supported Anthropic models.'}
+            </p>
           </div>
 
           {/* Default Agent */}
@@ -864,43 +960,6 @@ export default function SettingsPage() {
               </div>
             </div>
           )}
-
-          {/* Configuration Links */}
-          <div className="p-5 rounded-xl bg-white/[0.02] border border-white/[0.06] space-y-4 mt-6">
-            <div className="flex items-center gap-2">
-              <FileCode className="h-5 w-5 text-emerald-400" />
-              <h3 className="text-sm font-medium text-white">Additional Configuration</h3>
-            </div>
-            <p className="text-sm text-white/50">
-              Claude Code generates <code className="text-emerald-400 bg-white/[0.04] px-1.5 py-0.5 rounded">CLAUDE.md</code> and <code className="text-emerald-400 bg-white/[0.04] px-1.5 py-0.5 rounded">.claude/settings.local.json</code> per-workspace from your Library.
-            </p>
-            <div className="grid gap-3">
-              <a
-                href="/config/skills"
-                className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.06] hover:bg-white/[0.04] hover:border-white/[0.08] transition-colors"
-              >
-                <div className="p-2 rounded-lg bg-violet-500/10">
-                  <FileCode className="h-4 w-4 text-violet-400" />
-                </div>
-                <div>
-                  <p className="text-white/80 font-medium">Skills</p>
-                  <p className="text-xs text-white/40">System prompts and context for Claude</p>
-                </div>
-              </a>
-              <a
-                href="/config/mcps"
-                className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.06] hover:bg-white/[0.04] hover:border-white/[0.08] transition-colors"
-              >
-                <div className="p-2 rounded-lg bg-emerald-500/10">
-                  <Terminal className="h-4 w-4 text-emerald-400" />
-                </div>
-                <div>
-                  <p className="text-white/80 font-medium">MCP Servers</p>
-                  <p className="text-xs text-white/40">Tool servers Claude can access</p>
-                </div>
-              </a>
-            </div>
-          </div>
 
           {/* Backend Settings Link */}
           <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/20">

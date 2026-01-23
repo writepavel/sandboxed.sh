@@ -1354,6 +1354,53 @@ pub fn extract_text(parts: &[serde_json::Value]) -> String {
     out.join("\n")
 }
 
+fn is_opencode_status_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("starting opencode server") {
+        return true;
+    }
+    if lower.starts_with("opencode server started") {
+        return true;
+    }
+    if lower.starts_with("sending prompt") {
+        return true;
+    }
+    if lower.starts_with("waiting for completion") {
+        return true;
+    }
+    if lower.starts_with("all tasks completed") {
+        return true;
+    }
+    if lower.starts_with("session ended with error") {
+        return true;
+    }
+    if lower.starts_with("[session.error]") {
+        return true;
+    }
+    if lower.starts_with("session:") || lower.contains("session: ses_") {
+        return true;
+    }
+    if lower.contains("starting opencode server") {
+        return true;
+    }
+    false
+}
+
+fn strip_opencode_status_lines(text: &str) -> String {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if is_opencode_status_line(line) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
+}
+
 /// Extract reasoning/thinking content from message parts.
 /// This handles both "reasoning" and "thinking" part types.
 pub fn extract_reasoning(parts: &[serde_json::Value]) -> Option<String> {
@@ -1361,7 +1408,7 @@ pub fn extract_reasoning(parts: &[serde_json::Value]) -> Option<String> {
     for part in parts {
         let part_type = part.get("type").and_then(|v| v.as_str());
         if matches!(part_type, Some("reasoning") | Some("thinking")) {
-            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+            if let Some(text) = extract_part_text(part, part_type.unwrap_or("thinking")) {
                 if !text.is_empty() {
                     out.push(text.to_string());
                 }
@@ -1371,7 +1418,13 @@ pub fn extract_reasoning(parts: &[serde_json::Value]) -> Option<String> {
     if out.is_empty() {
         None
     } else {
-        Some(out.join("\n"))
+        let combined = out.join("\n");
+        let cleaned = strip_opencode_status_lines(&combined);
+        if cleaned.trim().is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
     }
 }
 

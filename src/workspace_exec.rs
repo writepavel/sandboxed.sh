@@ -117,8 +117,80 @@ impl WorkspaceExec {
         escaped
     }
 
-    fn build_shell_command(rel_cwd: &str, program: &str, args: &[String]) -> String {
+    /// Build a shell command with optional env var exports.
+    /// When `env` is provided, all env vars are exported before running the program.
+    /// This is needed for nsenter where env vars don't propagate into the container.
+    fn build_shell_command_with_env(
+        rel_cwd: &str,
+        program: &str,
+        args: &[String],
+        env: Option<&HashMap<String, String>>,
+    ) -> String {
         let mut cmd = String::new();
+
+        // Export env vars inside the shell command so they're available in the container
+        if let Some(env) = env {
+            for (k, v) in env {
+                if k.trim().is_empty() {
+                    continue;
+                }
+                cmd.push_str("export ");
+                cmd.push_str(k);
+                cmd.push('=');
+                cmd.push_str(&Self::shell_escape(v));
+                cmd.push_str("; ");
+            }
+        }
+
+        cmd.push_str("cd ");
+        cmd.push_str(&Self::shell_escape(rel_cwd));
+        cmd.push_str(" && exec ");
+        cmd.push_str(&Self::shell_escape(program));
+        for arg in args {
+            cmd.push(' ');
+            cmd.push_str(&Self::shell_escape(arg));
+        }
+        cmd
+    }
+
+    /// Build a shell command that bootstraps Tailscale networking before running the program.
+    ///
+    /// This runs the openagent-tailscale-up script (which also calls openagent-network-up)
+    /// to bring up the veth interface, get an IP via DHCP, start tailscaled, and authenticate.
+    /// The scripts are installed by the workspace template's init_script.
+    fn build_tailscale_bootstrap_command(
+        rel_cwd: &str,
+        program: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> String {
+        let mut cmd = String::new();
+
+        // Export TS_* env vars so the bootstrap script can use them.
+        // These are also passed via --setenv, but the shell script needs them exported.
+        for (k, v) in env {
+            if k.starts_with("TS_") && !v.trim().is_empty() {
+                cmd.push_str("export ");
+                cmd.push_str(k);
+                cmd.push('=');
+                cmd.push_str(&Self::shell_escape(v));
+                cmd.push_str("; ");
+            }
+        }
+
+        // Run the Tailscale bootstrap script if it exists.
+        // The script is expected to:
+        // 1. Bring up the host0 veth interface with DHCP
+        // 2. Start tailscaled daemon
+        // 3. Authenticate and connect to the exit node
+        // Errors are suppressed to allow the main program to run even if networking fails.
+        cmd.push_str(
+            "if [ -x /usr/local/bin/openagent-tailscale-up ]; then \
+             /usr/local/bin/openagent-tailscale-up >/dev/null 2>&1 || true; \
+             fi; ",
+        );
+
+        // Change to the working directory and exec the main program.
         cmd.push_str("cd ");
         cmd.push_str(&Self::shell_escape(rel_cwd));
         cmd.push_str(" && exec ");
@@ -179,7 +251,10 @@ impl WorkspaceExec {
             "nsenter"
         };
         let rel_cwd = self.rel_path_in_container(cwd);
-        let shell_cmd = Self::build_shell_command(&rel_cwd, program, args);
+        // Build shell command with env exports - nsenter doesn't pass env vars
+        // into the container namespace, so we need to export them in the shell.
+        let env_ref = if env.is_empty() { None } else { Some(&env) };
+        let shell_cmd = Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref);
         let mut cmd = Command::new(nsenter);
         cmd.args([
             "--target",
@@ -193,9 +268,8 @@ impl WorkspaceExec {
             "-lc",
         ]);
         cmd.arg(shell_cmd);
-        if !env.is_empty() {
-            cmd.envs(env);
-        }
+        // Note: env vars are now exported in the shell command, not here.
+        // Setting them here with cmd.envs() doesn't propagate into the container.
         cmd.stdin(stdin).stdout(stdout).stderr(stderr);
         Ok(cmd)
     }
@@ -258,7 +332,7 @@ impl WorkspaceExec {
                 cmd.arg("--quiet");
                 cmd.arg("--timezone=off");
                 cmd.arg("--console=pipe");
-                cmd.arg("--chdir").arg(rel_cwd);
+                cmd.arg("--chdir").arg(&rel_cwd);
 
                 // Ensure /root/context is available if Open Agent configured it.
                 let context_dir_name = std::env::var("OPEN_AGENT_CONTEXT_DIR_NAME")
@@ -292,30 +366,76 @@ impl WorkspaceExec {
 
                 // Network configuration.
                 let use_shared_network = self.workspace.shared_network.unwrap_or(true);
-                if use_shared_network {
+                tracing::debug!(
+                    workspace = %self.workspace.name,
+                    shared_network = ?self.workspace.shared_network,
+                    use_shared_network = %use_shared_network,
+                    "WorkspaceExec: checking network configuration"
+                );
+                let tailscale_enabled = if use_shared_network {
+                    tracing::debug!("WorkspaceExec: shared_network=true, binding resolv.conf");
                     cmd.arg("--bind-ro=/etc/resolv.conf");
+                    false
                 } else {
                     // If Tailscale is configured, it will set up networking; otherwise bind DNS.
                     let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
+                    tracing::debug!(
+                        tailscale_args = ?tailscale_args,
+                        "WorkspaceExec: checking Tailscale args"
+                    );
                     if tailscale_args.is_empty() {
+                        tracing::debug!("WorkspaceExec: no Tailscale args, binding resolv.conf");
                         cmd.arg("--bind-ro=/etc/resolv.conf");
+                        false
                     } else {
+                        tracing::info!(
+                            workspace = %self.workspace.name,
+                            "WorkspaceExec: Tailscale networking enabled, will bootstrap"
+                        );
                         for a in tailscale_args {
                             cmd.arg(a);
                         }
+                        true
                     }
-                }
+                };
 
                 // Set env vars inside the container.
-                for (k, v) in env {
+                for (k, v) in &env {
                     if k.trim().is_empty() {
                         continue;
                     }
                     cmd.arg(format!("--setenv={}={}", k, v));
                 }
 
-                cmd.arg(program);
-                cmd.args(args);
+                // When Tailscale is enabled, wrap the command in a shell that bootstraps
+                // networking before running the actual program. The bootstrap scripts
+                // are installed by the workspace template's init_script.
+                if tailscale_enabled {
+                    // Build a shell command that:
+                    // 1. Runs openagent-tailscale-up (which also calls openagent-network-up)
+                    // 2. Execs the actual program to hand off control
+                    let shell_cmd = Self::build_tailscale_bootstrap_command(&rel_cwd, program, args, &env);
+                    tracing::info!(
+                        workspace = %self.workspace.name,
+                        program = %program,
+                        "WorkspaceExec: running with Tailscale bootstrap"
+                    );
+                    tracing::debug!(
+                        shell_cmd = %shell_cmd,
+                        "WorkspaceExec: Tailscale bootstrap shell command"
+                    );
+                    cmd.arg("/bin/sh");
+                    cmd.arg("-c");
+                    cmd.arg(shell_cmd);
+                } else {
+                    tracing::debug!(
+                        workspace = %self.workspace.name,
+                        program = %program,
+                        "WorkspaceExec: running without Tailscale bootstrap"
+                    );
+                    cmd.arg(program);
+                    cmd.args(args);
+                }
 
                 cmd.stdin(stdin).stdout(stdout).stderr(stderr);
                 Ok(cmd)

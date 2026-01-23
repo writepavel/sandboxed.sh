@@ -107,6 +107,9 @@ pub struct Delta {
     pub text: Option<String>,
     #[serde(default)]
     pub partial_json: Option<String>,
+    /// Thinking content for thinking_delta events (extended thinking).
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

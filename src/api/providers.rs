@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use axum::{extract::State, Json};
+use axum::{extract::{Query, State}, Json};
 use serde::{Deserialize, Serialize};
 
 use super::routes::AppState;
@@ -37,6 +37,14 @@ pub struct Provider {
     pub description: String,
     /// Available models from this provider
     pub models: Vec<ProviderModel>,
+}
+
+/// Query parameters for providers endpoint.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProvidersQuery {
+    /// Include providers even if they are not configured/authenticated.
+    #[serde(default)]
+    pub include_all: bool,
 }
 
 /// Response for the providers endpoint.
@@ -163,6 +171,29 @@ fn default_providers_config() -> ProvidersConfig {
                     },
                 ],
             },
+            Provider {
+                id: "xai".to_string(),
+                name: "xAI (API Key)".to_string(),
+                billing: "pay-per-token".to_string(),
+                description: "Grok models via xAI API key".to_string(),
+                models: vec![
+                    ProviderModel {
+                        id: "grok-2".to_string(),
+                        name: "Grok 2".to_string(),
+                        description: Some("Most capable Grok model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-2-mini".to_string(),
+                        name: "Grok 2 Mini".to_string(),
+                        description: Some("Faster, lighter Grok model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "grok-2-vision".to_string(),
+                        name: "Grok 2 Vision".to_string(),
+                        description: Some("Vision-capable Grok model".to_string()),
+                    },
+                ],
+            },
         ],
     }
 }
@@ -182,7 +213,7 @@ fn has_valid_auth(value: &serde_json::Value) -> bool {
 }
 
 /// Get the set of configured provider IDs from OpenCode's auth files.
-fn get_configured_provider_ids() -> HashSet<String> {
+fn get_configured_provider_ids(working_dir: &std::path::Path) -> HashSet<String> {
     let mut configured = HashSet::new();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
 
@@ -221,6 +252,7 @@ fn get_configured_provider_ids() -> HashSet<String> {
         ProviderType::OpenAI,
         ProviderType::Google,
         ProviderType::GithubCopilot,
+        ProviderType::Xai,
     ] {
         let auth_file = provider_auth_dir.join(format!("{}.json", provider_type.id()));
         if let Ok(contents) = std::fs::read_to_string(&auth_file) {
@@ -242,6 +274,18 @@ fn get_configured_provider_ids() -> HashSet<String> {
         }
     }
 
+    // 3. Check Open Agent provider config (.openagent/ai_providers.json)
+    let ai_providers_path = working_dir.join(".openagent").join("ai_providers.json");
+    if let Ok(contents) = std::fs::read_to_string(&ai_providers_path) {
+        if let Ok(providers) = serde_json::from_str::<Vec<crate::ai_providers::AIProvider>>(&contents) {
+            for provider in providers {
+                if provider.enabled && provider.has_credentials() {
+                    configured.insert(provider.provider_type.id().to_string());
+                }
+            }
+        }
+    }
+
     tracing::debug!("Configured providers: {:?}", configured);
     configured
 }
@@ -252,21 +296,28 @@ fn get_configured_provider_ids() -> HashSet<String> {
 /// and descriptions. Only includes providers that are actually configured
 /// and authenticated. This endpoint is used by the frontend to render
 /// a grouped model selector.
-pub async fn list_providers(State(state): State<Arc<AppState>>) -> Json<ProvidersResponse> {
+pub async fn list_providers(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProvidersQuery>,
+) -> Json<ProvidersResponse> {
     let working_dir = state.config.working_dir.to_string_lossy().to_string();
     let config = load_providers_config(&working_dir);
 
     // Get the set of configured provider IDs
-    let configured = get_configured_provider_ids();
+    let configured = get_configured_provider_ids(state.config.working_dir.as_path());
 
-    // Filter providers to only include those that are configured
-    let filtered_providers: Vec<Provider> = config
-        .providers
-        .into_iter()
-        .filter(|p| configured.contains(&p.id))
-        .collect();
+    let providers = if query.include_all {
+        config.providers
+    } else {
+        // Filter providers to only include those that are configured
+        config
+            .providers
+            .into_iter()
+            .filter(|p| configured.contains(&p.id))
+            .collect()
+    };
 
     Json(ProvidersResponse {
-        providers: filtered_providers,
+        providers,
     })
 }

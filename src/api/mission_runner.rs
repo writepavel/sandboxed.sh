@@ -10,7 +10,7 @@
 //! - Health monitoring
 //! - Working directory (isolated per mission)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,6 +22,7 @@ use crate::agents::{AgentRef, AgentResult, TerminalReason};
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
 use crate::config::Config;
 use crate::mcp::McpRegistry;
+use crate::opencode::{extract_reasoning, extract_text};
 use crate::secrets::SecretsStore;
 use crate::task::{extract_deliverables, DeliverableSet};
 use crate::workspace::{self, Workspace, WorkspaceType};
@@ -31,6 +32,413 @@ use super::control::{
     AgentEvent, AgentTreeNode, ControlStatus, ExecutionProgress, FrontendToolHub,
 };
 use super::library::SharedLibrary;
+
+#[derive(Debug, Default)]
+struct OpencodeSseState {
+    message_roles: HashMap<String, String>,
+    part_buffers: HashMap<String, String>,
+    emitted_tool_calls: HashMap<String, ()>,
+    emitted_tool_results: HashMap<String, ()>,
+    response_tool_args: HashMap<String, String>,
+    response_tool_names: HashMap<String, String>,
+    last_emitted_thinking: Option<String>,
+}
+
+struct OpencodeSseParseResult {
+    event: Option<AgentEvent>,
+    message_complete: bool,
+    session_id: Option<String>,
+}
+
+fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(v) = value.get(*key).and_then(|v| v.as_str()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option<&'a str> {
+    if part_type == "thinking" || part_type == "reasoning" {
+        extract_str(part, &["thinking", "text", "content"])
+    } else {
+        extract_str(part, &["text", "content", "output_text"])
+    }
+}
+
+fn is_opencode_status_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("starting opencode server") {
+        return true;
+    }
+    if lower.starts_with("opencode server started") {
+        return true;
+    }
+    if lower.starts_with("sending prompt") {
+        return true;
+    }
+    if lower.starts_with("waiting for completion") {
+        return true;
+    }
+    if lower.starts_with("all tasks completed") {
+        return true;
+    }
+    if lower.starts_with("session ended with error") {
+        return true;
+    }
+    if lower.starts_with("[session.error]") {
+        return true;
+    }
+    if lower.starts_with("session:") || lower.contains("session: ses_") {
+        return true;
+    }
+    if lower.contains("starting opencode server") {
+        return true;
+    }
+    false
+}
+
+fn strip_opencode_status_lines(text: &str) -> String {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if is_opencode_status_line(line) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
+}
+
+fn handle_tool_part_update(
+    part: &serde_json::Value,
+    state: &mut OpencodeSseState,
+    mission_id: Uuid,
+) -> Option<AgentEvent> {
+    let state_obj = part.get("state")?;
+    let status = state_obj.get("status").and_then(|v| v.as_str())?;
+
+    let tool_call_id = part
+        .get("callID")
+        .or_else(|| part.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let tool_name = part
+        .get("tool")
+        .or_else(|| part.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    match status {
+        "running" => {
+            if state.emitted_tool_calls.contains_key(&tool_call_id) {
+                return None;
+            }
+            state.emitted_tool_calls.insert(tool_call_id.clone(), ());
+            let args = state_obj
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(AgentEvent::ToolCall {
+                tool_call_id,
+                name: tool_name,
+                args,
+                mission_id: Some(mission_id),
+            })
+        }
+        "completed" => {
+            if state.emitted_tool_results.contains_key(&tool_call_id) {
+                return None;
+            }
+            state.emitted_tool_results.insert(tool_call_id.clone(), ());
+            let result = state_obj
+                .get("output")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(AgentEvent::ToolResult {
+                tool_call_id,
+                name: tool_name,
+                result,
+                mission_id: Some(mission_id),
+            })
+        }
+        "error" => {
+            if state.emitted_tool_results.contains_key(&tool_call_id) {
+                return None;
+            }
+            state.emitted_tool_results.insert(tool_call_id.clone(), ());
+            let error_msg = state_obj
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            let result = serde_json::json!({ "error": error_msg });
+            Some(AgentEvent::ToolResult {
+                tool_call_id,
+                name: tool_name,
+                result,
+                mission_id: Some(mission_id),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn handle_part_update(
+    props: &serde_json::Value,
+    state: &mut OpencodeSseState,
+    mission_id: Uuid,
+) -> Option<AgentEvent> {
+    let part = props.get("part")?;
+    let part_type = part.get("type").and_then(|v| v.as_str())?;
+
+    if part_type == "tool" {
+        return handle_tool_part_update(part, state, mission_id);
+    }
+
+    if !matches!(part_type, "thinking" | "reasoning") {
+        return None;
+    }
+
+    let part_id = extract_str(part, &["id", "partID", "partId"]);
+    let message_id = extract_str(part, &["messageID", "messageId", "message_id"])
+        .or_else(|| extract_str(props, &["messageID", "messageId", "message_id"]));
+    if let Some(message_id) = message_id {
+        if let Some(role) = state.message_roles.get(message_id) {
+            if role != "assistant" {
+                return None;
+            }
+        }
+    }
+
+    let delta = props.get("delta").and_then(|v| v.as_str());
+    let full_text = extract_part_text(part, part_type);
+    let buffer_key = part_id.or(message_id).unwrap_or(part_type).to_string();
+    let buffer = state.part_buffers.entry(buffer_key).or_default();
+
+    let content = if let Some(delta) = delta {
+        if !delta.is_empty() || full_text.is_none() {
+            buffer.push_str(delta);
+            buffer.clone()
+        } else if let Some(full) = full_text {
+            *buffer = full.to_string();
+            buffer.clone()
+        } else {
+            return None;
+        }
+    } else if let Some(full) = full_text {
+        *buffer = full.to_string();
+        buffer.clone()
+    } else {
+        return None;
+    };
+
+    let filtered = strip_opencode_status_lines(&content);
+    if filtered != content {
+        *buffer = filtered.clone();
+    }
+    let content = filtered;
+
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    if state.last_emitted_thinking.as_ref() == Some(&content) {
+        return None;
+    }
+    state.last_emitted_thinking = Some(content.clone());
+
+    Some(AgentEvent::Thinking {
+        content,
+        done: false,
+        mission_id: Some(mission_id),
+    })
+}
+
+fn parse_opencode_sse_event(
+    data_str: &str,
+    event_name: Option<&str>,
+    current_session_id: Option<&str>,
+    state: &mut OpencodeSseState,
+    mission_id: Uuid,
+) -> Option<OpencodeSseParseResult> {
+    let json: serde_json::Value = match serde_json::from_str(data_str) {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+
+    let event_type = match json.get("type").and_then(|v| v.as_str()).or(event_name) {
+        Some(event_type) => event_type,
+        None => return None,
+    };
+    let props = json
+        .get("properties")
+        .cloned()
+        .unwrap_or_else(|| json.clone());
+
+    let event_session_id = props
+        .get("sessionID")
+        .or_else(|| props.get("info").and_then(|v| v.get("sessionID")))
+        .or_else(|| props.get("part").and_then(|v| v.get("sessionID")))
+        .and_then(|v| v.as_str());
+
+    if let Some(expected) = current_session_id {
+        if let Some(actual) = event_session_id {
+            if actual != expected {
+                return None;
+            }
+        }
+    }
+
+    let mut session_id = None;
+    if current_session_id.is_none() {
+        if let Some(actual) = event_session_id {
+            session_id = Some(actual.to_string());
+        }
+    }
+
+    let mut message_complete = false;
+    let event = match event_type {
+        "response.output_text.delta" => None,
+        "response.completed" | "response.incomplete" => {
+            message_complete = true;
+            None
+        }
+        "response.output_item.added" => {
+            if let Some(item) = props.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    state.response_tool_names.insert(call_id.clone(), name);
+                    if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
+                        if !args.is_empty() {
+                            state
+                                .response_tool_args
+                                .insert(call_id.clone(), args.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "response.function_call_arguments.delta" => {
+            let call_id = props
+                .get("item_id")
+                .or_else(|| props.get("call_id"))
+                .or_else(|| props.get("id"))
+                .and_then(|v| v.as_str());
+            let delta = props.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            if let (Some(call_id), false) = (call_id, delta.is_empty()) {
+                let entry = state
+                    .response_tool_args
+                    .entry(call_id.to_string())
+                    .or_default();
+                entry.push_str(delta);
+            }
+            None
+        }
+        "response.output_item.done" => {
+            if let Some(item) = props.get("item") {
+                if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if state.emitted_tool_calls.contains_key(&call_id) {
+                        None
+                    } else {
+                        let name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| state.response_tool_names.get(&call_id).cloned())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let args_str = item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .or_else(|| state.response_tool_args.get(&call_id).cloned())
+                            .unwrap_or_default();
+                        let args = if args_str.trim().is_empty() {
+                            serde_json::json!({})
+                        } else {
+                            serde_json::from_str(&args_str)
+                                .unwrap_or_else(|_| serde_json::json!({ "arguments": args_str }))
+                        };
+                        state.emitted_tool_calls.insert(call_id.clone(), ());
+                        Some(AgentEvent::ToolCall {
+                            tool_call_id: call_id,
+                            name,
+                            args,
+                            mission_id: Some(mission_id),
+                        })
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        "message.updated" => {
+            if let Some(info) = props.get("info") {
+                if let (Some(id), Some(role)) = (
+                    info.get("id").and_then(|v| v.as_str()),
+                    info.get("role").and_then(|v| v.as_str()),
+                ) {
+                    state.message_roles.insert(id.to_string(), role.to_string());
+                }
+            }
+            if props.get("part").is_some() {
+                handle_part_update(&props, state, mission_id)
+            } else {
+                None
+            }
+        }
+        "message.part.updated" => handle_part_update(&props, state, mission_id),
+        "message.completed" | "assistant.message.completed" => {
+            message_complete = true;
+            None
+        }
+        "error" | "message.error" => {
+            let message = props
+                .get("message")
+                .or(props.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error")
+                .to_string();
+            Some(AgentEvent::Error {
+                message,
+                mission_id: Some(mission_id),
+                resumable: true,
+            })
+        }
+        _ => None,
+    };
+
+    Some(OpencodeSseParseResult {
+        event,
+        message_complete,
+        session_id,
+    })
+}
 
 /// State of a running mission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -812,12 +1220,14 @@ pub async fn run_claudecode_turn(
     let session_id = Uuid::new_v4().to_string();
 
     let workspace_exec = WorkspaceExec::new(workspace.clone());
-    if let Err(err_msg) =
-        ensure_claudecode_cli_available(&workspace_exec, work_dir, &cli_path).await
+    let cli_path = match ensure_claudecode_cli_available(&workspace_exec, work_dir, &cli_path).await
     {
-        tracing::error!("{}", err_msg);
-        return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-    }
+        Ok(path) => path,
+        Err(err_msg) => {
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
 
     tracing::info!(
         mission_id = %mission_id,
@@ -871,18 +1281,38 @@ pub async fn run_claudecode_turn(
         match auth {
             ClaudeCodeAuth::OAuthToken(token) => {
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
-                tracing::debug!("Using OAuth token for Claude CLI authentication");
+                tracing::debug!(
+                    "Using OAuth token for Claude CLI authentication (token_len={})",
+                    token.len()
+                );
             }
             ClaudeCodeAuth::ApiKey(key) => {
                 env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
                 tracing::debug!("Using API key for Claude CLI authentication");
             }
         }
+    } else {
+        tracing::warn!("No authentication available for Claude Code!");
     }
+
+    // Handle case where cli_path might be a wrapper command like "bun /path/to/claude"
+    let (program, mut full_args) = if cli_path.contains(' ') {
+        let parts: Vec<&str> = cli_path.splitn(2, ' ').collect();
+        let program = parts[0].to_string();
+        let mut full_args = if parts.len() > 1 {
+            vec![parts[1].to_string()]
+        } else {
+            vec![]
+        };
+        full_args.extend(args.clone());
+        (program, full_args)
+    } else {
+        (cli_path.clone(), args.clone())
+    };
 
     // Use WorkspaceExec to spawn the CLI in the correct workspace context
     let mut child = match workspace_exec
-        .spawn_streaming(work_dir, &cli_path, &args, env)
+        .spawn_streaming(work_dir, &program, &full_args, env)
         .await
     {
         Ok(child) => child,
@@ -988,42 +1418,45 @@ pub async fn run_claudecode_turn(
                             ClaudeEvent::StreamEvent(wrapper) => {
                                 match wrapper.event {
                                     StreamEvent::ContentBlockDelta { index, delta } => {
-                                        // Only process deltas that have text content
-                                        if let Some(text) = delta.text {
-                                            if text.is_empty() {
-                                                continue;
-                                            }
+                                        // Check the delta type to determine where to route content
+                                        // "thinking_delta" -> thinking panel (uses delta.thinking field)
+                                        // "text_delta" -> text output (uses delta.text field)
+                                        if delta.delta_type == "thinking_delta" {
+                                            // For thinking deltas, content is in the `thinking` field, not `text`
+                                            if let Some(thinking_text) = delta.thinking {
+                                                if !thinking_text.is_empty() {
+                                                    // Accumulate thinking content
+                                                    let buffer = thinking_buffer.entry(index).or_default();
+                                                    buffer.push_str(&thinking_text);
 
-                                            // Check the delta type to determine where to route content
-                                            // "thinking_delta" -> thinking panel
-                                            // "text_delta" -> text output (not thinking)
-                                            if delta.delta_type == "thinking_delta" {
-                                                // Accumulate thinking content
-                                                let buffer = thinking_buffer.entry(index).or_default();
-                                                buffer.push_str(&text);
+                                                    // Send accumulated thinking content (cumulative, like OpenCode)
+                                                    // Only send if we have new content since last emit
+                                                    let total_len = thinking_buffer.values().map(|s| s.len()).sum::<usize>();
+                                                    if total_len > last_thinking_len {
+                                                        // Combine all thinking buffers for the cumulative content
+                                                        let accumulated: String = thinking_buffer.values().cloned().collect::<Vec<_>>().join("");
+                                                        last_thinking_len = total_len;
 
-                                                // Send accumulated thinking content (cumulative, like OpenCode)
-                                                // Only send if we have new content since last emit
-                                                let total_len = thinking_buffer.values().map(|s| s.len()).sum::<usize>();
-                                                if total_len > last_thinking_len {
-                                                    // Combine all thinking buffers for the cumulative content
-                                                    let accumulated: String = thinking_buffer.values().cloned().collect::<Vec<_>>().join("");
-                                                    last_thinking_len = total_len;
-
-                                                    let _ = events_tx.send(AgentEvent::Thinking {
-                                                        content: accumulated,
-                                                        done: false,
-                                                        mission_id: Some(mission_id),
-                                                    });
+                                                        let _ = events_tx.send(AgentEvent::Thinking {
+                                                            content: accumulated,
+                                                            done: false,
+                                                            mission_id: Some(mission_id),
+                                                        });
+                                                    }
                                                 }
-                                            } else if delta.delta_type == "text_delta" {
-                                                // Accumulate text content (will be used for final response)
-                                                let buffer = text_buffer.entry(index).or_default();
-                                                buffer.push_str(&text);
-                                                // Don't send text deltas as thinking events
                                             }
-                                            // Ignore other delta types (e.g., input_json_delta for tool use)
+                                        } else if delta.delta_type == "text_delta" {
+                                            // For text deltas, content is in the `text` field
+                                            if let Some(text) = delta.text {
+                                                if !text.is_empty() {
+                                                    // Accumulate text content (will be used for final response)
+                                                    let buffer = text_buffer.entry(index).or_default();
+                                                    buffer.push_str(&text);
+                                                    // Don't send text deltas as thinking events
+                                                }
+                                            }
                                         }
+                                        // Ignore other delta types (e.g., input_json_delta for tool use)
                                     }
                                     StreamEvent::ContentBlockStart { index, content_block } => {
                                         // Track the block type so we know how to handle deltas
@@ -1441,25 +1874,66 @@ fn host_oh_my_opencode_config_is_fallback() -> Option<bool> {
     None
 }
 
-fn detect_opencode_provider_auth() -> (bool, bool, bool) {
+struct OpenCodeAuthState {
+    has_openai: bool,
+    has_anthropic: bool,
+    has_google: bool,
+    has_other: bool,
+}
+
+fn auth_entry_has_credentials(value: &serde_json::Value) -> bool {
+    value.get("key").is_some()
+        || value.get("api_key").is_some()
+        || value.get("apiKey").is_some()
+        || value.get("refresh").is_some()
+        || value.get("refresh_token").is_some()
+        || value.get("access").is_some()
+        || value.get("access_token").is_some()
+}
+
+fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> OpenCodeAuthState {
     let mut has_openai = false;
     let mut has_anthropic = false;
     let mut has_google = false;
+    let mut has_other = false;
 
     if let Some(path) = host_opencode_auth_path() {
         if let Ok(contents) = std::fs::read_to_string(path) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
-                has_openai |= parsed.get("openai").is_some() || parsed.get("codex").is_some();
-                has_anthropic |= parsed.get("anthropic").is_some();
-                has_google |= parsed.get("google").is_some();
+                if let Some(map) = parsed.as_object() {
+                    for (key, value) in map {
+                        if !auth_entry_has_credentials(value) {
+                            continue;
+                        }
+                        match key.as_str() {
+                            "openai" | "codex" => has_openai = true,
+                            "anthropic" | "claude" => has_anthropic = true,
+                            "google" | "gemini" => has_google = true,
+                            _ => has_other = true,
+                        }
+                    }
+                }
             }
         }
     }
 
     if let Some(dir) = host_opencode_provider_auth_dir() {
-        has_openai |= dir.join("openai.json").exists();
-        has_anthropic |= dir.join("anthropic.json").exists();
-        has_google |= dir.join("google.json").exists();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                match stem {
+                    "openai" | "codex" => has_openai = true,
+                    "anthropic" | "claude" => has_anthropic = true,
+                    "google" | "gemini" => has_google = true,
+                    "" => {}
+                    _ => has_other = true,
+                }
+            }
+        }
     }
 
     if let Ok(value) = std::env::var("OPENAI_API_KEY") {
@@ -1482,8 +1956,36 @@ fn detect_opencode_provider_auth() -> (bool, bool, bool) {
             has_google = true;
         }
     }
+    if let Ok(value) = std::env::var("XAI_API_KEY") {
+        if !value.trim().is_empty() {
+            has_other = true;
+        }
+    }
 
-    (has_openai, has_anthropic, has_google)
+    if let Some(app_dir) = app_working_dir {
+        if let Some(auth) = build_opencode_auth_from_ai_providers(app_dir) {
+            if let Some(map) = auth.as_object() {
+                for (key, value) in map {
+                    if !auth_entry_has_credentials(value) {
+                        continue;
+                    }
+                    match key.as_str() {
+                        "openai" | "codex" => has_openai = true,
+                        "anthropic" | "claude" => has_anthropic = true,
+                        "google" | "gemini" => has_google = true,
+                        _ => has_other = true,
+                    }
+                }
+            }
+        }
+    }
+
+    OpenCodeAuthState {
+        has_openai,
+        has_anthropic,
+        has_google,
+        has_other,
+    }
 }
 
 fn workspace_oh_my_opencode_config_paths(
@@ -1545,13 +2047,15 @@ async fn ensure_oh_my_opencode_config(
     opencode_config_dir_env: &std::path::Path,
     cli_runner: &str,
     runner_is_direct: bool,
+    has_openai: bool,
+    has_anthropic: bool,
+    has_google: bool,
 ) {
     let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir_host);
     if omo_path.exists() || omo_path_jsonc.exists() {
         return;
     }
 
-    let (has_openai, has_anthropic, has_google) = detect_opencode_provider_auth();
     let has_any_provider = has_openai || has_anthropic || has_google;
     let host_fallback = host_oh_my_opencode_config_is_fallback();
     let should_regen = matches!(host_fallback, Some(true)) && has_any_provider;
@@ -2306,35 +2810,28 @@ fn build_opencode_auth_from_ai_providers(
         if !provider.enabled {
             continue;
         }
-        match provider.provider_type {
-            crate::ai_providers::ProviderType::OpenAI
-            | crate::ai_providers::ProviderType::Anthropic
-            | crate::ai_providers::ProviderType::Google => {
-                let keys: Vec<&str> = match provider.provider_type {
-                    crate::ai_providers::ProviderType::OpenAI => vec!["openai", "codex"],
-                    _ => vec![provider.provider_type.id()],
-                };
-                if let Some(api_key) = provider.api_key {
-                    let entry = serde_json::json!({
-                        "type": "api_key",
-                        "key": api_key,
-                    });
-                    for key in &keys {
-                        map.insert((*key).to_string(), entry.clone());
-                    }
-                } else if let Some(oauth) = provider.oauth {
-                    let entry = serde_json::json!({
-                        "type": "oauth",
-                        "refresh": oauth.refresh_token,
-                        "access": oauth.access_token,
-                        "expires": oauth.expires_at,
-                    });
-                    for key in &keys {
-                        map.insert((*key).to_string(), entry.clone());
-                    }
-                }
+        let keys: Vec<&str> = match provider.provider_type {
+            crate::ai_providers::ProviderType::OpenAI => vec!["openai", "codex"],
+            _ => vec![provider.provider_type.id()],
+        };
+        if let Some(api_key) = provider.api_key {
+            let entry = serde_json::json!({
+                "type": "api_key",
+                "key": api_key,
+            });
+            for key in &keys {
+                map.insert((*key).to_string(), entry.clone());
             }
-            _ => {}
+        } else if let Some(oauth) = provider.oauth {
+            let entry = serde_json::json!({
+                "type": "oauth",
+                "refresh": oauth.refresh_token,
+                "access": oauth.access_token,
+                "expires": oauth.expires_at,
+            });
+            for key in &keys {
+                map.insert((*key).to_string(), entry.clone());
+            }
         }
     }
 
@@ -2404,7 +2901,7 @@ fn sync_opencode_auth_to_workspace(
         }
     }
 
-    let providers = ["openai", "anthropic", "google"];
+    let providers = ["openai", "anthropic", "google", "xai"];
     if let (Some(src_dir), Some(dest_dir)) = (
         host_opencode_provider_auth_dir(),
         workspace_opencode_provider_auth_dir(workspace),
@@ -2439,7 +2936,12 @@ fn sync_opencode_auth_to_workspace(
     if let (Some(value), Some(dest_dir)) =
         (auth_json.as_ref(), workspace_opencode_provider_auth_dir(workspace))
     {
-        let provider_entries = [("openai", "OpenAI"), ("anthropic", "Anthropic"), ("google", "Google")];
+        let provider_entries = [
+            ("openai", "OpenAI"),
+            ("anthropic", "Anthropic"),
+            ("google", "Google"),
+            ("xai", "xAI"),
+        ];
         for (key, label) in provider_entries {
             let entry = if key == "openai" {
                 value.get("openai").or_else(|| value.get("codex"))
@@ -2481,38 +2983,90 @@ fn apply_opencode_auth_env(
     env: &mut std::collections::HashMap<String, String>,
 ) -> Vec<&'static str> {
     let mut providers = Vec::new();
+    let mut seen = HashSet::new();
 
-    if let Some(entry) = auth.get("openai").or_else(|| auth.get("codex")) {
-        if let Some(key) = extract_opencode_api_key(entry) {
-            env.entry("OPENAI_API_KEY".to_string()).or_insert(key);
-            providers.push("openai");
+    let Some(map) = auth.as_object() else {
+        return providers;
+    };
+
+    for (key, entry) in map {
+        let Some(provider_type) = crate::ai_providers::ProviderType::from_id(key) else {
+            continue;
+        };
+        let Some(api_key) = extract_opencode_api_key(entry) else {
+            continue;
+        };
+
+        if let Some(env_var) = provider_type.env_var_name() {
+            env.entry(env_var.to_string()).or_insert(api_key.clone());
         }
-    }
 
-    if let Some(entry) = auth.get("anthropic") {
-        if let Some(key) = extract_opencode_api_key(entry) {
-            env.entry("ANTHROPIC_API_KEY".to_string())
-                .or_insert(key);
-            providers.push("anthropic");
-        }
-    }
-
-    if let Some(entry) = auth.get("google") {
-        if let Some(key) = extract_opencode_api_key(entry) {
+        if provider_type == crate::ai_providers::ProviderType::Google {
             env.entry("GOOGLE_GENERATIVE_AI_API_KEY".to_string())
-                .or_insert(key.clone());
-            env.entry("GOOGLE_API_KEY".to_string()).or_insert(key);
-            providers.push("google");
+                .or_insert(api_key.clone());
+            env.entry("GOOGLE_API_KEY".to_string()).or_insert(api_key.clone());
+        }
+
+        let provider_id = provider_type.id();
+        if seen.insert(provider_id) {
+            providers.push(provider_id);
         }
     }
 
     providers
 }
 
-fn load_latest_opencode_assistant_text(
+#[derive(Debug, Clone)]
+struct StoredOpenCodeMessage {
+    parts: Vec<serde_json::Value>,
+    model: Option<String>,
+}
+
+fn extract_model_from_message(value: &serde_json::Value) -> Option<String> {
+    fn get_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+        for key in keys {
+            if let Some(v) = value.get(*key).and_then(|v| v.as_str()) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(value);
+    if let Some(info) = value.get("info") {
+        candidates.push(info);
+        if let Some(info_model) = info.get("model") {
+            candidates.push(info_model);
+        }
+    }
+    if let Some(model) = value.get("model") {
+        candidates.push(model);
+    }
+
+    for candidate in candidates {
+        let provider = get_str(candidate, &["providerID", "providerId", "provider_id", "provider"]);
+        let model_id = get_str(candidate, &["modelID", "modelId", "model_id", "model"]);
+        if let (Some(provider), Some(model_id)) = (provider, model_id) {
+            if !provider.is_empty() && !model_id.is_empty() {
+                return Some(format!("{}/{}", provider, model_id));
+            }
+        }
+
+        if let Some(model) = get_str(candidate, &["model", "model_id", "modelID", "modelId"]) {
+            if model.contains('/') {
+                return Some(model.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn load_latest_opencode_assistant_message(
     workspace: &Workspace,
     session_id: &str,
-) -> Option<String> {
+) -> Option<StoredOpenCodeMessage> {
     let mut storage_root: Option<std::path::PathBuf> = None;
     for root in opencode_storage_roots(workspace) {
         let message_dir = root.join("message").join(session_id);
@@ -2527,6 +3081,7 @@ fn load_latest_opencode_assistant_text(
 
     let mut latest_time = 0i64;
     let mut latest_message_id: Option<String> = None;
+    let mut latest_model: Option<String> = None;
 
     let entries = std::fs::read_dir(&message_dir).ok()?;
     for entry in entries.flatten() {
@@ -2551,6 +3106,7 @@ fn load_latest_opencode_assistant_text(
                 .get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            latest_model = extract_model_from_message(&value);
         }
     }
 
@@ -2560,7 +3116,7 @@ fn load_latest_opencode_assistant_text(
         return None;
     }
 
-    let mut parts: Vec<(i64, String, String)> = Vec::new();
+    let mut parts: Vec<(i64, String, serde_json::Value)> = Vec::new();
     let part_entries = std::fs::read_dir(&parts_dir).ok()?;
     for entry in part_entries.flatten() {
         let path = entry.path();
@@ -2569,14 +3125,6 @@ fn load_latest_opencode_assistant_text(
         }
         let content = std::fs::read_to_string(&path).ok()?;
         let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let part_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if part_type != "text" {
-            continue;
-        }
-        let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        if text.is_empty() {
-            continue;
-        }
         let start = value
             .get("time")
             .and_then(|t| t.get("start"))
@@ -2587,7 +3135,7 @@ fn load_latest_opencode_assistant_text(
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        parts.push((start, filename, text.to_string()));
+        parts.push((start, filename, value));
     }
 
     if parts.is_empty() {
@@ -2603,15 +3151,90 @@ fn load_latest_opencode_assistant_text(
         }
     });
 
-    let mut combined = String::new();
-    for (_, _, text) in parts {
-        combined.push_str(&text);
+    let parts = parts.into_iter().map(|(_, _, value)| value).collect();
+
+    Some(StoredOpenCodeMessage {
+        parts,
+        model: latest_model,
+    })
+}
+
+fn resolve_opencode_model_from_config(
+    opencode_config_dir: &std::path::Path,
+    agent: Option<&str>,
+) -> Option<String> {
+    let opencode_path = opencode_config_dir.join("opencode.json");
+    let opencode_value = std::fs::read_to_string(opencode_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+
+    if let Some(value) = opencode_value.as_ref() {
+        if let Some(agent_name) = agent {
+            if let Some(model) = value
+                .get("agent")
+                .and_then(|v| v.get(agent_name))
+                .and_then(|v| v.get("model"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(model.to_string());
+            }
+            if let Some(agent_map) = value.get("agent").and_then(|v| v.as_object()) {
+                let agent_lower = agent_name.to_lowercase();
+                for (name, entry) in agent_map {
+                    if name.to_lowercase() == agent_lower {
+                        if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
+                            return Some(model.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(model) = value.get("model").and_then(|v| v.as_str()) {
+            return Some(model.to_string());
+        }
     }
-    if combined.trim().is_empty() {
-        None
+
+    let omo_path = opencode_config_dir.join("oh-my-opencode.json");
+    let omo_jsonc_path = opencode_config_dir.join("oh-my-opencode.jsonc");
+    let omo_path = if omo_jsonc_path.exists() {
+        omo_jsonc_path
     } else {
-        Some(combined)
+        omo_path
+    };
+
+    let contents = std::fs::read_to_string(omo_path).ok()?;
+    let contents = if contents.contains("//") {
+        strip_jsonc_comments(&contents)
+    } else {
+        contents
+    };
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    if let Some(agent_name) = agent {
+        if let Some(model) = value
+            .get("agents")
+            .and_then(|v| v.get(agent_name))
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(model.to_string());
+        }
+        if let Some(agent_map) = value.get("agents").and_then(|v| v.as_object()) {
+            let agent_lower = agent_name.to_lowercase();
+            for (name, entry) in agent_map {
+                if name.to_lowercase() == agent_lower {
+                    if let Some(model) = entry.get("model").and_then(|v| v.as_str()) {
+                        return Some(model.to_string());
+                    }
+                }
+            }
+        }
     }
+
+    value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn env_var_bool(name: &str, default: bool) -> bool {
@@ -2689,13 +3312,49 @@ async fn command_available(
     false
 }
 
+/// Returns the path to the Claude Code CLI that should be used.
+/// If the CLI is not available, it will be auto-installed via bun or npm.
 async fn ensure_claudecode_cli_available(
     workspace_exec: &WorkspaceExec,
     cwd: &std::path::Path,
     cli_path: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    // Check if claude is available at the specified path
     if command_available(workspace_exec, cwd, cli_path).await {
-        return Ok(());
+        return Ok(cli_path.to_string());
+    }
+
+    // Also check bun's global bin directory (bun installs globals to ~/.cache/.bun/bin/)
+    const BUN_GLOBAL_CLAUDE_PATH: &str = "/root/.cache/.bun/bin/claude";
+    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_PATH).await {
+        // Claude Code requires Node.js, but if only bun is available, use bun to run it
+        if command_available(workspace_exec, cwd, "node").await {
+            tracing::debug!("Found Claude Code at {} (using node)", BUN_GLOBAL_CLAUDE_PATH);
+            return Ok(BUN_GLOBAL_CLAUDE_PATH.to_string());
+        } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
+            // Use full path to bun since it's not in PATH
+            let bun_cmd = format!("/root/.bun/bin/bun {}", BUN_GLOBAL_CLAUDE_PATH);
+            tracing::debug!(
+                "Found Claude Code at {} (using bun to run it: {})",
+                BUN_GLOBAL_CLAUDE_PATH,
+                bun_cmd
+            );
+            return Ok(bun_cmd);
+        } else if command_available(workspace_exec, cwd, "bun").await {
+            // Bun is in PATH
+            let bun_cmd = format!("bun {}", BUN_GLOBAL_CLAUDE_PATH);
+            tracing::debug!(
+                "Found Claude Code at {} (using bun to run it: {})",
+                BUN_GLOBAL_CLAUDE_PATH,
+                bun_cmd
+            );
+            return Ok(bun_cmd);
+        } else {
+            tracing::debug!(
+                "Found Claude Code at {} but neither node nor bun available to run it",
+                BUN_GLOBAL_CLAUDE_PATH
+            );
+        }
     }
 
     let auto_install = env_var_bool("OPEN_AGENT_AUTO_INSTALL_CLAUDECODE", true);
@@ -2708,8 +3367,17 @@ async fn ensure_claudecode_cli_available(
 
     // Check for npm or bun as package manager (bun is preferred for speed)
     let has_npm = command_available(workspace_exec, cwd, "npm").await;
-    let has_bun = command_available(workspace_exec, cwd, "bun").await
-        || command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+    tracing::debug!("Claude Code auto-install: npm available = {}", has_npm);
+
+    let bun_in_path = command_available(workspace_exec, cwd, "bun").await;
+    let bun_direct = command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await;
+    let has_bun = bun_in_path || bun_direct;
+    tracing::debug!(
+        "Claude Code auto-install: bun in PATH = {}, bun at /root/.bun/bin/bun = {}, has_bun = {}",
+        bun_in_path,
+        bun_direct,
+        has_bun
+    );
 
     if !has_npm && !has_bun {
         return Err(format!(
@@ -2719,9 +3387,10 @@ async fn ensure_claudecode_cli_available(
     }
 
     // Use bun if available (faster), otherwise npm
+    // Bun installs globals to ~/.cache/.bun/bin/
     let install_cmd = if has_bun {
-        // Ensure Bun's bin is in PATH, then install globally
-        "export PATH=\"/root/.bun/bin:$PATH\" && bun install -g @anthropic-ai/claude-code@latest"
+        // Ensure Bun's bin is in PATH and install globally
+        r#"export PATH="/root/.bun/bin:/root/.cache/.bun/bin:$PATH" && bun install -g @anthropic-ai/claude-code@latest"#
     } else {
         "npm install -g @anthropic-ai/claude-code@latest"
     };
@@ -2753,14 +3422,27 @@ async fn ensure_claudecode_cli_available(
         return Err(format!("Claude Code install failed: {}", message));
     }
 
-    if !command_available(workspace_exec, cwd, cli_path).await {
-        return Err(format!(
-            "Claude Code install completed but '{}' is still not available in workspace PATH.",
-            cli_path
-        ));
+    // Check if claude is available in PATH or in bun's global bin
+    if command_available(workspace_exec, cwd, cli_path).await {
+        return Ok(cli_path.to_string());
+    }
+    if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_PATH).await {
+        // Claude Code requires Node.js, but if only bun is available, use bun to run it
+        if command_available(workspace_exec, cwd, "node").await {
+            return Ok(BUN_GLOBAL_CLAUDE_PATH.to_string());
+        } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
+            // Use full path to bun since it's not in PATH
+            return Ok(format!("/root/.bun/bin/bun {}", BUN_GLOBAL_CLAUDE_PATH));
+        } else if command_available(workspace_exec, cwd, "bun").await {
+            // Bun is in PATH
+            return Ok(format!("bun {}", BUN_GLOBAL_CLAUDE_PATH));
+        }
     }
 
-    Ok(())
+    Err(format!(
+        "Claude Code install completed but '{}' is still not available in workspace PATH.",
+        cli_path
+    ))
 }
 
 fn runner_is_oh_my_opencode(path: &str) -> bool {
@@ -2940,6 +3622,8 @@ pub async fn run_opencode_turn(
         return AgentResult::failure(err, 0).with_terminal_reason(TerminalReason::LlmError);
     }
 
+    let opencode_config_dir_host = work_dir.join(".opencode");
+
     let mut resolved_model = model
         .map(|m| m.to_string())
         .or_else(|| {
@@ -2952,8 +3636,17 @@ pub async fn run_opencode_turn(
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         });
+    let default_model_override = resolved_model.clone();
 
-    let (has_openai, has_anthropic, has_google) = detect_opencode_provider_auth();
+    let auth_state = detect_opencode_provider_auth(Some(app_working_dir));
+    let has_openai = auth_state.has_openai;
+    let has_anthropic = auth_state.has_anthropic;
+    let has_google = auth_state.has_google;
+    let has_any_provider = has_openai || has_anthropic || has_google || auth_state.has_other;
+
+    if resolved_model.is_none() {
+        resolved_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
+    }
 
     let mut provider_hint = resolved_model
         .as_deref()
@@ -2996,8 +3689,14 @@ pub async fn run_opencode_turn(
         Some("anthropic") | Some("claude") => ensure_anthropic_oauth_token_valid().await,
         Some("openai") | Some("codex") => ensure_openai_oauth_token_valid().await,
         Some("google") | Some("gemini") => ensure_google_oauth_token_valid().await,
-        None => Err("No OpenCode providers configured. Add a provider in Settings → AI Providers."
-            .to_string()),
+        None => {
+            if has_any_provider {
+                Ok(())
+            } else {
+                Err("No OpenCode providers configured. Add a provider in Settings → AI Providers."
+                    .to_string())
+            }
+        }
         _ => Ok(()),
     };
 
@@ -3077,7 +3776,6 @@ pub async fn run_opencode_turn(
 
     let work_dir_env = workspace_path_for_env(workspace, work_dir);
     let work_dir_arg = work_dir_env.to_string_lossy().to_string();
-    let opencode_config_dir_host = work_dir.join(".opencode");
     let opencode_config_dir_env = workspace_path_for_env(workspace, &opencode_config_dir_host);
     ensure_oh_my_opencode_config(
         &workspace_exec,
@@ -3086,15 +3784,26 @@ pub async fn run_opencode_turn(
         &opencode_config_dir_env,
         &cli_runner,
         runner_is_direct,
+        has_openai,
+        has_anthropic,
+        has_google,
     )
     .await;
     sync_opencode_agent_config(
         &opencode_config_dir_host,
-        resolved_model.as_deref(),
+        default_model_override.as_deref(),
         has_openai,
         has_anthropic,
         has_google,
     );
+    let mut model_used = resolved_model.clone();
+    let agent_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
+    if model_used.is_none() {
+        model_used = agent_model.clone();
+    }
+    if resolved_model.is_none() {
+        resolved_model = agent_model.clone();
+    }
     if has_google {
         if let Some(project_id) = detect_google_project_id() {
             ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
@@ -3107,6 +3816,18 @@ pub async fn run_opencode_turn(
             &opencode_config_dir_host,
             &opencode_config_dir_env,
             gemini_plugin,
+        )
+        .await;
+    }
+    if has_openai {
+        let openai_plugin = "opencode-openai-codex-auth@latest";
+        ensure_opencode_plugin_specs(&opencode_config_dir_host, &[openai_plugin]);
+        ensure_opencode_plugin_installed(
+            &workspace_exec,
+            work_dir,
+            &opencode_config_dir_host,
+            &opencode_config_dir_env,
+            openai_plugin,
         )
         .await;
     }
@@ -3276,6 +3997,162 @@ pub async fn run_opencode_turn(
     let mut final_result = String::new();
     let mut had_error = false;
     let session_id_capture: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sse_cancel = CancellationToken::new();
+
+    let sse_handle = if command_available(&workspace_exec, work_dir, "curl").await {
+        let workspace_exec = workspace_exec.clone();
+        let work_dir = work_dir.to_path_buf();
+        let work_dir_arg = work_dir_arg.clone();
+        let session_id_capture = session_id_capture.clone();
+        let sse_emitted_thinking = sse_emitted_thinking.clone();
+        let sse_done_sent = sse_done_sent.clone();
+        let sse_cancel = sse_cancel.clone();
+        let events_tx = events_tx.clone();
+        let opencode_port = opencode_port.clone();
+        let mission_id = mission_id;
+        let sse_host = std::env::var("OPEN_AGENT_OPENCODE_SERVER_HOSTNAME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+
+        Some(tokio::spawn(async move {
+            let event_url = format!(
+                "http://{}:{}/event?directory={}",
+                sse_host,
+                opencode_port,
+                urlencoding::encode(&work_dir_arg)
+            );
+
+            let mut attempts = 0u32;
+            loop {
+                if sse_cancel.is_cancelled() {
+                    break;
+                }
+                if attempts > 5 {
+                    break;
+                }
+                attempts += 1;
+
+                let args = vec![
+                    "-N".to_string(),
+                    "-s".to_string(),
+                    "-H".to_string(),
+                    "Accept: text/event-stream".to_string(),
+                    "-H".to_string(),
+                    "Cache-Control: no-cache".to_string(),
+                    event_url.clone(),
+                ];
+
+                let child = workspace_exec
+                    .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
+                    .await;
+
+                let mut child = match child {
+                    Ok(child) => child,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                };
+
+                let stdout = match child.stdout.take() {
+                    Some(stdout) => stdout,
+                    None => {
+                        let _ = child.kill().await;
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        continue;
+                    }
+                };
+
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                let mut current_event: Option<String> = None;
+                let mut data_lines: Vec<String> = Vec::new();
+                let mut state = OpencodeSseState::default();
+                let mut saw_complete = false;
+
+                loop {
+                    if sse_cancel.is_cancelled() {
+                        let _ = child.kill().await;
+                        return;
+                    }
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let trimmed = line.trim_end();
+                            if trimmed.is_empty() {
+                                if !data_lines.is_empty() {
+                                    let data = data_lines.join("\n");
+                                    let current_session = session_id_capture.lock().unwrap().clone();
+                                    if let Some(parsed) = parse_opencode_sse_event(
+                                        &data,
+                                        current_event.as_deref(),
+                                        current_session.as_deref(),
+                                        &mut state,
+                                        mission_id,
+                                    ) {
+                                        if let Some(session_id) = parsed.session_id {
+                                            let mut guard = session_id_capture.lock().unwrap();
+                                            if guard.is_none() {
+                                                *guard = Some(session_id);
+                                            }
+                                        }
+                                        if let Some(event) = parsed.event {
+                                            if matches!(event, AgentEvent::Thinking { .. }) {
+                                                sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
+                                            }
+                                            let _ = events_tx.send(event);
+                                        }
+                                        if parsed.message_complete {
+                                            saw_complete = true;
+                                            if sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst)
+                                                && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
+                                            {
+                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                    content: String::new(),
+                                                    done: true,
+                                                    mission_id: Some(mission_id),
+                                                });
+                                                sse_done_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                                            }
+                                            let _ = child.kill().await;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                current_event = None;
+                                data_lines.clear();
+                                continue;
+                            }
+
+                            if let Some(rest) = trimmed.strip_prefix("event:") {
+                                current_event = Some(rest.trim_start().to_string());
+                                continue;
+                            }
+
+                            if let Some(rest) = trimmed.strip_prefix("data:") {
+                                data_lines.push(rest.trim_start().to_string());
+                                continue;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let _ = child.kill().await;
+                if saw_complete {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }))
+    } else {
+        None
+    };
 
     let mut stdout_reader = stdout;
 
@@ -3349,12 +4226,6 @@ pub async fn run_opencode_turn(
                     });
                 }
 
-                // Also forward as thinking for UI visibility
-                let _ = events_tx_clone.send(AgentEvent::Thinking {
-                    content: clean,
-                    done: false,
-                    mission_id: Some(mission_id_clone),
-                });
             }
         }))
     } else {
@@ -3390,12 +4261,6 @@ pub async fn run_opencode_turn(
                             if chunk.contains("Error:") || chunk.contains("error:") {
                                 had_error = true;
                             }
-
-                            let _ = events_tx.send(AgentEvent::Thinking {
-                                content: chunk.to_string(),
-                                done: false,
-                                mission_id: Some(mission_id),
-                            });
                         }
                     }
                     Err(e) => {
@@ -3415,6 +4280,11 @@ pub async fn run_opencode_turn(
     // Wait for child process to finish and clean up
     let exit_status = child.wait().await;
 
+    sse_cancel.cancel();
+    if let Some(handle) = sse_handle {
+        handle.abort();
+    }
+
     // Check exit status
     if let Ok(status) = exit_status {
         if !status.success() {
@@ -3425,25 +4295,31 @@ pub async fn run_opencode_turn(
         }
     }
 
-    // Emit final thinking done marker
-    let _ = events_tx.send(AgentEvent::Thinking {
-        content: String::new(),
-        done: true,
-        mission_id: Some(mission_id),
-    });
+    let session_id = session_id_capture.lock().unwrap().clone();
+    let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
+    let stored_message = session_id
+        .as_deref()
+        .and_then(|id| load_latest_opencode_assistant_message(workspace, id));
 
     if opencode_output_needs_fallback(&final_result) {
-        let session_id = session_id_capture.lock().unwrap().clone();
-        let session_id = session_id.or_else(|| extract_opencode_session_id(&final_result));
-        if let Some(session_id) = session_id {
-            if let Some(text) = load_latest_opencode_assistant_text(workspace, &session_id) {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    session_id = %session_id,
-                    text_len = text.len(),
-                    "Recovered OpenCode assistant output from storage"
-                );
-                final_result = text;
+        if let Some(session_id) = session_id.as_deref() {
+            if let Some(message) = stored_message.as_ref() {
+                let text = extract_text(&message.parts);
+                if !text.trim().is_empty() {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        session_id = %session_id,
+                        text_len = text.len(),
+                        "Recovered OpenCode assistant output from storage"
+                    );
+                    final_result = text;
+                } else {
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        session_id = %session_id,
+                        "OpenCode assistant output not found in storage"
+                    );
+                }
             } else {
                 tracing::warn!(
                     mission_id = %mission_id,
@@ -3459,6 +4335,40 @@ pub async fn run_opencode_turn(
         }
     }
 
+    let mut emitted_thinking = false;
+    let sse_emitted = sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst);
+    if let Some(message) = stored_message.as_ref() {
+        if let Some(model) = message.model.clone() {
+            model_used = Some(model);
+        }
+        if !sse_emitted {
+            if let Some(reasoning) = extract_reasoning(&message.parts) {
+                let _ = events_tx.send(AgentEvent::Thinking {
+                    content: reasoning,
+                    done: false,
+                    mission_id: Some(mission_id),
+                });
+                emitted_thinking = true;
+            }
+        }
+    }
+
+    if emitted_thinking {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: String::new(),
+            done: true,
+            mission_id: Some(mission_id),
+        });
+    } else if sse_emitted
+        && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let _ = events_tx.send(AgentEvent::Thinking {
+            content: String::new(),
+            done: true,
+            mission_id: Some(mission_id),
+        });
+    }
+
     if final_result.trim().is_empty() && !had_error {
         had_error = true;
         final_result =
@@ -3472,11 +4382,15 @@ pub async fn run_opencode_turn(
         "OpenCode CLI execution completed"
     );
 
-    if had_error {
+    let mut result = if had_error {
         AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
     } else {
         AgentResult::success(final_result, 0)
+    };
+    if let Some(model) = model_used {
+        result = result.with_model(model);
     }
+    result
 }
 
 /// Compact info about a running mission (for API responses).

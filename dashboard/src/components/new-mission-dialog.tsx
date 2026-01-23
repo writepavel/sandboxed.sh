@@ -221,11 +221,11 @@ export function NewMissionDialog({
   const formatWorkspaceType = (type: Workspace['workspace_type']) =>
     type === 'host' ? 'host' : 'isolated';
 
-  // Reset model override when switching to Claude Code if current model isn't Anthropic
+  // Reset model override when switching to Claude Code if current model is provider-prefixed
   useEffect(() => {
     if (selectedBackend === 'claudecode' && newMissionModelOverride) {
-      // Check if current model is from Anthropic
-      if (!newMissionModelOverride.startsWith('anthropic/')) {
+      // Claude Code expects raw model IDs (no provider prefix).
+      if (newMissionModelOverride.includes('/')) {
         setNewMissionModelOverride('');
       }
     }
@@ -423,15 +423,19 @@ export function NewMissionDialog({
                 </option>
                 {filteredProviders.map((provider) => (
                   <optgroup key={provider.id} label={provider.name} className="bg-[#1a1a1a]">
-                    {provider.models.map((model) => (
-                      <option
-                        key={`${provider.id}/${model.id}`}
-                        value={`${provider.id}/${model.id}`}
-                        className="bg-[#1a1a1a]"
-                      >
-                        {model.name || model.id}
-                      </option>
-                    ))}
+                    {provider.models.map((model) => {
+                      const value =
+                        selectedBackend === 'claudecode' ? model.id : `${provider.id}/${model.id}`;
+                      return (
+                        <option
+                          key={`${provider.id}/${model.id}`}
+                          value={value}
+                          className="bg-[#1a1a1a]"
+                        >
+                          {model.name || model.id}
+                        </option>
+                      );
+                    })}
                   </optgroup>
                 ))}
               </select>
