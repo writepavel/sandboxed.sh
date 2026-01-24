@@ -224,8 +224,10 @@ export const EnhancedInput = forwardRef<EnhancedInputHandle, EnhancedInputProps>
           const bestMatch = prefixMatches[0];
           const remaining = bestMatch.name.substring(searchTerm.length);
           // Show remaining command name + short hint from description
+          const firstSentence = bestMatch.description?.split('.')[0] ?? '';
+          const truncated = firstSentence.substring(0, 40);
           const hint = bestMatch.description
-            ? ` — ${bestMatch.description.split('.')[0].substring(0, 40)}${bestMatch.description.length > 40 ? '…' : ''}`
+            ? ` — ${truncated}${firstSentence.length > 40 ? '…' : ''}`
             : '';
           setGhostText(remaining + hint);
         } else {

@@ -910,10 +910,11 @@ function ThinkingPanel({
   const LOAD_MORE_THOUGHTS = 10;
   const [visibleThoughtsLimit, setVisibleThoughtsLimit] = useState(INITIAL_VISIBLE_THOUGHTS);
 
-  // Reset limit when items change significantly (new mission)
+  // Reset limit when items array reference changes (new mission loads new items)
   useEffect(() => {
     setVisibleThoughtsLimit(INITIAL_VISIBLE_THOUGHTS);
-  }, [items.length === 0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -2819,6 +2820,7 @@ export default function ControlClient() {
           setViewingMissionId(fallbackMission.id);
           setViewingMission(fallbackMission);
           setItems(missionHistoryToItems(fallbackMission));
+          setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           applyDesktopSessionState(fallbackMission);
         } else {
           setViewingMissionId(null);
@@ -3213,12 +3215,14 @@ export default function ControlClient() {
           setViewingMissionId(fallbackMission.id);
           setViewingMission(fallbackMission);
           setItems(missionHistoryToItems(fallbackMission));
+          setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           applyDesktopSessionState(fallbackMission);
           router.replace(`/control?mission=${fallbackMission.id}`, { scroll: false });
         } else if (previousViewingId && missionItems[previousViewingId]) {
           setViewingMissionId(previousViewingId);
           setViewingMission(null);
           setItems(missionItems[previousViewingId]);
+          setVisibleItemsLimit(INITIAL_VISIBLE_ITEMS);
           router.replace(`/control?mission=${previousViewingId}`, { scroll: false });
         } else {
           setViewingMissionId(null);
