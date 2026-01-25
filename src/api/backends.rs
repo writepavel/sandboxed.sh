@@ -146,18 +146,21 @@ pub async fn get_backend_config(
         let has_api_key = obj
             .get("api_key")
             .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty() && !s.starts_with("[REDACTED"))
+            .map(|s| !s.is_empty() && !s.starts_with("[REDACTED") && s != "********")
             .unwrap_or(false);
         obj.insert(
             "api_key_configured".to_string(),
             serde_json::Value::Bool(has_api_key),
         );
-        // Mask the actual api_key value if present
+        // Mask the actual api_key value if present and valid, or clear invalid values
         if has_api_key {
             obj.insert(
                 "api_key".to_string(),
                 serde_json::Value::String("********".to_string()),
             );
+        } else {
+            // Clear invalid/redacted values so frontend shows empty field
+            obj.remove("api_key");
         }
         settings = serde_json::Value::Object(obj);
     }

@@ -1088,7 +1088,10 @@ pub fn get_amp_api_key_from_config() -> Option<String> {
         if config.get("id")?.as_str()? == "amp" {
             if let Some(settings) = config.get("settings") {
                 if let Some(api_key) = settings.get("api_key").and_then(|v| v.as_str()) {
-                    if !api_key.is_empty() {
+                    if !api_key.is_empty()
+                        && !api_key.starts_with("[REDACTED")
+                        && api_key != "********"
+                    {
                         tracing::debug!("Using Amp API key from backend config");
                         return Some(api_key.to_string());
                     }
@@ -1097,6 +1100,24 @@ pub fn get_amp_api_key_from_config() -> Option<String> {
         }
     }
     None
+}
+
+/// Read amp.url from Amp CLI settings file (~/.config/amp/settings.json)
+fn get_amp_url_from_settings() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let settings_path = std::path::PathBuf::from(&home)
+        .join(".config")
+        .join("amp")
+        .join("settings.json");
+
+    let contents = std::fs::read_to_string(&settings_path).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    settings
+        .get("amp.url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Execute a turn using Claude Code CLI backend.
@@ -4879,6 +4900,14 @@ pub async fn run_amp_turn(
     if !env.contains_key("AMP_URL") {
         if let Ok(provider_url) = std::env::var("AMP_PROVIDER_URL") {
             env.insert("AMP_URL".to_string(), provider_url);
+        }
+    }
+    
+    // Fall back to reading amp.url from Amp CLI settings file if no env var set
+    if !env.contains_key("AMP_URL") {
+        if let Some(amp_url) = get_amp_url_from_settings() {
+            tracing::debug!(mission_id = %mission_id, amp_url = %amp_url, "Using amp.url from Amp CLI settings");
+            env.insert("AMP_URL".to_string(), amp_url);
         }
     }
 
