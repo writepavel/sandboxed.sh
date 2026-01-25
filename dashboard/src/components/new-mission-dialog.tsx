@@ -23,6 +23,7 @@ interface CombinedAgent {
   backend: string;
   backendName: string;
   agent: string;
+  displayName: string; // User-friendly name for UI display
   value: string; // "backend:agent" format
 }
 
@@ -177,9 +178,22 @@ export function NewMissionDialog({
         const allClaudeAgents = claudecodeAgents?.map(a => a.name) || [];
         agentNames = allClaudeAgents.filter(name => !claudeCodeHiddenAgents.includes(name));
       } else if (backend.id === 'amp') {
-        // Amp has built-in modes: smart and rush (use id for CLI, not display name)
-        const backendAgentList = ampAgents?.map(a => a.id) || [];
-        agentNames = backendAgentList.length > 0 ? backendAgentList : ['smart', 'rush'];
+        // Amp has built-in modes: smart and rush
+        // Use id for CLI value but name for display
+        const ampAgentsList = ampAgents || [
+          { id: 'smart', name: 'Smart Mode' },
+          { id: 'rush', name: 'Rush Mode' },
+        ];
+        for (const agent of ampAgentsList) {
+          result.push({
+            backend: backend.id,
+            backendName: backend.name,
+            agent: agent.id,
+            displayName: agent.name,
+            value: `${backend.id}:${agent.id}`,
+          });
+        }
+        continue; // Skip the generic loop below
       }
 
       for (const agent of agentNames) {
@@ -187,6 +201,7 @@ export function NewMissionDialog({
           backend: backend.id,
           backendName: backend.name,
           agent,
+          displayName: agent, // For non-Amp backends, agent name is the display name
           value: `${backend.id}:${agent}`,
         });
       }
@@ -404,7 +419,7 @@ export function NewMissionDialog({
                     <optgroup key={backend.id} label={backend.name} className="bg-[#1a1a1a]">
                       {backendAgentsList.map((agent) => (
                         <option key={agent.value} value={agent.value} className="bg-[#1a1a1a]">
-                          {agent.agent}{agent.backend === 'opencode' && agent.agent === 'Sisyphus' ? ' (recommended)' : ''}
+                          {agent.displayName}{agent.backend === 'opencode' && agent.agent === 'Sisyphus' ? ' (recommended)' : ''}
                         </option>
                       ))}
                     </optgroup>
