@@ -31,16 +31,14 @@ export const StreamingMarkdown = memo(function StreamingMarkdown({
   basePath,
   stabilizeDelay = 300,
 }: StreamingMarkdownProps) {
-  // Split content into blocks (paragraphs)
+  // Split content into blocks (paragraphs separated by double newlines)
+  // Note: This simple split may break code blocks with blank lines during
+  // streaming, but they render correctly once streaming completes.
   const blocks = useMemo(() => {
     if (!content) return [];
-    // Split by double newlines, but keep code blocks intact
     const parts = content.split(/\n\n+/);
     return parts.filter(p => p.trim());
   }, [content]);
-
-  // Track which blocks have been "seen" as stable
-  const stableBlocksRef = useRef<Map<string, string>>(new Map());
 
   // Track when the last block was updated for stabilization
   const lastUpdateRef = useRef<number>(Date.now());
