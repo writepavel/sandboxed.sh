@@ -25,10 +25,10 @@ execution context:
 
 - **Host workspace**: process runs directly on the host with the mission working
   directory as `cwd`.
-- **Container workspace**: process runs inside the container via `systemd-nspawn`.
-This guarantees that built-in bash (OpenCode `bash` / Claude Code `Bash`) executes
-**inside the workspace**. File creation, git operations, and shell commands land
-in the correct workspace without a host-proxy tool.
+- **Container workspace**: process runs inside the container via
+  `systemd-nspawn`. This guarantees that built-in bash (OpenCode `bash` / Claude
+  Code `Bash`) executes **inside the workspace**. File creation, git operations,
+  and shell commands land in the correct workspace without a host-proxy tool.
 
 ## Harnesses
 
@@ -80,14 +80,15 @@ backend in configuration. The default is to avoid host-proxy tooling.
 - Container workspaces do **not** see the host desktop by default because the
   X11 socket (`/tmp/.X11-unix`) is not bind-mounted for harness/MCP execution.
 - Interactive shells bind X11 when a runtime display is present, but harnesses
-  and MCPs do not. If you need container agents to drive the shared desktop,
-  add an explicit X11 bind + `DISPLAY`, or run the mission on a host workspace.
+  and MCPs do not. If you need container agents to drive the shared desktop, add
+  an explicit X11 bind + `DISPLAY`, or run the mission on a host workspace.
 
 ## Configuration sources
 
 Per-workspace config is generated from three sources:
 
-1. **Library** (git-backed) for agents, skills, tools, rules, and MCP definitions.
+1. **Library** (git-backed) for agents, skills, tools, rules, and MCP
+   definitions.
 2. **Backend Settings** (UI) for CLI paths or backend-specific overrides.
 3. **Workspace Settings** for env vars and per-workspace overrides.
 
@@ -112,7 +113,8 @@ This preserves the UI experience while keeping execution isolated per workspace.
 
 ## Operational notes
 
-- **No central OpenCode server needed**: Missions spawn per-workspace CLI processes.
+- **No central OpenCode server needed**: Missions spawn per-workspace CLI
+  processes.
 - Agents are loaded from the Library's `oh-my-opencode.json` (no HTTP call).
 - Per-workspace execution eliminates host-to-container network issues.
 - For remote workspaces, SSH execution keeps bash/tooling on the remote host.
@@ -130,3 +132,8 @@ Recommended smoke tests after changes:
 
 If files appear in the wrong place, the harness is not running inside the
 workspace execution context.
+
+## Debugging Deployed Instances
+
+For debugging production deployments, SSH access, systemd service management,
+and log analysis, see **[DEBUGGING.md](DEBUGGING.md)**.
