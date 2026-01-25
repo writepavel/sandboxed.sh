@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS missions (
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
+CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
 
 CREATE TABLE IF NOT EXISTS mission_trees (
     mission_id TEXT PRIMARY KEY NOT NULL,
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS mission_events (
 CREATE INDEX IF NOT EXISTS idx_events_mission ON mission_events(mission_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_events_type ON mission_events(mission_id, event_type);
 CREATE INDEX IF NOT EXISTS idx_events_tool_call ON mission_events(tool_call_id) WHERE tool_call_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);
 
 CREATE TABLE IF NOT EXISTS mission_summaries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,6 +193,13 @@ impl SqliteMissionStore {
             conn.execute("ALTER TABLE missions ADD COLUMN session_id TEXT", [])
                 .map_err(|e| format!("Failed to add session_id column: {}", e))?;
         }
+
+        // Add performance indexes if they don't exist (idempotent)
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_missions_status_updated ON missions(status, updated_at);
+             CREATE INDEX IF NOT EXISTS idx_events_event_type ON mission_events(event_type);",
+        )
+        .map_err(|e| format!("Failed to create performance indexes: {}", e))?;
 
         Ok(())
     }
@@ -330,14 +339,18 @@ impl MissionStore for SqliteMissionStore {
                 .optional()
                 .map_err(|e| e.to_string())?;
 
-            // Load history from events
+            // Load history from events (limited to last 200 messages for performance)
+            // Full history can be retrieved via get_events() if needed
             if let Some(mut m) = mission {
                 let mut history_stmt = conn
                     .prepare(
-                        "SELECT event_type, content, content_file
-                         FROM mission_events
-                         WHERE mission_id = ?1 AND event_type IN ('user_message', 'assistant_message')
-                         ORDER BY sequence ASC",
+                        "SELECT event_type, content, content_file FROM (
+                             SELECT event_type, content, content_file, sequence
+                             FROM mission_events
+                             WHERE mission_id = ?1 AND event_type IN ('user_message', 'assistant_message')
+                             ORDER BY sequence DESC
+                             LIMIT 200
+                         ) ORDER BY sequence ASC",
                     )
                     .map_err(|e| e.to_string())?;
 
@@ -848,7 +861,8 @@ impl MissionStore for SqliteMissionStore {
             | AgentEvent::AgentPhase { .. }
             | AgentEvent::AgentTree { .. }
             | AgentEvent::Progress { .. }
-            | AgentEvent::SessionIdUpdate { .. } => return Ok(()),
+            | AgentEvent::SessionIdUpdate { .. }
+            | AgentEvent::TextDelta { .. } => return Ok(()),
         };
 
         let event_type = event_type.to_string();
