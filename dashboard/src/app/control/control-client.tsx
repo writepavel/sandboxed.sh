@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useCallback, memo } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback, memo } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { toast } from "@/components/toast";
 import { MarkdownContent } from "@/components/markdown-content";
@@ -2223,8 +2223,18 @@ export default function ControlClient() {
   }, [items]);
 
   // Smart auto-scroll
-  const { containerRef, endRef, isAtBottom, scrollToBottom } =
+  const { containerRef, endRef, isAtBottom, scrollToBottom, scrollToBottomImmediate } =
     useScrollToBottom();
+
+  // Scroll to bottom synchronously before paint when items change.
+  // This ensures the page appears at the bottom instantly when returning
+  // to the control page (no visible scroll animation).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useLayoutEffect(() => {
+    if (items.length > 0 && isAtBottom) {
+      scrollToBottomImmediate();
+    }
+  }, [items]);
 
   // Sync input to localStorage draft
   useEffect(() => {
