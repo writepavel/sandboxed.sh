@@ -817,6 +817,56 @@ async fn resolve_claudecode_default_model(library: &SharedLibrary) -> Option<Str
     }
 }
 
+/// Try to resolve a library command from a user message starting with `/`.
+/// If the message starts with `/command-name` and a matching command exists in the library,
+/// returns the command's body content (frontmatter stripped). Otherwise returns the original message.
+async fn resolve_library_command(library: &SharedLibrary, message: &str) -> String {
+    let trimmed = message.trim();
+
+    // Must start with / and have at least one non-slash character
+    if !trimmed.starts_with('/') || trimmed.len() < 2 {
+        return message.to_string();
+    }
+
+    // Extract command name and optional arguments
+    let without_slash = &trimmed[1..];
+    let (command_name, args) = match without_slash.find(|c: char| c.is_whitespace()) {
+        Some(pos) => (&without_slash[..pos], without_slash[pos..].trim()),
+        None => (without_slash, ""),
+    };
+
+    // Try to fetch from library
+    let lib_guard = library.read().await;
+    let Some(lib) = lib_guard.as_ref() else {
+        return message.to_string();
+    };
+
+    match lib.get_command(command_name).await {
+        Ok(command) => {
+            // Strip frontmatter from content to get the body
+            let (_frontmatter, body) =
+                crate::library::types::parse_frontmatter(&command.content);
+            let body = body.trim();
+
+            tracing::info!(
+                command_name = command_name,
+                has_args = !args.is_empty(),
+                "Resolved library command"
+            );
+
+            if args.is_empty() {
+                body.to_string()
+            } else {
+                format!("{}\n\nArguments: {}", body, args)
+            }
+        }
+        Err(_) => {
+            // Not a library command, pass through as-is (may be a builtin like /plan)
+            message.to_string()
+        }
+    }
+}
+
 /// Execute a single turn for a mission.
 async fn run_mission_turn(
     config: Config,
@@ -858,6 +908,9 @@ async fn run_mission_turn(
         user_message_len = user_message.len(),
         "Mission turn started"
     );
+
+    // Resolve library commands (e.g., /bugbot-review → expanded command content)
+    let user_message = resolve_library_command(&library, &user_message).await;
 
     // Build context with history
     let max_history_chars = config.context.max_history_total_chars;

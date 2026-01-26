@@ -2529,10 +2529,12 @@ export default function ControlClient() {
         const toolName = event.tool_name;
         const isStart =
           toolName === "desktop_start_session" ||
-          toolName === "desktop_desktop_start_session";
+          toolName === "desktop_desktop_start_session" ||
+          toolName === "mcp__desktop__desktop_start_session";
         const isClose =
           toolName === "desktop_close_session" ||
-          toolName === "desktop_desktop_close_session";
+          toolName === "desktop_desktop_close_session" ||
+          toolName === "mcp__desktop__desktop_close_session";
 
         if (!isStart && !isClose) continue;
 
@@ -3925,7 +3927,7 @@ export default function ControlClient() {
 
         // Check for desktop_start_session right away using event data
         // This handles the case where tool_call events might be filtered or missed
-        if (eventToolName === "desktop_start_session" || eventToolName === "desktop_desktop_start_session") {
+        if (eventToolName === "desktop_start_session" || eventToolName === "desktop_desktop_start_session" || eventToolName === "mcp__desktop__desktop_start_session") {
           let result = data["result"];
           // Handle case where result is a JSON string that needs parsing
           if (typeof result === "string") {
@@ -3944,7 +3946,7 @@ export default function ControlClient() {
           }
         }
         // Handle desktop session close
-        if (eventToolName === "desktop_close_session" || eventToolName === "desktop_desktop_close_session") {
+        if (eventToolName === "desktop_close_session" || eventToolName === "desktop_desktop_close_session" || eventToolName === "mcp__desktop__desktop_close_session") {
           setHasDesktopSession(false);
           setShowDesktopStream(false);
         }
@@ -3958,7 +3960,7 @@ export default function ControlClient() {
           if (toolItem && toolItem.kind === "tool") {
             const toolName = toolItem.name;
             // Check for desktop_start_session (with or without desktop_ prefix from MCP)
-            if (toolName === "desktop_start_session" || toolName === "desktop_desktop_start_session") {
+            if (toolName === "desktop_start_session" || toolName === "desktop_desktop_start_session" || toolName === "mcp__desktop__desktop_start_session") {
               let result = data["result"];
               // Handle case where result is a JSON string that needs parsing
               if (typeof result === "string") {
@@ -3976,7 +3978,7 @@ export default function ControlClient() {
               }
             }
             // Check for desktop_close_session
-            if (toolName === "desktop_close_session" || toolName === "desktop_desktop_close_session") {
+            if (toolName === "desktop_close_session" || toolName === "desktop_desktop_close_session" || toolName === "mcp__desktop__desktop_close_session") {
               setHasDesktopSession(false);
               setShowDesktopStream(false);
             }

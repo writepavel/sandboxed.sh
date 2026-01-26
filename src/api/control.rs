@@ -2275,16 +2275,34 @@ async fn control_actor_loop(
                         };
                         let main_is_running = running.is_some();
 
+                        // If no explicit target but current_mission differs from the
+                        // running mission (i.e., CreateMission switched the pointer),
+                        // infer the target as current_mission so it auto-starts in parallel.
+                        let effective_target = target_mission_id.or_else(|| {
+                            if main_is_running {
+                                if let Some(cid) = current_mission_id {
+                                    if running_mid != Some(cid) {
+                                        tracing::info!(
+                                            "Inferred target mission {} (current differs from running {:?})",
+                                            cid, running_mid
+                                        );
+                                        return Some(cid);
+                                    }
+                                }
+                            }
+                            None
+                        });
+
                         // Determine if target is already running somewhere
-                        let target_in_parallel = target_mission_id
+                        let target_in_parallel = effective_target
                             .map(|tid| parallel_runners.contains_key(&tid))
                             .unwrap_or(false);
-                        let target_is_main = target_mission_id
+                        let target_is_main = effective_target
                             .map(|tid| main_mission_id == Some(tid))
                             .unwrap_or(true); // No target = use main
 
                         // Case 1: Target is already running in parallel_runners - queue to it
-                        if let Some(tid) = target_mission_id {
+                        if let Some(tid) = effective_target {
                             if target_in_parallel {
                                 if let Some(runner) = parallel_runners.get_mut(&tid) {
                                     let was_running = runner.is_running();
@@ -2318,7 +2336,7 @@ async fn control_actor_loop(
                         }
 
                         // Case 2: Target differs from main AND main is running → start parallel
-                        if let Some(tid) = target_mission_id {
+                        if let Some(tid) = effective_target {
                             if !target_is_main && main_is_running {
                                 // Check capacity
                                 let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
@@ -2401,15 +2419,15 @@ async fn control_actor_loop(
                         {
                             let mission_id = current_mission.read().await.clone();
                             if mission_id.is_none() {
-                                // Use target_mission_id if provided, otherwise create new
-                                if let Some(tid) = target_mission_id {
+                                // Use effective_target if available, otherwise create new
+                                if let Some(tid) = effective_target {
                                     *current_mission.write().await = Some(tid);
                                     tracing::info!("Set current mission to target: {}", tid);
                                 } else if let Ok(new_mission) = create_new_mission(&mission_store).await {
                                     *current_mission.write().await = Some(new_mission.id);
                                     tracing::info!("Auto-created mission: {}", new_mission.id);
                                 }
-                            } else if let Some(tid) = target_mission_id {
+                            } else if let Some(tid) = effective_target {
                                 // Switch main session to target mission if nothing running
                                 if !main_is_running && mission_id != Some(tid) {
                                     // Persist current history before switching
@@ -3522,7 +3540,9 @@ async fn control_actor_loop(
                         let tool_name = name.as_str();
                         let is_start = matches!(
                             tool_name,
-                            "desktop_start_session" | "desktop_desktop_start_session"
+                            "desktop_start_session"
+                                | "desktop_desktop_start_session"
+                                | "mcp__desktop__desktop_start_session"
                         );
                         let is_stop = matches!(
                             tool_name,
@@ -3530,6 +3550,8 @@ async fn control_actor_loop(
                                 | "desktop_close_session"
                                 | "desktop_desktop_stop_session"
                                 | "desktop_desktop_close_session"
+                                | "mcp__desktop__desktop_stop_session"
+                                | "mcp__desktop__desktop_close_session"
                         );
 
                         if !is_start && !is_stop {
