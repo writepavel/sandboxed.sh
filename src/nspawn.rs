@@ -243,13 +243,24 @@ pub async fn create_container(path: &Path, distro: NspawnDistro) -> NspawnResult
 }
 
 async fn create_debootstrap_container(path: &Path, distro: NspawnDistro) -> NspawnResult<()> {
-    let output = tokio::process::Command::new("debootstrap")
+    // Stream debootstrap output to a build log file so the dashboard can show progress.
+    // The log is stored as a sibling file (e.g. /root/.openagent/containers/alex.build.log)
+    // because the container filesystem doesn't exist yet during debootstrap.
+    let build_log_path = build_log_path_for(path);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&build_log_path)
+        .ok();
+
+    let mut child = tokio::process::Command::new("debootstrap")
         .arg("--variant=minbase")
         .arg(distro.as_str())
         .arg(path)
         .arg(distro.mirror_url())
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 NspawnError::Debootstrap(
@@ -260,12 +271,91 @@ async fn create_debootstrap_container(path: &Path, distro: NspawnDistro) -> Nspa
             }
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // Stream stdout and stderr to the build log file in real-time
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let log_for_stdout = log_file
+        .as_ref()
+        .and_then(|f| f.try_clone().ok());
+    let log_for_stderr = log_file
+        .as_ref()
+        .and_then(|f| f.try_clone().ok());
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut collected = Vec::new();
+        if let Some(stdout) = stdout {
+            use tokio::io::AsyncReadExt;
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if let Some(ref mut f) = log_for_stdout.as_ref() {
+                            use std::io::Write;
+                            let _ = f.write_all(&buf[..n]);
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        collected
+    });
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut collected = Vec::new();
+        if let Some(stderr) = stderr {
+            use tokio::io::AsyncReadExt;
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        collected.extend_from_slice(&buf[..n]);
+                        if let Some(ref mut f) = log_for_stderr.as_ref() {
+                            use std::io::Write;
+                            let _ = f.write_all(&buf[..n]);
+                            let _ = f.flush();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        collected
+    });
+
+    let status = child.wait().await.map_err(|e| NspawnError::Debootstrap(e.to_string()))?;
+    let _ = stdout_handle.await;
+    let stderr_bytes = stderr_handle.await.unwrap_or_default();
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         return Err(NspawnError::Debootstrap(stderr.to_string()));
     }
 
+    // Copy the build log into the container's var/log/ so the dashboard can read it
+    // from the standard init-log path after debootstrap completes.
+    let container_log_dir = path.join("var/log");
+    if container_log_dir.exists() {
+        let container_log = container_log_dir.join("openagent-init.log");
+        let _ = std::fs::copy(&build_log_path, &container_log);
+    }
+
     Ok(())
+}
+
+/// Returns the path to the build log file stored as a sibling to the container directory.
+/// This is used during debootstrap when the container filesystem doesn't exist yet.
+pub(crate) fn build_log_path_for(container_path: &Path) -> std::path::PathBuf {
+    let mut log_path = container_path.to_path_buf().into_os_string();
+    log_path.push(".build.log");
+    std::path::PathBuf::from(log_path)
 }
 
 async fn create_arch_container(path: &Path) -> NspawnResult<()> {

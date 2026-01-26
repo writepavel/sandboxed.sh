@@ -1228,17 +1228,27 @@ async fn get_init_log(
     let log_path = "/var/log/openagent-init.log";
     let host_log_path = workspace.path.join("var/log/openagent-init.log");
 
-    if !host_log_path.exists() {
-        return Ok(Json(InitLogResponse {
-            exists: false,
-            content: String::new(),
-            total_lines: None,
-            log_path: log_path.to_string(),
-        }));
-    }
+    // During debootstrap, the container filesystem doesn't exist yet so
+    // var/log/openagent-init.log won't be there. Check the build log sibling
+    // file that debootstrap streams output to.
+    let effective_log_path = if host_log_path.exists() {
+        host_log_path
+    } else {
+        let build_log = crate::nspawn::build_log_path_for(&workspace.path);
+        if build_log.exists() {
+            build_log
+        } else {
+            return Ok(Json(InitLogResponse {
+                exists: false,
+                content: String::new(),
+                total_lines: None,
+                log_path: log_path.to_string(),
+            }));
+        }
+    };
 
     // Read the log file
-    let content = tokio::fs::read_to_string(&host_log_path)
+    let content = tokio::fs::read_to_string(&effective_log_path)
         .await
         .map_err(|e| {
             (
