@@ -2501,6 +2501,12 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
             env_var: Some("XAI_API_KEY".to_string()),
         },
         ProviderTypeInfo {
+            id: "zai".to_string(),
+            name: "Z.AI".to_string(),
+            uses_oauth: false,
+            env_var: Some("ZHIPU_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
             id: "github-copilot".to_string(),
             name: "GitHub Copilot".to_string(),
             uses_oauth: true,
