@@ -2078,6 +2078,7 @@ fn spawn_control_session(
         tokio::spawn(stale_mission_cleanup_loop(
             Arc::clone(&state.mission_store),
             config.stale_mission_hours,
+            Arc::clone(&running_missions),
             events_tx.clone(),
         ));
     }
@@ -2110,23 +2111,74 @@ fn spawn_control_session(
     state
 }
 
-/// Background task that periodically closes stale missions.
+/// Background task that periodically cleans up missions that are no longer running.
+///
+/// Two checks on each tick:
+/// 1. **Orphan detection**: any mission marked `active` in the DB but not present
+///    in the in-memory `running_missions` list is an orphan whose harness process
+///    died without updating the DB. These are marked `interrupted` immediately.
+/// 2. **Stale timeout**: missions that have been active longer than `stale_hours`
+///    without any activity update are marked `completed` as a safety net.
 async fn stale_mission_cleanup_loop(
     mission_store: Arc<dyn MissionStore>,
     stale_hours: u64,
+    running_missions: Arc<RwLock<Vec<super::mission_runner::RunningMissionInfo>>>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
-    // Check every hour
-    let check_interval = std::time::Duration::from_secs(3600);
+    // Check every 5 minutes (fast enough to catch orphans promptly).
+    let check_interval = std::time::Duration::from_secs(300);
 
     tracing::info!(
-        "Stale mission cleanup task started: closing missions inactive for {} hours",
+        "Mission cleanup task started: orphan check every 5 min, stale timeout {} hours",
         stale_hours
     );
 
     loop {
         tokio::time::sleep(check_interval).await;
 
+        // --- Orphan detection: active in DB but not running in-process ---
+        match mission_store.get_all_active_missions().await {
+            Ok(active_missions) if !active_missions.is_empty() => {
+                let running = running_missions.read().await;
+                let running_ids: std::collections::HashSet<Uuid> =
+                    running.iter().map(|r| r.mission_id).collect();
+                drop(running);
+
+                for mission in &active_missions {
+                    if !running_ids.contains(&mission.id) {
+                        tracing::info!(
+                            "Orphan detected: mission {} '{}' is active in DB but has no running process (last update: {})",
+                            mission.id,
+                            mission.title.as_deref().unwrap_or("Untitled"),
+                            mission.updated_at
+                        );
+                        if let Err(e) = mission_store
+                            .update_mission_status(mission.id, MissionStatus::Interrupted)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to mark orphaned mission {} as interrupted: {}",
+                                mission.id, e
+                            );
+                        } else {
+                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                mission_id: mission.id,
+                                status: MissionStatus::Interrupted,
+                                summary: Some(
+                                    "Interrupted: harness process is no longer running".to_string(),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Failed to check for orphaned missions: {}", e);
+            }
+        }
+
+        // --- Stale timeout: safety net for missions that somehow stay active ---
         match mission_store.get_stale_active_missions(stale_hours).await {
             Ok(stale_missions) => {
                 for mission in stale_missions {
@@ -2143,7 +2195,6 @@ async fn stale_mission_cleanup_loop(
                     {
                         tracing::warn!("Failed to auto-close stale mission {}: {}", mission.id, e);
                     } else {
-                        // Notify listeners
                         let _ = events_tx.send(AgentEvent::MissionStatusChanged {
                             mission_id: mission.id,
                             status: MissionStatus::Completed,
