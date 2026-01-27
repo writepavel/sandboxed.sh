@@ -1,0 +1,16 @@
+{
+	# No automatic HTTPS inside Docker — users put their own reverse proxy in front
+	auto_https off
+}
+
+:80 {
+	# API & backend endpoints → Rust backend
+	handle /api/* {
+		reverse_proxy localhost:3000
+	}
+
+	# Everything else → Next.js dashboard
+	handle {
+		reverse_proxy localhost:3001
+	}
+}
