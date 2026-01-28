@@ -4,38 +4,9 @@ import Link from "next/link";
 import useSWR from "swr";
 import { cn } from "@/lib/utils";
 import { listMissions, Mission } from "@/lib/api";
-import {
-  ArrowRight,
-  CheckCircle,
-  XCircle,
-  Loader,
-  Clock,
-  Ban,
-} from "lucide-react";
-
-const statusIcons: Record<string, typeof Clock> = {
-  pending: Clock,
-  active: Loader,
-  running: Loader,
-  completed: CheckCircle,
-  failed: XCircle,
-  cancelled: Ban,
-  interrupted: Ban,
-  blocked: Ban,
-  not_feasible: XCircle,
-};
-
-const statusColors: Record<string, string> = {
-  pending: "text-amber-400",
-  active: "text-indigo-400",
-  running: "text-indigo-400",
-  completed: "text-emerald-400",
-  failed: "text-red-400",
-  cancelled: "text-white/40",
-  interrupted: "text-amber-400",
-  blocked: "text-orange-400",
-  not_feasible: "text-rose-400",
-};
+import { ArrowRight, Clock } from "lucide-react";
+import { getStatusIcon } from "@/components/ui/status-icons";
+import { STATUS_TEXT_COLORS } from "@/lib/mission-status";
 
 // Sort missions by updated_at descending
 const sortMissions = (data: Mission[]): Mission[] =>
@@ -67,8 +38,8 @@ export function RecentTasks() {
       ) : (
         <div className="flex-1 overflow-y-auto space-y-2 min-h-0">
           {sortedMissions.map((mission) => {
-            const Icon = statusIcons[mission.status] || Clock;
-            const color = statusColors[mission.status] || "text-white/40";
+            const Icon = getStatusIcon(mission.status, Clock);
+            const color = STATUS_TEXT_COLORS[mission.status] || "text-white/40";
             const title = mission.title || "Untitled Mission";
             return (
               <Link

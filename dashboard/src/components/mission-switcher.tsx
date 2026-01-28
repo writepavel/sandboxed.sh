@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { Search, XCircle, Check, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { type Mission, type MissionStatus, type RunningMissionInfo } from '@/lib/api';
-import { STATUS_DOT_COLORS, STATUS_LABELS, getMissionDotColor } from '@/lib/mission-status';
+import { STATUS_DOT_COLORS, STATUS_LABELS, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 
 interface MissionSwitcherProps {
   open: boolean;
@@ -27,14 +27,7 @@ function getMissionDisplayName(mission: Mission): string {
 }
 
 function getMissionDescription(mission: Mission): string {
-  if (mission.title) return mission.title;
-  // Get first user message from history as fallback
-  const firstUserMessage = mission.history?.find(h => h.role === 'user');
-  if (firstUserMessage?.content) {
-    const content = firstUserMessage.content.trim();
-    return content.length > 60 ? content.slice(0, 60) + '...' : content;
-  }
-  return '';
+  return getMissionTitle(mission, { maxLength: 60, fallback: '' });
 }
 
 export function MissionSwitcher({

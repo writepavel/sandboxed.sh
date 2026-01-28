@@ -126,3 +126,43 @@ export function getMissionTextColor(status: MissionStatus, isActuallyRunning: bo
   }
   return STATUS_TEXT_COLORS[status] || 'text-white/40';
 }
+
+/**
+ * Icon mapping for mission statuses.
+ * Import the icons where needed and use this mapping.
+ * Example: const Icon = STATUS_ICONS[mission.status] || Clock;
+ */
+export const STATUS_ICONS = {
+  pending: 'Clock',
+  active: 'Loader',
+  running: 'Loader',
+  completed: 'CheckCircle',
+  failed: 'XCircle',
+  cancelled: 'Ban',
+  interrupted: 'Ban',
+  blocked: 'Ban',
+  not_feasible: 'XCircle',
+} as const;
+
+export type StatusIconName = (typeof STATUS_ICONS)[keyof typeof STATUS_ICONS];
+
+/**
+ * Get mission title from mission data.
+ * Prioritizes explicit title, falls back to truncated first user message.
+ */
+export function getMissionTitle(
+  mission: { title?: string | null; history?: Array<{ role: string; content?: string | null }> | null },
+  options?: { maxLength?: number; fallback?: string }
+): string {
+  const { maxLength = 50, fallback = 'Untitled Mission' } = options || {};
+  
+  if (mission.title) return mission.title;
+  
+  const firstUserMessage = mission.history?.find(h => h.role === 'user');
+  if (firstUserMessage?.content) {
+    const content = firstUserMessage.content.trim();
+    return content.length > maxLength ? content.slice(0, maxLength) + '...' : content;
+  }
+  
+  return fallback;
+}

@@ -26,20 +26,21 @@ import {
   DollarSign,
   Zap,
   Loader,
-  XCircle,
-  Ban,
   Clock,
   RotateCcw,
   Trash2,
   Hand,
+  XCircle,
 } from 'lucide-react';
 import { cn, formatCents } from '@/lib/utils';
 import { NewMissionDialog } from '@/components/new-mission-dialog';
 import {
   categorizeMissions,
   getMissionTextColor,
+  getMissionTitle,
   type MissionCategory,
 } from '@/lib/mission-status';
+import { getStatusIcon } from '@/components/ui/status-icons';
 
 interface Column {
   id: MissionCategory;
@@ -52,25 +53,6 @@ const columns: Column[] = [
   { id: 'needs-you', label: 'Needs You', icon: Hand },
   { id: 'finished', label: 'Finished', icon: CheckCircle },
 ];
-
-const statusIcons: Record<string, typeof Clock> = {
-  active: Loader,
-  completed: CheckCircle,
-  failed: XCircle,
-  interrupted: Ban,
-  blocked: Ban,
-  not_feasible: XCircle,
-};
-
-function getMissionTitle(mission: Mission): string {
-  if (mission.title) return mission.title;
-  const firstUser = mission.history?.find((h) => h.role === 'user');
-  if (firstUser?.content) {
-    const content = firstUser.content.trim();
-    return content.length > 50 ? content.slice(0, 50) + '...' : content;
-  }
-  return 'Untitled Mission';
-}
 
 function CompactMissionCard({
   mission,
@@ -85,7 +67,7 @@ function CompactMissionCard({
   onResume: (id: string) => void;
   onDelete: (id: string) => void;
 }) {
-  const Icon = isActuallyRunning ? Loader : (statusIcons[mission.status] || Clock);
+  const Icon = isActuallyRunning ? Loader : getStatusIcon(mission.status);
   const color = getMissionTextColor(mission.status, isActuallyRunning);
   const title = getMissionTitle(mission);
   const isResumable = !isActuallyRunning && mission.resumable &&
