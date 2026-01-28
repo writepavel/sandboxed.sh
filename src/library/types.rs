@@ -160,6 +160,9 @@ pub struct WorkspaceTemplateSummary {
     /// Skills enabled for this template (optional summary)
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Vec<String>,
 }
 
 /// Full workspace template definition.
@@ -184,7 +187,10 @@ pub struct WorkspaceTemplate {
     /// Keys of env vars that should be encrypted at rest
     #[serde(default)]
     pub encrypted_keys: Vec<String>,
-    /// Init script to run on build
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Vec<String>,
+    /// Custom init script to run on build (appended after fragments)
     #[serde(default)]
     pub init_script: String,
     /// Whether to share the host network (default: true).
@@ -196,6 +202,36 @@ pub struct WorkspaceTemplate {
     /// Empty = use default MCPs (those with `default_enabled = true`).
     #[serde(default)]
     pub mcps: Vec<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init Script Fragment Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Init script fragment summary for listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitScriptSummary {
+    /// Fragment name (folder name, e.g., "base", "ssh-keys")
+    pub name: String,
+    /// Description extracted from first comment line
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root (e.g., "init-script/base/SCRIPT.sh")
+    pub path: String,
+}
+
+/// Full init script fragment with content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitScript {
+    /// Fragment name
+    pub name: String,
+    /// Description extracted from first comment line
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+    /// Full script content
+    pub content: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -25,10 +25,10 @@ use tokio::sync::RwLock;
 
 use crate::library::{
     rename::{ItemType, RenameResult},
-    ClaudeCodeConfig, Command, CommandSummary, GitAuthor, LibraryAgent, LibraryAgentSummary,
-    LibraryStatus, LibraryStore, LibraryTool, LibraryToolSummary, McpServer, MigrationReport,
-    OpenAgentConfig, Plugin, Skill, SkillSummary, WorkspaceTemplate,
-    WorkspaceTemplateSummary,
+    ClaudeCodeConfig, Command, CommandSummary, GitAuthor, InitScript, InitScriptSummary,
+    LibraryAgent, LibraryAgentSummary, LibraryStatus, LibraryStore, LibraryTool,
+    LibraryToolSummary, McpServer, MigrationReport, OpenAgentConfig, Plugin, Skill, SkillSummary,
+    WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
 use crate::workspace::{self, WorkspaceType, DEFAULT_WORKSPACE_ID};
@@ -250,6 +250,11 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
             "/workspace-template/:name",
             delete(delete_workspace_template),
         )
+        // Init Scripts
+        .route("/init-script", get(list_init_scripts))
+        .route("/init-script/:name", get(get_init_script))
+        .route("/init-script/:name", put(save_init_script))
+        .route("/init-script/:name", delete(delete_init_script))
         // Migration
         .route("/migrate", post(migrate_library))
         // Rename (works for all item types)
@@ -297,6 +302,10 @@ pub struct SaveWorkspaceTemplateRequest {
     pub skills: Option<Vec<String>>,
     pub env_vars: Option<HashMap<String, String>>,
     pub encrypted_keys: Option<Vec<String>>,
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Option<Vec<String>>,
+    /// Custom init script to run on build (appended after fragments)
     pub init_script: Option<String>,
     /// Whether to share the host network (default: true).
     /// Set to false for isolated networking (e.g., Tailscale).
@@ -1047,6 +1056,7 @@ async fn save_workspace_template(
         skills: sanitize_skill_list(req.skills.unwrap_or_default()),
         env_vars: req.env_vars.unwrap_or_default(),
         encrypted_keys: req.encrypted_keys.unwrap_or_default(),
+        init_scripts: req.init_scripts.unwrap_or_default(),
         init_script: req.init_script.unwrap_or_default(),
         shared_network: req.shared_network,
         mcps: req.mcps.unwrap_or_default(),
@@ -1078,6 +1088,78 @@ async fn delete_workspace_template(
             (
                 StatusCode::OK,
                 "Workspace template deleted successfully".to_string(),
+            )
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init Scripts
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/init-script - List all init script fragments.
+async fn list_init_scripts(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<InitScriptSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_init_scripts()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/init-script/:name - Get an init script fragment by name.
+async fn get_init_script(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<InitScript>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library.get_init_script(&name).await.map(Json).map_err(|e| {
+        if e.to_string().contains("not found") {
+            (StatusCode::NOT_FOUND, e.to_string())
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    })
+}
+
+/// PUT /api/library/init-script/:name - Save an init script fragment.
+async fn save_init_script(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SaveContentRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_init_script(&name, &req.content)
+        .await
+        .map(|_| {
+            (
+                StatusCode::OK,
+                "Init script saved successfully".to_string(),
+            )
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/init-script/:name - Delete an init script fragment.
+async fn delete_init_script(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_init_script(&name)
+        .await
+        .map(|_| {
+            (
+                StatusCode::OK,
+                "Init script deleted successfully".to_string(),
             )
         })
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

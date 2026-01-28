@@ -39,6 +39,10 @@ struct WorkspaceTemplateConfig {
     /// Keys of env vars that should be encrypted at rest (stored alongside encrypted values)
     #[serde(default)]
     encrypted_keys: Vec<String>,
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    init_scripts: Vec<String>,
+    /// Custom init script to run on build (appended after fragments)
     #[serde(default)]
     init_script: String,
     /// Whether to share the host network (default: true).
@@ -54,6 +58,7 @@ const SKILL_DIR: &str = "skill";
 const COMMAND_DIR: &str = "command";
 const AGENT_DIR: &str = "agent";
 const TOOL_DIR: &str = "tool";
+const INIT_SCRIPT_DIR: &str = "init-script";
 const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
 const OPENCODE_DIR: &str = "opencode";
@@ -371,17 +376,39 @@ impl LibraryStore {
         let skill_dir = self.skills_dir().join(name);
         let skill_md = skill_dir.join("SKILL.md");
 
+        tracing::debug!(
+            skill = %name,
+            path = %skill_md.display(),
+            has_encrypted_tags = env_crypto::has_encrypted_tags(content),
+            content_len = content.len(),
+            "Saving skill"
+        );
+
         // Ensure directory exists
         fs::create_dir_all(&skill_dir).await?;
 
         // Encrypt any unversioned encrypted tags (lazily generates key if needed)
         let key = env_crypto::ensure_private_key().await
             .context("Failed to ensure encryption key for saving skill")?;
+
+        tracing::debug!(skill = %name, "Encryption key loaded, encrypting content tags");
+
         let encrypted_content = env_crypto::encrypt_content_tags(&key, content)?;
 
-        fs::write(&skill_md, encrypted_content)
+        let content_changed = encrypted_content != content;
+        tracing::info!(
+            skill = %name,
+            content_changed = content_changed,
+            original_len = content.len(),
+            encrypted_len = encrypted_content.len(),
+            "Skill content encryption complete"
+        );
+
+        fs::write(&skill_md, &encrypted_content)
             .await
             .context("Failed to write SKILL.md")?;
+
+        tracing::debug!(skill = %name, path = %skill_md.display(), "Skill saved successfully");
 
         Ok(())
     }
@@ -1095,6 +1122,10 @@ impl LibraryStore {
                 .as_ref()
                 .map(|c| c.skills.clone())
                 .unwrap_or_default();
+            let init_scripts = config
+                .as_ref()
+                .map(|c| c.init_scripts.clone())
+                .unwrap_or_default();
             let template_name = config
                 .as_ref()
                 .and_then(|c| c.name.clone())
@@ -1105,6 +1136,7 @@ impl LibraryStore {
                 description,
                 distro,
                 skills,
+                init_scripts,
                 path: format!("{}/{}", WORKSPACE_TEMPLATE_DIR, file_name),
             });
         }
@@ -1175,6 +1207,7 @@ impl LibraryStore {
             skills: config.skills,
             env_vars,
             encrypted_keys,
+            init_scripts: config.init_scripts,
             init_script: config.init_script,
             shared_network: config.shared_network,
             mcps: config.mcps,
@@ -1224,6 +1257,7 @@ impl LibraryStore {
             skills: template.skills.clone(),
             env_vars,
             encrypted_keys: template.encrypted_keys.clone(),
+            init_scripts: template.init_scripts.clone(),
             init_script: template.init_script.clone(),
             shared_network: template.shared_network,
             mcps: template.mcps.clone(),
@@ -1252,6 +1286,202 @@ impl LibraryStore {
         }
 
         Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Init Script Fragments (init-script/*/SCRIPT.sh)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// List all init script fragments with their summaries.
+    pub async fn list_init_scripts(&self) -> Result<Vec<InitScriptSummary>> {
+        let init_scripts_dir = self.path.join(INIT_SCRIPT_DIR);
+
+        if !init_scripts_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut scripts = Vec::new();
+        let mut entries = fs::read_dir(&init_scripts_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let entry_path = entry.path();
+
+            // Only process directories
+            if !entry_path.is_dir() {
+                continue;
+            }
+
+            let script_sh = entry_path.join("SCRIPT.sh");
+            if !script_sh.exists() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Read and extract description from first comment line
+            let content = fs::read_to_string(&script_sh).await.ok();
+            let description = content.as_ref().and_then(|c| Self::extract_script_description(c));
+
+            scripts.push(InitScriptSummary {
+                name,
+                description,
+                path: format!("{}/{}/SCRIPT.sh", INIT_SCRIPT_DIR, entry.file_name().to_string_lossy()),
+            });
+        }
+
+        // Sort by name
+        scripts.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(scripts)
+    }
+
+    /// Get an init script fragment by name with full content.
+    pub async fn get_init_script(&self, name: &str) -> Result<InitScript> {
+        Self::validate_name(name)?;
+        let script_dir = self.path.join(INIT_SCRIPT_DIR).join(name);
+        let script_sh = script_dir.join("SCRIPT.sh");
+
+        if !script_sh.exists() {
+            anyhow::bail!("Init script not found: {}", name);
+        }
+
+        let content = fs::read_to_string(&script_sh)
+            .await
+            .context("Failed to read SCRIPT.sh")?;
+
+        let description = Self::extract_script_description(&content);
+
+        Ok(InitScript {
+            name: name.to_string(),
+            description,
+            path: format!("{}/{}/SCRIPT.sh", INIT_SCRIPT_DIR, name),
+            content,
+        })
+    }
+
+    /// Save an init script fragment.
+    pub async fn save_init_script(&self, name: &str, content: &str) -> Result<()> {
+        Self::validate_name(name)?;
+
+        let script_dir = self.path.join(INIT_SCRIPT_DIR).join(name);
+        let script_sh = script_dir.join("SCRIPT.sh");
+
+        // Ensure directory exists
+        fs::create_dir_all(&script_dir).await?;
+
+        fs::write(&script_sh, content)
+            .await
+            .context("Failed to write SCRIPT.sh")?;
+
+        Ok(())
+    }
+
+    /// Delete an init script fragment and its directory.
+    pub async fn delete_init_script(&self, name: &str) -> Result<()> {
+        Self::validate_name(name)?;
+
+        let script_dir = self.path.join(INIT_SCRIPT_DIR).join(name);
+
+        if script_dir.exists() {
+            fs::remove_dir_all(&script_dir)
+                .await
+                .context("Failed to delete init script directory")?;
+        }
+
+        Ok(())
+    }
+
+    /// Assemble a combined init script from fragments and optional custom script.
+    /// Each fragment is prefixed with a header comment for debugging.
+    pub async fn assemble_init_script(
+        &self,
+        fragment_names: &[String],
+        custom_script: Option<&str>,
+    ) -> Result<String> {
+        let mut assembled = String::new();
+
+        // Add shebang
+        assembled.push_str("#!/usr/bin/env bash\n");
+        assembled.push_str("# Auto-assembled init script from fragments\n\n");
+
+        // Add each fragment
+        for name in fragment_names {
+            let script = self.get_init_script(name).await?;
+
+            // Add header for this fragment
+            assembled.push_str(&format!("\n# === {} ===\n", name));
+
+            // Strip shebang from fragment content if present
+            let content = if script.content.starts_with("#!") {
+                // Skip the first line (shebang)
+                script.content.lines().skip(1).collect::<Vec<_>>().join("\n")
+            } else {
+                script.content.clone()
+            };
+
+            assembled.push_str(&content);
+            assembled.push_str("\n");
+        }
+
+        // Add custom script at the end if provided
+        if let Some(custom) = custom_script {
+            let trimmed = custom.trim();
+            if !trimmed.is_empty() {
+                assembled.push_str("\n# === Custom Script ===\n");
+
+                // Strip shebang from custom script if present
+                let content = if trimmed.starts_with("#!") {
+                    trimmed.lines().skip(1).collect::<Vec<_>>().join("\n")
+                } else {
+                    trimmed.to_string()
+                };
+
+                assembled.push_str(&content);
+                assembled.push_str("\n");
+            }
+        }
+
+        Ok(assembled)
+    }
+
+    /// Extract description from the first comment line after shebang.
+    /// Supports formats like:
+    /// - `# Description: Base logging and error handling`
+    /// - `# Base logging and error handling`
+    fn extract_script_description(content: &str) -> Option<String> {
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Skip shebang
+            if trimmed.starts_with("#!") {
+                continue;
+            }
+
+            // Skip empty lines
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Found a comment line - extract description
+            if trimmed.starts_with('#') {
+                let comment = trimmed.trim_start_matches('#').trim();
+
+                // Handle "Description: ..." format
+                if let Some(desc) = comment.strip_prefix("Description:") {
+                    return Some(desc.trim().to_string());
+                }
+
+                // Otherwise use the whole comment as description
+                if !comment.is_empty() {
+                    return Some(comment.to_string());
+                }
+            }
+
+            // Non-comment, non-empty line - stop looking
+            break;
+        }
+
+        None
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1415,6 +1645,7 @@ impl LibraryStore {
         let _ = fs::create_dir_all(self.path.join(COMMAND_DIR)).await;
         let _ = fs::create_dir_all(self.path.join(AGENT_DIR)).await;
         let _ = fs::create_dir_all(self.path.join(TOOL_DIR)).await;
+        let _ = fs::create_dir_all(self.path.join(INIT_SCRIPT_DIR)).await;
 
         report.success = true;
         Ok(report)

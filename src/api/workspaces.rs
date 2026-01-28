@@ -327,6 +327,12 @@ async fn create_workspace(
     }
     skills = sanitize_skill_list(skills);
 
+    // Init script fragments from template
+    let init_scripts = template_data
+        .as_ref()
+        .map(|t| t.init_scripts.clone())
+        .unwrap_or_default();
+
     let mut init_script = template_data.as_ref().map(|t| t.init_script.clone());
     if let Some(custom_script) = req.init_script.clone() {
         init_script = Some(custom_script);
@@ -369,6 +375,7 @@ async fn create_workspace(
             template: req.template.clone(),
             distro,
             env_vars,
+            init_scripts: init_scripts.clone(),
             init_script,
             created_at: chrono::Utc::now(),
             skills,
@@ -385,6 +392,7 @@ async fn create_workspace(
             ws.template = req.template.clone();
             ws.distro = distro;
             ws.env_vars = env_vars;
+            ws.init_scripts = init_scripts;
             ws.init_script = init_script;
             ws.shared_network = shared_network;
             ws.mcps = mcps;
@@ -442,6 +450,11 @@ async fn create_workspace(
         let workspaces_store = Arc::clone(&state.workspaces);
         let working_dir = state.config.working_dir.clone();
         let mut workspace_for_build = workspace.clone();
+        // Get library for init script assembly
+        let library = {
+            let guard = state.library.read().await;
+            guard.as_ref().map(Arc::clone)
+        };
 
         tokio::spawn(async move {
             let result = crate::workspace::build_container_workspace(
@@ -449,6 +462,7 @@ async fn create_workspace(
                 distro,
                 false, // don't force rebuild
                 &working_dir,
+                library.as_deref(),
             )
             .await;
 
@@ -811,6 +825,11 @@ async fn build_workspace(
     let workspaces_store = Arc::clone(&state.workspaces);
     let working_dir = state.config.working_dir.clone();
     let mut workspace_for_build = workspace.clone();
+    // Get library for init script assembly
+    let library = {
+        let guard = state.library.read().await;
+        guard.as_ref().map(Arc::clone)
+    };
 
     tokio::spawn(async move {
         let result = crate::workspace::build_container_workspace(
@@ -818,6 +837,7 @@ async fn build_workspace(
             distro,
             force_rebuild,
             &working_dir,
+            library.as_deref(),
         )
         .await;
 

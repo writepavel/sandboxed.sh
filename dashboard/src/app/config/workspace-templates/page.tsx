@@ -8,10 +8,12 @@ import {
   deleteWorkspaceTemplate,
   renameWorkspaceTemplate,
   listLibrarySkills,
+  listInitScripts,
   CONTAINER_DISTROS,
   type WorkspaceTemplate,
   type WorkspaceTemplateSummary,
   type SkillSummary,
+  type InitScriptSummary,
 } from '@/lib/api';
 import {
   GitBranch,
@@ -28,6 +30,9 @@ import {
   Terminal,
   Upload,
   Pencil,
+  ChevronUp,
+  ChevronDown,
+  FileCode,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { LibraryUnavailable } from '@/components/library-unavailable';
@@ -51,6 +56,7 @@ const buildSnapshot = (data: {
   distro: string;
   skills: string[];
   envRows: EnvRow[];
+  initScripts: string[];
   initScript: string;
   sharedNetwork: boolean | null;
 }) =>
@@ -59,6 +65,7 @@ const buildSnapshot = (data: {
     distro: data.distro,
     skills: data.skills,
     env: data.envRows.map((row) => ({ key: row.key, value: row.value, encrypted: row.encrypted })),
+    initScripts: data.initScripts,
     initScript: data.initScript,
     sharedNetwork: data.sharedNetwork,
   });
@@ -87,6 +94,10 @@ export default function WorkspaceTemplatesPage() {
   const [skillsFilter, setSkillsFilter] = useState('');
   const [templateFilter, setTemplateFilter] = useState('');
 
+  const [initScriptFragments, setInitScriptFragments] = useState<InitScriptSummary[]>([]);
+  const [initScriptFragmentsError, setInitScriptFragmentsError] = useState<string | null>(null);
+  const [initScriptFragmentsFilter, setInitScriptFragmentsFilter] = useState('');
+
   const [selectedTemplate, setSelectedTemplate] = useState<WorkspaceTemplate | null>(null);
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TemplateTab>('overview');
@@ -95,6 +106,7 @@ export default function WorkspaceTemplatesPage() {
   const [distro, setDistro] = useState<string>('');
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [envRows, setEnvRows] = useState<EnvRow[]>([]);
+  const [selectedInitScripts, setSelectedInitScripts] = useState<string[]>([]);
   const [initScript, setInitScript] = useState('');
   const [sharedNetwork, setSharedNetwork] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
@@ -120,10 +132,11 @@ export default function WorkspaceTemplatesPage() {
         distro,
         skills: selectedSkills,
         envRows,
+        initScripts: selectedInitScripts,
         initScript,
         sharedNetwork,
       }),
-    [description, distro, selectedSkills, envRows, initScript, sharedNetwork]
+    [description, distro, selectedSkills, envRows, selectedInitScripts, initScript, sharedNetwork]
   );
 
   useEffect(() => {
@@ -172,11 +185,23 @@ export default function WorkspaceTemplatesPage() {
     }
   }, []);
 
+  const loadInitScriptFragments = useCallback(async () => {
+    try {
+      setInitScriptFragmentsError(null);
+      const data = await listInitScripts();
+      setInitScriptFragments(data);
+    } catch (err) {
+      setInitScriptFragments([]);
+      setInitScriptFragmentsError(err instanceof Error ? err.message : 'Failed to load init scripts');
+    }
+  }, []);
+
   useEffect(() => {
     if (libraryUnavailable || loading) return;
     loadTemplates();
     loadSkills();
-  }, [libraryUnavailable, loading, loadTemplates, loadSkills]);
+    loadInitScriptFragments();
+  }, [libraryUnavailable, loading, loadTemplates, loadSkills, loadInitScriptFragments]);
 
   const loadTemplate = useCallback(async (name: string) => {
     try {
@@ -189,6 +214,7 @@ export default function WorkspaceTemplatesPage() {
       setSelectedSkills(template.skills || []);
       const rows = toEnvRows(template.env_vars || {}, template.encrypted_keys);
       setEnvRows(rows);
+      setSelectedInitScripts(template.init_scripts || []);
       setInitScript(template.init_script || '');
       setSharedNetwork(template.shared_network ?? null);
       baselineRef.current = buildSnapshot({
@@ -196,6 +222,7 @@ export default function WorkspaceTemplatesPage() {
         distro: template.distro || '',
         skills: template.skills || [],
         envRows: rows,
+        initScripts: template.init_scripts || [],
         initScript: template.init_script || '',
         sharedNetwork: template.shared_network ?? null,
       });
@@ -215,6 +242,7 @@ export default function WorkspaceTemplatesPage() {
         skills: selectedSkills,
         env_vars: envRowsToMap(envRows),
         encrypted_keys: getEncryptedKeys(envRows),
+        init_scripts: selectedInitScripts,
         init_script: initScript,
         shared_network: sharedNetwork,
       });
@@ -263,6 +291,7 @@ export default function WorkspaceTemplatesPage() {
       setDistro('');
       setSelectedSkills([]);
       setEnvRows([]);
+      setSelectedInitScripts([]);
       setInitScript('');
       setSharedNetwork(null);
       setDirty(false);
@@ -332,10 +361,34 @@ export default function WorkspaceTemplatesPage() {
     return skills.filter((skill) => skill.name.toLowerCase().includes(term));
   }, [skills, skillsFilter]);
 
+  const filteredInitScriptFragments = useMemo(() => {
+    const term = initScriptFragmentsFilter.trim().toLowerCase();
+    if (!term) return initScriptFragments;
+    return initScriptFragments.filter((fragment) => fragment.name.toLowerCase().includes(term));
+  }, [initScriptFragments, initScriptFragmentsFilter]);
+
   const toggleSkill = (name: string) => {
     setSelectedSkills((prev) =>
       prev.includes(name) ? prev.filter((s) => s !== name) : [...prev, name]
     );
+  };
+
+  const toggleInitScript = (name: string) => {
+    setSelectedInitScripts((prev) =>
+      prev.includes(name) ? prev.filter((s) => s !== name) : [...prev, name]
+    );
+  };
+
+  const moveInitScript = (name: string, direction: 'up' | 'down') => {
+    setSelectedInitScripts((prev) => {
+      const idx = prev.indexOf(name);
+      if (idx === -1) return prev;
+      const newIdx = direction === 'up' ? idx - 1 : idx + 1;
+      if (newIdx < 0 || newIdx >= prev.length) return prev;
+      const updated = [...prev];
+      [updated[idx], updated[newIdx]] = [updated[newIdx], updated[idx]];
+      return updated;
+    });
   };
 
   if (loading) {
@@ -728,32 +781,135 @@ export default function WorkspaceTemplatesPage() {
                 )}
 
                 {activeTab === 'init' && (
-                  <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden flex flex-col flex-1">
-                    <div className="px-4 py-3 border-b border-white/[0.05] flex items-center gap-2 flex-shrink-0">
-                      <Terminal className="h-4 w-4 text-indigo-400" />
-                      <p className="text-xs text-white/50 font-medium">Init Script</p>
-                    </div>
-                    <div className="p-4 flex flex-col flex-1 min-h-0">
-                      <div className="flex-1 min-h-[288px] rounded-lg bg-black/20 border border-white/[0.06] overflow-auto focus-within:border-indigo-500/50 transition-colors">
-                        <Editor
-                          value={initScript}
-                          onValueChange={setInitScript}
-                          highlight={(code) => highlight(code, languages.bash, 'bash')}
-                          placeholder="#!/usr/bin/env bash&#10;# Install packages or setup files here"
-                          padding={12}
-                          style={{
-                            fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
-                            fontSize: 12,
-                            lineHeight: 1.6,
-                            minHeight: '100%',
-                          }}
-                          className="init-script-editor"
-                          textareaClassName="focus:outline-none"
-                        />
+                  <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto">
+                    {/* Init Script Fragments Selector */}
+                    <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden flex-shrink-0">
+                      <div className="px-4 py-3 border-b border-white/[0.05] flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <FileCode className="h-4 w-4 text-indigo-400" />
+                          <p className="text-xs text-white/50 font-medium">Init Script Fragments</p>
+                        </div>
+                        <span className="text-xs text-white/40">{selectedInitScripts.length} selected</span>
                       </div>
-                      <p className="text-xs text-white/35 mt-3 flex-shrink-0">
-                        Runs during build for workspaces created from this template.
-                      </p>
+                      <div className="p-4">
+                        {/* Selected fragments with reorder controls */}
+                        {selectedInitScripts.length > 0 && (
+                          <div className="mb-3 space-y-1.5">
+                            {selectedInitScripts.map((name, idx) => {
+                              const fragment = initScriptFragments.find((f) => f.name === name);
+                              return (
+                                <div
+                                  key={name}
+                                  className="flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-500/10 border border-indigo-500/25"
+                                >
+                                  <span className="text-[10px] text-indigo-300 font-medium w-5">{idx + 1}.</span>
+                                  <span className="text-xs text-white flex-1">{name}</span>
+                                  {fragment?.description && (
+                                    <span className="text-[10px] text-white/40 truncate max-w-[150px]">
+                                      {fragment.description}
+                                    </span>
+                                  )}
+                                  <div className="flex items-center gap-0.5">
+                                    <button
+                                      onClick={() => moveInitScript(name, 'up')}
+                                      disabled={idx === 0}
+                                      className="p-1 rounded hover:bg-white/10 disabled:opacity-30"
+                                    >
+                                      <ChevronUp className="h-3 w-3 text-white/60" />
+                                    </button>
+                                    <button
+                                      onClick={() => moveInitScript(name, 'down')}
+                                      disabled={idx === selectedInitScripts.length - 1}
+                                      className="p-1 rounded hover:bg-white/10 disabled:opacity-30"
+                                    >
+                                      <ChevronDown className="h-3 w-3 text-white/60" />
+                                    </button>
+                                    <button
+                                      onClick={() => toggleInitScript(name)}
+                                      className="p-1 rounded hover:bg-white/10"
+                                    >
+                                      <X className="h-3 w-3 text-white/60" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {/* Available fragments */}
+                        <input
+                          value={initScriptFragmentsFilter}
+                          onChange={(e) => setInitScriptFragmentsFilter(e.target.value)}
+                          placeholder="Search fragments..."
+                          className="w-full px-3 py-2 rounded-lg bg-black/20 border border-white/[0.06] text-xs text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50 mb-3"
+                        />
+                        {initScriptFragmentsError ? (
+                          <p className="text-xs text-red-400 py-4 text-center">{initScriptFragmentsError}</p>
+                        ) : initScriptFragments.length === 0 ? (
+                          <div className="py-4 text-center">
+                            <FileCode className="h-6 w-6 text-white/10 mx-auto mb-2" />
+                            <p className="text-xs text-white/40">No init script fragments in library</p>
+                          </div>
+                        ) : (
+                          <div className="max-h-40 overflow-y-auto space-y-1.5">
+                            {filteredInitScriptFragments.filter((f) => !selectedInitScripts.includes(f.name)).map((fragment) => (
+                              <button
+                                key={fragment.name}
+                                onClick={() => toggleInitScript(fragment.name)}
+                                className="w-full text-left px-3 py-2 rounded-lg border bg-black/10 border-white/[0.04] text-white/70 hover:bg-black/20 hover:border-white/[0.08] transition-all"
+                              >
+                                <div className="flex items-center justify-between gap-3">
+                                  <span className="text-xs font-medium">{fragment.name}</span>
+                                  <Plus className="h-3 w-3 text-white/40" />
+                                </div>
+                                {fragment.description && (
+                                  <p className="mt-1 text-[11px] text-white/40 line-clamp-1">
+                                    {fragment.description}
+                                  </p>
+                                )}
+                              </button>
+                            ))}
+                            {filteredInitScriptFragments.filter((f) => !selectedInitScripts.includes(f.name)).length === 0 && (
+                              <p className="text-xs text-white/40 py-2 text-center">
+                                {selectedInitScripts.length > 0 ? 'All fragments selected' : 'No matching fragments'}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        <p className="text-xs text-white/35 mt-3 pt-3 border-t border-white/[0.04]">
+                          Fragments are executed in order during workspace build.
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Custom Init Script */}
+                    <div className="rounded-xl bg-white/[0.02] border border-white/[0.05] overflow-hidden flex flex-col flex-1 min-h-[250px]">
+                      <div className="px-4 py-3 border-b border-white/[0.05] flex items-center gap-2 flex-shrink-0">
+                        <Terminal className="h-4 w-4 text-indigo-400" />
+                        <p className="text-xs text-white/50 font-medium">Custom Init Script</p>
+                      </div>
+                      <div className="p-4 flex flex-col flex-1 min-h-0">
+                        <div className="flex-1 min-h-[150px] rounded-lg bg-black/20 border border-white/[0.06] overflow-auto focus-within:border-indigo-500/50 transition-colors">
+                          <Editor
+                            value={initScript}
+                            onValueChange={setInitScript}
+                            highlight={(code) => highlight(code, languages.bash, 'bash')}
+                            placeholder="#!/usr/bin/env bash&#10;# Additional setup that runs after fragments"
+                            padding={12}
+                            style={{
+                              fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+                              fontSize: 12,
+                              lineHeight: 1.6,
+                              minHeight: '100%',
+                            }}
+                            className="init-script-editor"
+                            textareaClassName="focus:outline-none"
+                          />
+                        </div>
+                        <p className="text-xs text-white/35 mt-3 flex-shrink-0">
+                          Runs after fragments during build.
+                        </p>
+                      </div>
                     </div>
                   </div>
                 )}

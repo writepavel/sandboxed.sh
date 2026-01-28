@@ -22,6 +22,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::library::env_crypto::strip_encrypted_tags;
 use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
@@ -124,7 +125,10 @@ pub struct Workspace {
     /// Environment variables always loaded for this workspace
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
-    /// Init script to run when the workspace is built/rebuilt
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Vec<String>,
+    /// Custom init script to run when the workspace is built/rebuilt (after fragments)
     #[serde(default)]
     pub init_script: Option<String>,
     /// Creation timestamp
@@ -164,6 +168,7 @@ impl Workspace {
             template: None,
             distro: None,
             env_vars: HashMap::new(),
+            init_scripts: Vec::new(),
             init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
@@ -187,6 +192,7 @@ impl Workspace {
             template: None,
             distro: None,
             env_vars: HashMap::new(),
+            init_scripts: Vec::new(),
             init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
@@ -376,6 +382,7 @@ impl WorkspaceStore {
                     template: None,
                     distro: None,
                     env_vars: HashMap::new(),
+                    init_scripts: Vec::new(),
                     init_script: None,
                     created_at: Utc::now(), // We don't know the actual creation time
                     skills: Vec::new(),
@@ -1542,6 +1549,9 @@ fn ensure_skill_name_in_frontmatter(content: &str, skill_name: &str) -> String {
 /// Write skill files to the workspace's `.opencode/skill/` directory.
 /// This makes skills available to OpenCode when running in this workspace.
 /// OpenCode looks for skills in `.opencode/{skill,skills}/**/SKILL.md`
+///
+/// Note: `<encrypted>` tags are stripped from content before writing,
+/// leaving only the plaintext values for the agent to use.
 pub async fn write_skills_to_workspace(
     workspace_dir: &Path,
     skills: &[SkillContent],
@@ -1560,9 +1570,12 @@ pub async fn write_skills_to_workspace(
         // Ensure skill content has required `name` field in frontmatter
         let content_with_name = ensure_skill_name_in_frontmatter(&skill.content, &skill.name);
 
+        // Strip <encrypted> tags - deployed skills should have bare plaintext values
+        let content_for_workspace = strip_encrypted_tags(&content_with_name);
+
         // Write SKILL.md
         let skill_md_path = skill_dir.join("SKILL.md");
-        tokio::fs::write(&skill_md_path, &content_with_name).await?;
+        tokio::fs::write(&skill_md_path, &content_for_workspace).await?;
 
         // Write additional files (preserving subdirectory structure)
         for (relative_path, file_content) in &skill.files {
@@ -1571,7 +1584,9 @@ pub async fn write_skills_to_workspace(
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&file_path, file_content).await?;
+            // Also strip encrypted tags from additional files
+            let file_content_stripped = strip_encrypted_tags(file_content);
+            tokio::fs::write(&file_path, file_content_stripped).await?;
         }
 
         tracing::debug!(
@@ -1593,6 +1608,9 @@ pub async fn write_skills_to_workspace(
 /// Write skill files to the workspace's `.claude/skills/` directory.
 /// This makes skills available to Claude Code using its native skills format.
 /// Claude Code looks for skills in `.claude/skills/<name>/SKILL.md`
+///
+/// Note: `<encrypted>` tags are stripped from content before writing,
+/// leaving only the plaintext values for the agent to use.
 pub async fn write_claudecode_skills_to_workspace(
     workspace_dir: &Path,
     skills: &[SkillContent],
@@ -1630,9 +1648,12 @@ pub async fn write_claudecode_skills_to_workspace(
         let content_with_frontmatter =
             ensure_claudecode_skill_frontmatter(&skill.content, &skill.name, skill.description.as_deref());
 
+        // Strip <encrypted> tags - deployed skills should have bare plaintext values
+        let content_for_workspace = strip_encrypted_tags(&content_with_frontmatter);
+
         // Write SKILL.md
         let skill_md_path = skill_dir.join("SKILL.md");
-        tokio::fs::write(&skill_md_path, &content_with_frontmatter).await?;
+        tokio::fs::write(&skill_md_path, &content_for_workspace).await?;
 
         // Write additional files (preserving subdirectory structure)
         for (relative_path, file_content) in &skill.files {
@@ -1641,7 +1662,9 @@ pub async fn write_claudecode_skills_to_workspace(
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&file_path, file_content).await?;
+            // Also strip encrypted tags from additional files
+            let file_content_stripped = strip_encrypted_tags(file_content);
+            tokio::fs::write(&file_path, file_content_stripped).await?;
         }
 
         tracing::debug!(
@@ -2983,6 +3006,7 @@ pub async fn build_container_workspace(
     distro: Option<NspawnDistro>,
     force_rebuild: bool,
     working_dir: &Path,
+    library: Option<&LibraryStore>,
 ) -> anyhow::Result<()> {
     if workspace.workspace_type != WorkspaceType::Container {
         return Err(anyhow::anyhow!("Workspace is not a container type"));
@@ -3088,10 +3112,12 @@ pub async fn build_container_workspace(
                 return Err(e);
             }
 
-            if workspace.init_script.as_ref().map_or(false, |s| !s.trim().is_empty()) {
+            let has_init_scripts = !workspace.init_scripts.is_empty();
+            let has_custom_script = workspace.init_script.as_ref().map_or(false, |s| !s.trim().is_empty());
+            if has_init_scripts || has_custom_script {
                 append_to_init_log(&workspace.path, "[openagent] Running init script...\n");
             }
-            if let Err(e) = run_workspace_init_script(workspace).await {
+            if let Err(e) = run_workspace_init_script(workspace, library).await {
                 append_to_init_log(
                     &workspace.path,
                     &format!("[openagent] Init script failed: {}\n", e),
@@ -3329,19 +3355,55 @@ echo "[openagent] Harness bootstrap done"
     Ok(())
 }
 
-async fn run_workspace_init_script(workspace: &Workspace) -> anyhow::Result<()> {
-    let script = workspace
-        .init_script
-        .as_ref()
-        .map(|s| s.trim())
-        .unwrap_or("");
+async fn run_workspace_init_script(
+    workspace: &Workspace,
+    library: Option<&LibraryStore>,
+) -> anyhow::Result<()> {
+    let has_fragments = !workspace.init_scripts.is_empty();
+    let custom_script = workspace.init_script.as_ref().map(|s| s.trim()).unwrap_or("");
+
+    // If there are fragments and we have a library, assemble them
+    let script = if has_fragments {
+        if let Some(library) = library {
+            // Assemble fragments + custom script
+            let custom = if custom_script.is_empty() {
+                None
+            } else {
+                Some(custom_script)
+            };
+            match library
+                .assemble_init_script(&workspace.init_scripts, custom)
+                .await
+            {
+                Ok(assembled) => assembled,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        error = %e,
+                        "Failed to assemble init script fragments, falling back to custom script only"
+                    );
+                    custom_script.to_string()
+                }
+            }
+        } else {
+            // No library available, just use custom script
+            tracing::warn!(
+                workspace = %workspace.name,
+                "Init script fragments specified but library not available"
+            );
+            custom_script.to_string()
+        }
+    } else {
+        // No fragments, just use custom script
+        custom_script.to_string()
+    };
 
     if script.is_empty() {
         return Ok(());
     }
 
     let script_path = workspace.path.join("openagent-init.sh");
-    tokio::fs::write(&script_path, script).await?;
+    tokio::fs::write(&script_path, &script).await?;
 
     #[cfg(unix)]
     {

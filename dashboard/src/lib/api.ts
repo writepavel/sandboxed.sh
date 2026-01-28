@@ -1712,6 +1712,7 @@ export interface WorkspaceTemplateSummary {
   path: string;
   distro?: string;
   skills?: string[];
+  init_scripts?: string[];
 }
 
 export interface WorkspaceTemplate {
@@ -1722,6 +1723,7 @@ export interface WorkspaceTemplate {
   skills: string[];
   env_vars: Record<string, string>;
   encrypted_keys: string[];
+  init_scripts: string[];
   init_script: string;
   shared_network?: boolean | null;
 }
@@ -1742,6 +1744,7 @@ export async function saveWorkspaceTemplate(
     skills?: string[];
     env_vars?: Record<string, string>;
     encrypted_keys?: string[];
+    init_scripts?: string[];
     init_script?: string;
     shared_network?: boolean | null;
   }
@@ -1763,11 +1766,42 @@ export async function renameWorkspaceTemplate(oldName: string, newName: string):
     skills: template.skills,
     env_vars: template.env_vars,
     encrypted_keys: template.encrypted_keys,
+    init_scripts: template.init_scripts,
     init_script: template.init_script,
     shared_network: template.shared_network,
   });
   // Delete old template
   await deleteWorkspaceTemplate(oldName);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init Scripts
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface InitScriptSummary {
+  name: string;
+  description?: string | null;
+  path: string;
+}
+
+export interface InitScript extends InitScriptSummary {
+  content: string;
+}
+
+export async function listInitScripts(): Promise<InitScriptSummary[]> {
+  return libGet("/api/library/init-script", "Failed to fetch init scripts");
+}
+
+export async function getInitScript(name: string): Promise<InitScript> {
+  return libGet(`/api/library/init-script/${encodeURIComponent(name)}`, "Failed to fetch init script");
+}
+
+export async function saveInitScript(name: string, content: string): Promise<void> {
+  return libPut(`/api/library/init-script/${encodeURIComponent(name)}`, { content }, "Failed to save init script");
+}
+
+export async function deleteInitScript(name: string): Promise<void> {
+  return libDel(`/api/library/init-script/${encodeURIComponent(name)}`, "Failed to delete init script");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

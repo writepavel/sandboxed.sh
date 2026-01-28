@@ -2,8 +2,8 @@
 //!
 //! Starts the HTTP server that exposes the agent API.
 
-use open_agent::{api, config::Config};
-use tracing::info;
+use open_agent::{api, config::Config, library::env_crypto};
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -43,6 +43,12 @@ async fn main() -> anyhow::Result<()> {
         "OPEN_AGENT_RUNTIME_WORKSPACE_FILE",
         runtime_workspace_file.to_string_lossy().to_string(),
     );
+
+    // Initialize encryption key (ensures key is available for library operations)
+    match env_crypto::ensure_private_key().await {
+        Ok(_) => info!("Encryption key initialized"),
+        Err(e) => warn!("Could not initialize encryption key: {}. Library encryption will be unavailable.", e),
+    }
 
     // Start HTTP server
     let addr = format!("{}:{}", config.host, config.port);

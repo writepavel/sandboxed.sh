@@ -3475,7 +3475,8 @@ export default function ControlClient() {
   };
 
   // Handle resuming an interrupted mission
-  const handleResumeMission = async () => {
+  // cleanWorkspace parameter is reserved for future use (workspace cleanup before resume)
+  const handleResumeMission = async (_cleanWorkspace?: boolean) => {
     const mission = viewingMission ?? currentMission;
     if (!mission || !["interrupted", "blocked", "failed"].includes(mission.status)) return;
     try {
@@ -5724,7 +5725,7 @@ export default function ControlClient() {
                 <span>Mission {activeMission.status === 'blocked' ? 'blocked' : activeMission.status === 'failed' ? 'failed' : 'interrupted'}</span>
               </div>
               <button
-                onClick={handleResumeMission}
+                onClick={() => handleResumeMission()}
                 disabled={missionLoading}
                 className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors disabled:opacity-50"
               >

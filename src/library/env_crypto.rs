@@ -191,26 +191,54 @@ fn private_key_file_path() -> std::path::PathBuf {
 pub async fn ensure_private_key() -> Result<[u8; KEY_LENGTH]> {
     // 1. Fast path: env var already set
     if let Some(key) = load_private_key_from_env()? {
+        tracing::trace!("Using PRIVATE_KEY from environment variable");
         return Ok(key);
     }
 
     // 2. Try reading from persisted key file
     let key_file = private_key_file_path();
+    tracing::debug!(
+        key_file = %key_file.display(),
+        exists = key_file.exists(),
+        "Checking for private key file"
+    );
+
     if key_file.exists() {
-        if let Ok(contents) = fs::read_to_string(&key_file).await {
-            let trimmed = contents.trim();
-            if !trimmed.is_empty() {
-                let key = parse_key(trimmed)
-                    .context("Invalid key in private_key file")?;
-                // Cache in process env for future calls
-                std::env::set_var(PRIVATE_KEY_ENV, trimmed);
-                tracing::info!("Loaded PRIVATE_KEY from {}", key_file.display());
-                return Ok(key);
+        match fs::read_to_string(&key_file).await {
+            Ok(contents) => {
+                let trimmed = contents.trim();
+                if !trimmed.is_empty() {
+                    let key = parse_key(trimmed)
+                        .context("Invalid key in private_key file")?;
+                    // Cache in process env for future calls
+                    std::env::set_var(PRIVATE_KEY_ENV, trimmed);
+                    tracing::info!(
+                        key_file = %key_file.display(),
+                        "Loaded PRIVATE_KEY from file"
+                    );
+                    return Ok(key);
+                }
+                tracing::warn!(
+                    key_file = %key_file.display(),
+                    "Private key file exists but is empty"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    key_file = %key_file.display(),
+                    error = %e,
+                    "Failed to read private key file"
+                );
             }
         }
     }
 
     // 3. Generate new key and persist
+    tracing::info!(
+        key_file = %key_file.display(),
+        "Generating new PRIVATE_KEY"
+    );
+
     let key = generate_private_key();
     let key_hex = hex::encode(key);
 
@@ -224,7 +252,10 @@ pub async fn ensure_private_key() -> Result<[u8; KEY_LENGTH]> {
     // Set in process env
     std::env::set_var(PRIVATE_KEY_ENV, &key_hex);
 
-    tracing::info!("Generated new PRIVATE_KEY and saved to {}", key_file.display());
+    tracing::info!(
+        key_file = %key_file.display(),
+        "Generated new PRIVATE_KEY and saved to file"
+    );
     Ok(key)
 }
 
@@ -275,6 +306,9 @@ const UNVERSIONED_TAG_REGEX: &str = r"<encrypted>([^<]*)</encrypted>";
 /// Regex to match versioned <encrypted v="N">value</encrypted> tags (storage format).
 const VERSIONED_TAG_REGEX: &str = r#"<encrypted v="(\d+)">([^<]*)</encrypted>"#;
 
+/// Regex to match any encrypted tag (both versioned and unversioned).
+const ANY_ENCRYPTED_TAG_REGEX: &str = r#"<encrypted(?:\s+v="\d+")?>([^<]*)</encrypted>"#;
+
 /// Check if a value is an unversioned encrypted tag (user input format).
 pub fn is_unversioned_encrypted(value: &str) -> bool {
     let trimmed = value.trim();
@@ -283,16 +317,46 @@ pub fn is_unversioned_encrypted(value: &str) -> bool {
         && !trimmed.contains(" v=\"")
 }
 
+/// Check if content contains any encrypted tags (versioned or unversioned).
+pub fn has_encrypted_tags(content: &str) -> bool {
+    content.contains("<encrypted>") || content.contains("<encrypted v=\"")
+}
+
+/// Strip all <encrypted>...</encrypted> tags from content, leaving only the inner values.
+///
+/// This is used when deploying skills to workspaces where the actual plaintext
+/// values are needed (after decryption has already been performed).
+///
+/// Handles both versioned and unversioned tags:
+/// - `<encrypted>plaintext</encrypted>` → `plaintext`
+/// - `<encrypted v="1">ciphertext</encrypted>` → `ciphertext` (should not happen after decryption)
+pub fn strip_encrypted_tags(content: &str) -> String {
+    let re = regex::Regex::new(ANY_ENCRYPTED_TAG_REGEX).expect("Invalid regex");
+    re.replace_all(content, "$1").to_string()
+}
+
 /// Encrypt all unversioned <encrypted>value</encrypted> tags in content.
 /// Transforms <encrypted>plaintext</encrypted> to <encrypted v="1">ciphertext</encrypted>.
 pub fn encrypt_content_tags(key: &[u8; KEY_LENGTH], content: &str) -> Result<String> {
     let re =
         regex::Regex::new(UNVERSIONED_TAG_REGEX).map_err(|e| anyhow!("Invalid regex: {}", e))?;
 
+    let captures: Vec<_> = re.captures_iter(content).collect();
+
+    if captures.is_empty() {
+        tracing::trace!("No unversioned encrypted tags found in content");
+        return Ok(content.to_string());
+    }
+
+    tracing::debug!(
+        tags_found = captures.len(),
+        "Encrypting unversioned <encrypted> tags in content"
+    );
+
     let mut result = content.to_string();
     let mut offset: i64 = 0;
 
-    for cap in re.captures_iter(content) {
+    for cap in captures {
         let full_match = cap.get(0).unwrap();
         let plaintext = cap.get(1).unwrap().as_str();
 
@@ -315,6 +379,7 @@ pub fn encrypt_content_tags(key: &[u8; KEY_LENGTH], content: &str) -> Result<Str
         result = format!("{}{}{}", &result[..start], encrypted, &result[end..]);
     }
 
+    tracing::debug!("Successfully encrypted content tags");
     Ok(result)
 }
 
@@ -625,5 +690,124 @@ Use them wisely.
         // Encrypting again should not double-encrypt
         let result = encrypt_content_tags(&key, content).unwrap();
         assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_has_encrypted_tags() {
+        // Unversioned tags
+        assert!(has_encrypted_tags("text <encrypted>secret</encrypted> more"));
+        assert!(has_encrypted_tags("<encrypted>secret</encrypted>"));
+
+        // Versioned tags
+        assert!(has_encrypted_tags("text <encrypted v=\"1\">ciphertext</encrypted> more"));
+        assert!(has_encrypted_tags("<encrypted v=\"1\">ciphertext</encrypted>"));
+
+        // No tags
+        assert!(!has_encrypted_tags("plain text without any tags"));
+        assert!(!has_encrypted_tags(""));
+        assert!(!has_encrypted_tags("encrypted but not in tags"));
+    }
+
+    #[test]
+    fn test_strip_encrypted_tags_unversioned() {
+        let content = "API key: <encrypted>sk-12345</encrypted> is here.";
+        let stripped = strip_encrypted_tags(content);
+        assert_eq!(stripped, "API key: sk-12345 is here.");
+    }
+
+    #[test]
+    fn test_strip_encrypted_tags_versioned() {
+        let content = "API key: <encrypted v=\"1\">BASE64CIPHER</encrypted> is here.";
+        let stripped = strip_encrypted_tags(content);
+        assert_eq!(stripped, "API key: BASE64CIPHER is here.");
+    }
+
+    #[test]
+    fn test_strip_encrypted_tags_multiple() {
+        let content = r#"
+Keys:
+- OpenAI: <encrypted>sk-openai</encrypted>
+- Anthropic: <encrypted v="1">sk-ant-encrypted</encrypted>
+- Plain: not-encrypted
+"#;
+        let stripped = strip_encrypted_tags(content);
+        assert_eq!(
+            stripped,
+            r#"
+Keys:
+- OpenAI: sk-openai
+- Anthropic: sk-ant-encrypted
+- Plain: not-encrypted
+"#
+        );
+    }
+
+    #[test]
+    fn test_strip_encrypted_tags_no_tags() {
+        let content = "Plain content without any encrypted tags.";
+        let stripped = strip_encrypted_tags(content);
+        assert_eq!(stripped, content);
+    }
+
+    #[test]
+    fn test_strip_encrypted_tags_empty() {
+        assert_eq!(strip_encrypted_tags(""), "");
+    }
+
+    #[test]
+    fn test_strip_encrypted_tags_preserves_structure() {
+        let content = r#"---
+name: my-skill
+---
+
+# My Skill
+
+Use this key: <encrypted>secret-key-value</encrypted>
+
+```bash
+export API_KEY=<encrypted>another-secret</encrypted>
+```
+"#;
+        let stripped = strip_encrypted_tags(content);
+        assert_eq!(
+            stripped,
+            r#"---
+name: my-skill
+---
+
+# My Skill
+
+Use this key: secret-key-value
+
+```bash
+export API_KEY=another-secret
+```
+"#
+        );
+    }
+
+    #[test]
+    fn test_full_encryption_flow_with_strip() {
+        // This tests the complete flow:
+        // 1. User input with <encrypted>plaintext</encrypted>
+        // 2. Encrypt for storage -> <encrypted v="1">ciphertext</encrypted>
+        // 3. Decrypt for display -> <encrypted>plaintext</encrypted>
+        // 4. Strip for deployment -> plaintext
+
+        let key = test_key();
+        let user_input = "Key: <encrypted>my-secret-api-key</encrypted>";
+
+        // Step 1->2: Encrypt for storage
+        let stored = encrypt_content_tags(&key, user_input).unwrap();
+        assert!(stored.contains("<encrypted v=\"1\">"));
+        assert!(!stored.contains("<encrypted>my-secret-api-key</encrypted>"));
+
+        // Step 2->3: Decrypt for display
+        let displayed = decrypt_content_tags(&key, &stored).unwrap();
+        assert_eq!(displayed, user_input);
+
+        // Step 3->4: Strip for deployment
+        let deployed = strip_encrypted_tags(&displayed);
+        assert_eq!(deployed, "Key: my-secret-api-key");
     }
 }
