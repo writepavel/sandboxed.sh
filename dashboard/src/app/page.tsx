@@ -19,8 +19,6 @@ import {
   deleteMission,
   resumeMission,
   type Mission,
-  type MissionStatus,
-  type RunningMissionInfo,
 } from '@/lib/api';
 import {
   Activity,
@@ -90,7 +88,8 @@ function CompactMissionCard({
   const Icon = isActuallyRunning ? Loader : (statusIcons[mission.status] || Clock);
   const color = getMissionTextColor(mission.status, isActuallyRunning);
   const title = getMissionTitle(mission);
-  const isResumable = !isActuallyRunning && mission.resumable && mission.status === 'interrupted';
+  const isResumable = !isActuallyRunning && mission.resumable &&
+    (mission.status === 'interrupted' || mission.status === 'blocked' || mission.status === 'failed');
 
   return (
     <div className="group rounded-md bg-white/[0.02] border border-white/[0.06] hover:border-white/[0.12] px-2.5 py-2 transition-colors">
