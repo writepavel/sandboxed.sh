@@ -1477,6 +1477,7 @@ pub fn run_claudecode_turn<'a>(
     // Write Claude Code credentials file with refresh token for long-running missions.
     // This allows Claude Code to refresh tokens automatically during execution.
     let is_oauth = matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_)));
+    let mut wrote_claude_credentials = false;
     tracing::debug!(
         mission_id = %mission_id,
         is_oauth = is_oauth,
@@ -1487,6 +1488,7 @@ pub fn run_claudecode_turn<'a>(
     if is_oauth {
         match write_claudecode_credentials_for_workspace(&workspace) {
             Ok(()) => {
+                wrote_claude_credentials = true;
                 tracing::info!(
                     mission_id = %mission_id,
                     workspace_type = ?workspace.workspace_type,
@@ -1632,10 +1634,17 @@ pub fn run_claudecode_turn<'a>(
         match auth {
             ClaudeCodeAuth::OAuthToken(token) => {
                 env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
-                tracing::debug!(
-                    "Using OAuth token for Claude CLI authentication (token_len={})",
-                    token.len()
-                );
+                if wrote_claude_credentials {
+                    tracing::debug!(
+                        "Claude credentials file also written for token refresh (token_len={})",
+                        token.len()
+                    );
+                } else {
+                    tracing::debug!(
+                        "Using OAuth token for Claude CLI authentication (token_len={})",
+                        token.len()
+                    );
+                }
             }
             ClaudeCodeAuth::ApiKey(key) => {
                 env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());

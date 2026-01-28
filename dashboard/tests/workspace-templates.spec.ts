@@ -4,7 +4,7 @@ test.describe('Workspace Templates Flow', () => {
   test.setTimeout(240000);
 
   test('create template, create workspace from template, verify init script and env', async ({ page, request }) => {
-    const apiBase = 'http://95.216.112.253:3000';
+    const apiBase = process.env.OPEN_AGENT_API_BASE || 'http://95.216.112.253:3000';
     const runId = Date.now();
     const templateName = `pw-template-${runId}`;
     const seedWorkspaceName = `pw-template-seed-${runId}`;
@@ -12,6 +12,7 @@ test.describe('Workspace Templates Flow', () => {
     const envKey = 'PLAYWRIGHT_ENV';
     const envValue = `playwright-${runId}`;
     const initFile = '/root/.openagent/playwright-init.txt';
+    const initScript = `#!/usr/bin/env bash\nset -e\nmkdir -p /root/.openagent\necho "Env is $${envKey}" > ${initFile}\n`;
 
     await page.addInitScript((base) => {
       localStorage.setItem('settings', JSON.stringify({ apiUrl: base }));
@@ -19,35 +20,41 @@ test.describe('Workspace Templates Flow', () => {
 
     await page.goto('/workspaces');
 
-    // Create seed workspace
+    // Create seed workspace via UI
     await page.getByRole('button', { name: /New Workspace/i }).click();
     await page.getByPlaceholder('my-workspace').fill(seedWorkspaceName);
     await page.getByRole('button', { name: /^Create$/i }).click();
 
-    await expect(page.getByRole('heading', { name: seedWorkspaceName })).toBeVisible({ timeout: 30000 });
+    const seedHeading = page.getByRole('heading', { name: seedWorkspaceName }).first();
+    await expect(seedHeading).toBeVisible({ timeout: 30000 });
 
-    // Open workspace modal
-    await page.getByRole('heading', { name: seedWorkspaceName }).click();
+    // Modal auto-opens; close it so we can configure via API
+    // (the Build tab hides the init script editor while building)
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.backdrop-blur-md')).toHaveCount(0);
+
+    // Find the seed workspace ID and configure env + init script via API
+    const listRes = await request.get(`${apiBase}/api/workspaces`);
+    expect(listRes.ok()).toBeTruthy();
+    const allWorkspaces = (await listRes.json()) as Array<{ id: string; name: string }>;
+    const seedWs = allWorkspaces.find((w) => w.name === seedWorkspaceName);
+    expect(seedWs).toBeTruthy();
+
+    const updateRes = await request.put(`${apiBase}/api/workspaces/${seedWs!.id}`, {
+      data: {
+        env_vars: { [envKey]: envValue },
+        init_script: initScript,
+      },
+    });
+    expect(updateRes.ok()).toBeTruthy();
+
+    // Open workspace modal and save as template
+    await page.reload();
+    await expect(page.getByRole('heading', { name: 'Workspaces' })).toBeVisible();
+    const seedCard = page.getByRole('heading', { name: seedWorkspaceName }).first();
+    await seedCard.click();
     await expect(page.getByRole('button', { name: 'Overview' })).toBeVisible();
 
-    // Switch to Env & Init tab
-    await page.getByRole('button', { name: 'Env & Init' }).click();
-
-    // Add env var
-    await page.getByRole('button', { name: /\+ Add/i }).click();
-    await page.getByPlaceholder('KEY').first().fill(envKey);
-    await page.getByPlaceholder('value').first().fill(envValue);
-
-    // Set init script
-    const initScript = `#!/usr/bin/env bash\nset -e\nmkdir -p /root/.openagent\necho \"Env is $${envKey}\" > ${initFile}\n`;
-    await page.getByPlaceholder(/#!\/usr\/bin\/env bash/).fill(initScript);
-
-    // Save workspace settings
-    const saveSettingsButton = page.getByRole('button', { name: /^Save$/i }).first();
-    await saveSettingsButton.scrollIntoViewIfNeeded();
-    await saveSettingsButton.evaluate((button: HTMLButtonElement) => button.click());
-
-    // Save as template
     await page.getByRole('button', { name: 'Template' }).click();
     await page.getByPlaceholder('my-template').fill(templateName);
     const saveTemplateButton = page.getByRole('button', { name: /Save Template/i });
@@ -88,11 +95,8 @@ test.describe('Workspace Templates Flow', () => {
     await templateSelect.selectOption(templateName);
     await page.getByRole('button', { name: /^Create$/i }).click();
 
-    await expect(page.getByRole('heading', { name: workspaceName })).toBeVisible({ timeout: 30000 });
-
-    // Open workspace modal and build
-    await page.getByRole('heading', { name: workspaceName }).click();
-    await page.getByRole('button', { name: /Build/i }).click();
+    const workspaceHeading = page.getByRole('heading', { name: workspaceName }).first();
+    await expect(workspaceHeading).toBeVisible({ timeout: 30000 });
 
     // Poll backend for build completion
     const deadline = Date.now() + 180000;

@@ -50,7 +50,8 @@ export function proxy(request: NextRequest) {
     pathname.startsWith("/api/") ||
     pathname.startsWith("/_next/") ||
     pathname.startsWith("/static/") ||
-    pathname.includes(".")  && !pathname.endsWith(".md") // Has extension but not .md
+    pathname.startsWith("/_pagefind/") ||
+    pathname.includes(".") && !pathname.endsWith(".md") // Has extension but not .md
   ) {
     return NextResponse.next();
   }
@@ -94,6 +95,6 @@ export const config = {
      * - Static files with extensions (images, css, js, etc.)
      * - Next.js internals
      */
-    "/((?!api|_next/static|_next/image|favicon.ico|.*\\.[^m][^d]$).*)",
+    "/((?!api|_next/static|_next/image|_pagefind|favicon.ico|.*\\.[^m][^d]$).*)",
   ],
 };

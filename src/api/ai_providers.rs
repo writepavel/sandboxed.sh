@@ -326,6 +326,40 @@ pub fn get_workspace_auth_path(workspace_root: &std::path::Path) -> std::path::P
         .join("anthropic.json")
 }
 
+/// Read an OAuth token entry from a container workspace's OpenCode auth file.
+fn read_oauth_entry_from_workspace_auth(
+    workspace_root: &std::path::Path,
+) -> Option<OAuthTokenEntry> {
+    let auth_path = get_workspace_auth_path(workspace_root);
+    if !auth_path.exists() {
+        return None;
+    }
+
+    let contents = std::fs::read_to_string(&auth_path).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&contents).ok()?;
+
+    let auth_type = auth.get("type").and_then(|v| v.as_str());
+    if auth_type != Some("oauth") {
+        return None;
+    }
+
+    let refresh_token = auth.get("refresh").and_then(|v| v.as_str())?;
+    let access_token = auth.get("access").and_then(|v| v.as_str()).unwrap_or("");
+    let expires_at = auth.get("expires").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    tracing::debug!(
+        auth_path = %auth_path.display(),
+        expires_at = expires_at,
+        "Found OAuth token entry in container workspace auth"
+    );
+
+    Some(OAuthTokenEntry {
+        refresh_token: refresh_token.to_string(),
+        access_token: access_token.to_string(),
+        expires_at,
+    })
+}
+
 /// Get Anthropic auth from host OpenCode auth.json with expiry info.
 pub fn get_anthropic_auth_from_host_with_expiry() -> Option<ClaudeCodeAuthWithExpiry> {
     let entry = read_oauth_token_entry(ProviderType::Anthropic)?;
@@ -1696,6 +1730,24 @@ pub fn write_claudecode_credentials_to_path(credentials_dir: &std::path::Path) -
 pub fn write_claudecode_credentials_for_workspace(workspace: &crate::workspace::Workspace) -> Result<(), String> {
     use crate::workspace::WorkspaceType;
 
+    let entry = read_oauth_token_entry(ProviderType::Anthropic)
+        .or_else(|| {
+            if workspace.workspace_type == WorkspaceType::Container {
+                if let Some(entry) = read_oauth_entry_from_workspace_auth(&workspace.path) {
+                    // Best-effort sync so future reads hit the canonical store.
+                    let _ = write_openagent_credential(
+                        ProviderType::Anthropic,
+                        &entry.refresh_token,
+                        &entry.access_token,
+                        entry.expires_at,
+                    );
+                    return Some(entry);
+                }
+            }
+            None
+        })
+        .ok_or_else(|| "No Anthropic OAuth entry found".to_string())?;
+
     let claude_dir = match workspace.workspace_type {
         WorkspaceType::Container => {
             // Container workspaces: write to /root/.claude inside the container
@@ -1708,7 +1760,21 @@ pub fn write_claudecode_credentials_for_workspace(workspace: &crate::workspace::
         }
     };
 
-    write_claudecode_credentials_to_path(&claude_dir)
+    write_claudecode_credentials_from_entry(
+        &claude_dir,
+        &entry.access_token,
+        &entry.refresh_token,
+        entry.expires_at,
+    )?;
+
+    tracing::info!(
+        workspace_type = ?workspace.workspace_type,
+        claude_dir = %claude_dir.display(),
+        expires_at = entry.expires_at,
+        "Prepared Claude Code credentials for workspace"
+    );
+
+    Ok(())
 }
 
 /// Sync an API key to OpenCode's auth.json file.
