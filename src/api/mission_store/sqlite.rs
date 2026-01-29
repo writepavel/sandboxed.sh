@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS missions (
     updated_at TEXT NOT NULL,
     interrupted_at TEXT,
     resumable INTEGER NOT NULL DEFAULT 0,
-    desktop_sessions TEXT
+    desktop_sessions TEXT,
+    terminal_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_missions_updated_at ON missions(updated_at DESC);
@@ -201,24 +202,39 @@ impl SqliteMissionStore {
         )
         .map_err(|e| format!("Failed to create performance indexes: {}", e))?;
 
+        // Check if 'terminal_reason' column exists in missions table
+        let has_terminal_reason_column: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('missions') WHERE name = 'terminal_reason'")
+            .map_err(|e| format!("Failed to check for terminal_reason column: {}", e))?
+            .exists([])
+            .map_err(|e| format!("Failed to query table info: {}", e))?;
+
+        if !has_terminal_reason_column {
+            tracing::info!("Running migration: adding 'terminal_reason' column to missions table");
+            conn.execute("ALTER TABLE missions ADD COLUMN terminal_reason TEXT", [])
+                .map_err(|e| format!("Failed to add terminal_reason column: {}", e))?;
+        }
+
         Ok(())
     }
 }
 
 fn parse_status(s: &str) -> MissionStatus {
     match s {
+        "pending" => MissionStatus::Pending,
         "active" => MissionStatus::Active,
         "completed" => MissionStatus::Completed,
         "failed" => MissionStatus::Failed,
         "interrupted" => MissionStatus::Interrupted,
         "blocked" => MissionStatus::Blocked,
         "not_feasible" => MissionStatus::NotFeasible,
-        _ => MissionStatus::Active,
+        _ => MissionStatus::Pending,
     }
 }
 
 fn status_to_string(status: MissionStatus) -> &'static str {
     match status {
+        MissionStatus::Pending => "pending",
         MissionStatus::Active => "active",
         MissionStatus::Completed => "completed",
         MissionStatus::Failed => "failed",
@@ -242,7 +258,7 @@ impl MissionStore for SqliteMissionStore {
                 .prepare(
                     "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
-                            COALESCE(backend, 'opencode') as backend, session_id
+                            COALESCE(backend, 'opencode') as backend, session_id, terminal_reason
                      FROM missions
                      ORDER BY updated_at DESC
                      LIMIT ?1 OFFSET ?2",
@@ -257,6 +273,7 @@ impl MissionStore for SqliteMissionStore {
                     let desktop_sessions_json: Option<String> = row.get(11)?;
                     let backend: String = row.get(12)?;
                     let session_id: Option<String> = row.get(13)?;
+                    let terminal_reason: Option<String> = row.get(14)?;
 
                     Ok(Mission {
                         id: Uuid::parse_str(&id_str).unwrap_or_default(),
@@ -277,6 +294,7 @@ impl MissionStore for SqliteMissionStore {
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                         session_id,
+                        terminal_reason,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -301,7 +319,7 @@ impl MissionStore for SqliteMissionStore {
                 .prepare(
                     "SELECT id, status, title, workspace_id, workspace_name, agent, model_override,
                             created_at, updated_at, interrupted_at, resumable, desktop_sessions,
-                            COALESCE(backend, 'opencode') as backend, session_id
+                            COALESCE(backend, 'opencode') as backend, session_id, terminal_reason
                      FROM missions WHERE id = ?1",
                 )
                 .map_err(|e| e.to_string())?;
@@ -314,6 +332,7 @@ impl MissionStore for SqliteMissionStore {
                     let desktop_sessions_json: Option<String> = row.get(11)?;
                     let backend: String = row.get(12)?;
                     let session_id: Option<String> = row.get(13)?;
+                    let terminal_reason: Option<String> = row.get(14)?;
 
                     Ok(Mission {
                         id: Uuid::parse_str(&id_str).unwrap_or_default(),
@@ -334,6 +353,7 @@ impl MissionStore for SqliteMissionStore {
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                         session_id,
+                        terminal_reason,
                     })
                 })
                 .optional()
@@ -402,7 +422,7 @@ impl MissionStore for SqliteMissionStore {
 
         let mission = Mission {
             id,
-            status: MissionStatus::Active,
+            status: MissionStatus::Pending,
             title: title.map(|s| s.to_string()),
             workspace_id,
             workspace_name: None,
@@ -416,6 +436,7 @@ impl MissionStore for SqliteMissionStore {
             resumable: false,
             desktop_sessions: Vec::new(),
             session_id: Some(session_id.clone()),
+            terminal_reason: None,
         };
 
         let m = mission.clone();
@@ -448,6 +469,16 @@ impl MissionStore for SqliteMissionStore {
     }
 
     async fn update_mission_status(&self, id: Uuid, status: MissionStatus) -> Result<(), String> {
+        self.update_mission_status_with_reason(id, status, None)
+            .await
+    }
+
+    async fn update_mission_status_with_reason(
+        &self,
+        id: Uuid,
+        status: MissionStatus,
+        terminal_reason: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self.conn.clone();
         let now = now_string();
         let interrupted_at =
@@ -456,17 +487,23 @@ impl MissionStore for SqliteMissionStore {
             } else {
                 None
             };
-        let resumable = matches!(status, MissionStatus::Interrupted | MissionStatus::Blocked);
+        // Failed missions with LlmError are also resumable (transient API errors)
+        let resumable = matches!(
+            status,
+            MissionStatus::Interrupted | MissionStatus::Blocked | MissionStatus::Failed
+        );
+        let terminal_reason = terminal_reason.map(|s| s.to_string());
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4 WHERE id = ?5",
+                "UPDATE missions SET status = ?1, updated_at = ?2, interrupted_at = ?3, resumable = ?4, terminal_reason = ?5 WHERE id = ?6",
                 params![
                     status_to_string(status),
                     now,
                     interrupted_at,
                     if resumable { 1 } else { 0 },
+                    terminal_reason,
                     id.to_string(),
                 ],
             )
@@ -712,6 +749,7 @@ impl MissionStore for SqliteMissionStore {
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                         session_id: None, // Not needed for stale mission checks
+                        terminal_reason: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -766,6 +804,7 @@ impl MissionStore for SqliteMissionStore {
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                         session_id: None,
+                        terminal_reason: None,
                     })
                 })
                 .map_err(|e| e.to_string())?
@@ -1074,7 +1113,7 @@ impl MissionStore for SqliteMissionStore {
 
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
         let conn = self.conn.lock().await;
-        
+
         // Use SQLite JSON1 extension to extract cost_cents from metadata
         // and sum across all assistant_message events
         let query = r#"
@@ -1089,10 +1128,11 @@ impl MissionStore for SqliteMissionStore {
             FROM mission_events
             WHERE event_type = 'assistant_message'
         "#;
-        
-        let total: i64 = conn.query_row(query, [], |row| row.get(0))
+
+        let total: i64 = conn
+            .query_row(query, [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
-        
+
         Ok(total as u64)
     }
 }

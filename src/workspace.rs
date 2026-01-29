@@ -21,7 +21,9 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::ai_providers::{AIProvider, ProviderType};
 use crate::config::Config;
+use crate::library::env_crypto::strip_encrypted_tags;
 use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
@@ -124,7 +126,10 @@ pub struct Workspace {
     /// Environment variables always loaded for this workspace
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
-    /// Init script to run when the workspace is built/rebuilt
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Vec<String>,
+    /// Custom init script to run when the workspace is built/rebuilt (after fragments)
     #[serde(default)]
     pub init_script: Option<String>,
     /// Creation timestamp
@@ -164,6 +169,7 @@ impl Workspace {
             template: None,
             distro: None,
             env_vars: HashMap::new(),
+            init_scripts: Vec::new(),
             init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
@@ -187,6 +193,7 @@ impl Workspace {
             template: None,
             distro: None,
             env_vars: HashMap::new(),
+            init_scripts: Vec::new(),
             init_script: None,
             created_at: Utc::now(),
             skills: Vec::new(),
@@ -376,6 +383,7 @@ impl WorkspaceStore {
                     template: None,
                     distro: None,
                     env_vars: HashMap::new(),
+                    init_scripts: Vec::new(),
                     init_script: None,
                     created_at: Utc::now(), // We don't know the actual creation time
                     skills: Vec::new(),
@@ -625,11 +633,15 @@ fn opencode_entry_from_mcp(
 
             let container_fallback = workspace_env
                 .get("OPEN_AGENT_CONTAINER_FALLBACK")
-                .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+                .map(|v| {
+                    matches!(
+                        v.trim().to_lowercase().as_str(),
+                        "1" | "true" | "yes" | "y" | "on"
+                    )
+                })
                 .unwrap_or(false)
                 || (workspace_type == WorkspaceType::Container && !nspawn::nspawn_available());
-            let per_workspace_runner =
-                env_var_bool("OPEN_AGENT_PER_WORKSPACE_RUNNER", true);
+            let per_workspace_runner = env_var_bool("OPEN_AGENT_PER_WORKSPACE_RUNNER", true);
             if container_fallback {
                 merged_env
                     .entry("OPEN_AGENT_CONTAINER_FALLBACK".to_string())
@@ -738,14 +750,9 @@ fn opencode_entry_from_mcp(
                     } else {
                         format!("/{}", rel.to_string_lossy())
                     };
-                    merged_env
-                        .insert("OPEN_AGENT_WORKSPACE".to_string(), rel_str.clone());
-                    merged_env.insert(
-                        "OPEN_AGENT_WORKSPACE_ROOT".to_string(),
-                        "/".to_string(),
-                    );
-                    merged_env
-                        .insert("WORKING_DIR".to_string(), rel_str);
+                    merged_env.insert("OPEN_AGENT_WORKSPACE".to_string(), rel_str.clone());
+                    merged_env.insert("OPEN_AGENT_WORKSPACE_ROOT".to_string(), "/".to_string());
+                    merged_env.insert("WORKING_DIR".to_string(), rel_str);
                 }
 
                 let mut cmd = vec![resolve_command_path(command)];
@@ -838,6 +845,7 @@ async fn write_opencode_config(
     skill_allowlist: Option<&[String]>,
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
+    custom_providers: Option<&[AIProvider]>,
 ) -> anyhow::Result<()> {
     fn strip_jsonc_comments(input: &str) -> String {
         let mut out = String::with_capacity(input.len());
@@ -959,11 +967,16 @@ async fn write_opencode_config(
     //   inside the workspace execution context (host/container).
     // - Therefore, OpenCode built-in bash MUST be enabled for all workspace types.
     // - The legacy workspace-mcp/desktop-mcp proxy tools are no longer required for core flows.
-    let enable_desktop_tools =
-        env_var_bool("OPEN_AGENT_ENABLE_DESKTOP_TOOLS", false) || env_var_bool("DESKTOP_ENABLED", false);
+    let enable_desktop_tools = env_var_bool("OPEN_AGENT_ENABLE_DESKTOP_TOOLS", false)
+        || env_var_bool("DESKTOP_ENABLED", false);
     let container_fallback = workspace_env
         .get("OPEN_AGENT_CONTAINER_FALLBACK")
-        .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "y" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
         .unwrap_or(false);
     let per_workspace_runner = env_var_bool("OPEN_AGENT_PER_WORKSPACE_RUNNER", true);
     let mut tools = serde_json::Map::new();
@@ -1022,9 +1035,7 @@ async fn write_opencode_config(
     }
 
     {
-        let base_obj = base_config
-            .as_object_mut()
-            .expect("opencode base config");
+        let base_obj = base_config.as_object_mut().expect("opencode base config");
         base_obj.insert(
             "$schema".to_string(),
             json!("https://opencode.ai/config.json"),
@@ -1035,6 +1046,95 @@ async fn write_opencode_config(
             serde_json::Value::Object(permission),
         );
         base_obj.insert("tools".to_string(), serde_json::Value::Object(tools));
+
+        // Add custom providers if any
+        if let Some(providers) = custom_providers {
+            let custom_only: Vec<_> = providers
+                .iter()
+                .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+                .collect();
+
+            if !custom_only.is_empty() {
+                let mut provider_map = serde_json::Map::new();
+
+                for provider in custom_only {
+                    let provider_id = sanitize_key(&provider.name);
+                    let mut provider_config = serde_json::Map::new();
+
+                    // Set npm package (default to openai-compatible)
+                    let npm = provider
+                        .npm_package
+                        .as_deref()
+                        .unwrap_or("@ai-sdk/openai-compatible");
+                    provider_config.insert("npm".to_string(), json!(npm));
+
+                    // Set provider name
+                    provider_config.insert("name".to_string(), json!(&provider.name));
+
+                    // Build options
+                    let mut options = serde_json::Map::new();
+                    if let Some(base_url) = &provider.base_url {
+                        options.insert("baseURL".to_string(), json!(base_url));
+                    }
+
+                    // API key: either direct value or env var reference
+                    if let Some(api_key) = &provider.api_key {
+                        options.insert("apiKey".to_string(), json!(api_key));
+                    } else if let Some(env_var) = &provider.custom_env_var {
+                        options.insert("apiKey".to_string(), json!(format!("{{env:{}}}", env_var)));
+                    }
+                    // API key is optional - some providers may not need it
+
+                    if !options.is_empty() {
+                        provider_config
+                            .insert("options".to_string(), serde_json::Value::Object(options));
+                    }
+
+                    // Build models config
+                    if let Some(models) = &provider.custom_models {
+                        let mut models_map = serde_json::Map::new();
+                        for model in models {
+                            let mut model_config = serde_json::Map::new();
+
+                            if let Some(name) = &model.name {
+                                model_config.insert("name".to_string(), json!(name));
+                            }
+
+                            // Build limit config if either limit is set
+                            if model.context_limit.is_some() || model.output_limit.is_some() {
+                                let mut limit = serde_json::Map::new();
+                                if let Some(context) = model.context_limit {
+                                    limit.insert("context".to_string(), json!(context));
+                                }
+                                if let Some(output) = model.output_limit {
+                                    limit.insert("output".to_string(), json!(output));
+                                }
+                                model_config
+                                    .insert("limit".to_string(), serde_json::Value::Object(limit));
+                            }
+
+                            models_map
+                                .insert(model.id.clone(), serde_json::Value::Object(model_config));
+                        }
+                        if !models_map.is_empty() {
+                            provider_config.insert(
+                                "models".to_string(),
+                                serde_json::Value::Object(models_map),
+                            );
+                        }
+                    }
+
+                    provider_map.insert(provider_id, serde_json::Value::Object(provider_config));
+                }
+
+                if !provider_map.is_empty() {
+                    base_obj.insert(
+                        "provider".to_string(),
+                        serde_json::Value::Object(provider_map),
+                    );
+                }
+            }
+        }
     }
 
     let config_value = base_config;
@@ -1147,15 +1247,22 @@ async fn write_claudecode_config(
 
         match workspace_type {
             WorkspaceType::Container => {
-                claude_md.push_str("This is an **isolated container workspace** managed by Open Agent.\n\n");
+                claude_md.push_str(
+                    "This is an **isolated container workspace** managed by Open Agent.\n\n",
+                );
                 claude_md.push_str("- Shell commands execute inside the container\n");
                 claude_md.push_str("- Use the built-in `Bash` tool for shell commands\n");
-                claude_md.push_str("- Skills are available in `.claude/skills/` - use `/help` to list them\n");
+                claude_md.push_str(
+                    "- Skills are available in `.claude/skills/` - use `/help` to list them\n",
+                );
             }
             WorkspaceType::Host => {
                 claude_md.push_str("This is a **host workspace** managed by Open Agent.\n\n");
-                claude_md.push_str("- Use the built-in `Bash` tool to run shell commands directly\n");
-                claude_md.push_str("- Skills are available in `.claude/skills/` - use `/help` to list them\n");
+                claude_md
+                    .push_str("- Use the built-in `Bash` tool to run shell commands directly\n");
+                claude_md.push_str(
+                    "- Skills are available in `.claude/skills/` - use `/help` to list them\n",
+                );
             }
         }
 
@@ -1201,7 +1308,13 @@ async fn write_amp_config(
         let key = unique_key(&base, &mut used);
         mcp_servers.insert(
             key,
-            amp_entry_from_mcp(&config, workspace_dir, workspace_root, workspace_type, workspace_env),
+            amp_entry_from_mcp(
+                &config,
+                workspace_dir,
+                workspace_root,
+                workspace_type,
+                workspace_env,
+            ),
         );
     }
 
@@ -1232,7 +1345,8 @@ async fn write_amp_config(
 
     match workspace_type {
         WorkspaceType::Container => {
-            agents_md.push_str("This is an **isolated container workspace** managed by Open Agent.\n\n");
+            agents_md
+                .push_str("This is an **isolated container workspace** managed by Open Agent.\n\n");
             agents_md.push_str("- Shell commands execute inside the container\n");
             agents_md.push_str("- Use the built-in `Bash` tool for shell commands\n");
         }
@@ -1246,10 +1360,15 @@ async fn write_amp_config(
     if let Some(skills) = skill_contents {
         if !skills.is_empty() {
             agents_md.push_str("\n## Available Skills\n\n");
-            agents_md.push_str("The following skills provide specialized instructions for specific tasks.\n");
+            agents_md.push_str(
+                "The following skills provide specialized instructions for specific tasks.\n",
+            );
             agents_md.push_str("Read a skill when the task matches its description.\n\n");
             for skill in skills {
-                let desc = skill.description.as_deref().unwrap_or("A specialized skill");
+                let desc = skill
+                    .description
+                    .as_deref()
+                    .unwrap_or("A specialized skill");
                 agents_md.push_str(&format!(
                     "- **{}**: {} - See @.agents/skills/{}/SKILL.md\n",
                     skill.name, desc, skill.name
@@ -1355,7 +1474,11 @@ pub async fn write_amp_skills_to_workspace(
 }
 
 /// Ensure the skill content has required YAML frontmatter fields for Amp.
-fn ensure_amp_skill_frontmatter(content: &str, skill_name: &str, description: Option<&str>) -> String {
+fn ensure_amp_skill_frontmatter(
+    content: &str,
+    skill_name: &str,
+    description: Option<&str>,
+) -> String {
     // Check if the content already has frontmatter
     if content.starts_with("---") {
         // Already has frontmatter, check if name is present
@@ -1402,6 +1525,7 @@ pub async fn write_backend_config(
     skill_contents: Option<&[SkillContent]>,
     command_contents: Option<&[CommandContent]>,
     shared_network: Option<bool>,
+    custom_providers: Option<&[AIProvider]>,
 ) -> anyhow::Result<()> {
     match backend_id {
         "opencode" => {
@@ -1414,6 +1538,7 @@ pub async fn write_backend_config(
                 skill_allowlist,
                 command_contents,
                 shared_network,
+                custom_providers,
             )
             .await
         }
@@ -1428,6 +1553,7 @@ pub async fn write_backend_config(
                 skill_allowlist,
                 command_contents,
                 shared_network,
+                custom_providers,
             )
             .await?;
             write_claudecode_config(
@@ -1469,6 +1595,7 @@ pub async fn write_backend_config(
                 skill_allowlist,
                 command_contents,
                 shared_network,
+                custom_providers,
             )
             .await
         }
@@ -1542,6 +1669,9 @@ fn ensure_skill_name_in_frontmatter(content: &str, skill_name: &str) -> String {
 /// Write skill files to the workspace's `.opencode/skill/` directory.
 /// This makes skills available to OpenCode when running in this workspace.
 /// OpenCode looks for skills in `.opencode/{skill,skills}/**/SKILL.md`
+///
+/// Note: `<encrypted>` tags are stripped from content before writing,
+/// leaving only the plaintext values for the agent to use.
 pub async fn write_skills_to_workspace(
     workspace_dir: &Path,
     skills: &[SkillContent],
@@ -1560,9 +1690,12 @@ pub async fn write_skills_to_workspace(
         // Ensure skill content has required `name` field in frontmatter
         let content_with_name = ensure_skill_name_in_frontmatter(&skill.content, &skill.name);
 
+        // Strip <encrypted> tags - deployed skills should have bare plaintext values
+        let content_for_workspace = strip_encrypted_tags(&content_with_name);
+
         // Write SKILL.md
         let skill_md_path = skill_dir.join("SKILL.md");
-        tokio::fs::write(&skill_md_path, &content_with_name).await?;
+        tokio::fs::write(&skill_md_path, &content_for_workspace).await?;
 
         // Write additional files (preserving subdirectory structure)
         for (relative_path, file_content) in &skill.files {
@@ -1571,7 +1704,9 @@ pub async fn write_skills_to_workspace(
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&file_path, file_content).await?;
+            // Also strip encrypted tags from additional files
+            let file_content_stripped = strip_encrypted_tags(file_content);
+            tokio::fs::write(&file_path, file_content_stripped).await?;
         }
 
         tracing::debug!(
@@ -1593,6 +1728,9 @@ pub async fn write_skills_to_workspace(
 /// Write skill files to the workspace's `.claude/skills/` directory.
 /// This makes skills available to Claude Code using its native skills format.
 /// Claude Code looks for skills in `.claude/skills/<name>/SKILL.md`
+///
+/// Note: `<encrypted>` tags are stripped from content before writing,
+/// leaving only the plaintext values for the agent to use.
 pub async fn write_claudecode_skills_to_workspace(
     workspace_dir: &Path,
     skills: &[SkillContent],
@@ -1627,12 +1765,18 @@ pub async fn write_claudecode_skills_to_workspace(
         tokio::fs::create_dir_all(&skill_dir).await?;
 
         // Ensure skill content has required frontmatter fields for Claude Code
-        let content_with_frontmatter =
-            ensure_claudecode_skill_frontmatter(&skill.content, &skill.name, skill.description.as_deref());
+        let content_with_frontmatter = ensure_claudecode_skill_frontmatter(
+            &skill.content,
+            &skill.name,
+            skill.description.as_deref(),
+        );
+
+        // Strip <encrypted> tags - deployed skills should have bare plaintext values
+        let content_for_workspace = strip_encrypted_tags(&content_with_frontmatter);
 
         // Write SKILL.md
         let skill_md_path = skill_dir.join("SKILL.md");
-        tokio::fs::write(&skill_md_path, &content_with_frontmatter).await?;
+        tokio::fs::write(&skill_md_path, &content_for_workspace).await?;
 
         // Write additional files (preserving subdirectory structure)
         for (relative_path, file_content) in &skill.files {
@@ -1641,7 +1785,9 @@ pub async fn write_claudecode_skills_to_workspace(
             if let Some(parent) = file_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            tokio::fs::write(&file_path, file_content).await?;
+            // Also strip encrypted tags from additional files
+            let file_content_stripped = strip_encrypted_tags(file_content);
+            tokio::fs::write(&file_path, file_content_stripped).await?;
         }
 
         tracing::debug!(
@@ -1785,7 +1931,23 @@ fn convert_command_to_skill_content(content: &str, name: &str) -> String {
 fn format_yaml_description(desc: &str) -> String {
     let clean = desc.replace('\n', " ");
     // Quote if it contains colons, brackets, or other YAML special characters
-    if clean.contains(':') || clean.contains('[') || clean.contains(']') || clean.contains('{') || clean.contains('}') || clean.contains('#') || clean.contains('&') || clean.contains('*') || clean.contains('!') || clean.contains('|') || clean.contains('>') || clean.contains('\'') || clean.contains('"') || clean.contains('%') || clean.contains('@') || clean.contains('`') {
+    if clean.contains(':')
+        || clean.contains('[')
+        || clean.contains(']')
+        || clean.contains('{')
+        || clean.contains('}')
+        || clean.contains('#')
+        || clean.contains('&')
+        || clean.contains('*')
+        || clean.contains('!')
+        || clean.contains('|')
+        || clean.contains('>')
+        || clean.contains('\'')
+        || clean.contains('"')
+        || clean.contains('%')
+        || clean.contains('@')
+        || clean.contains('`')
+    {
         // Escape any double quotes in the description and wrap in quotes
         format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
@@ -1796,7 +1958,11 @@ fn format_yaml_description(desc: &str) -> String {
 /// Ensure the skill content has proper YAML frontmatter for Claude Code.
 /// Claude Code requires `name` and benefits from `description` for auto-discovery.
 /// Also fixes invalid YAML descriptions that contain colons without quotes.
-fn ensure_claudecode_skill_frontmatter(content: &str, skill_name: &str, description: Option<&str>) -> String {
+fn ensure_claudecode_skill_frontmatter(
+    content: &str,
+    skill_name: &str,
+    description: Option<&str>,
+) -> String {
     // Check if the content starts with YAML frontmatter
     if !content.starts_with("---") {
         // No frontmatter, add it with name and description
@@ -1824,11 +1990,19 @@ fn ensure_claudecode_skill_frontmatter(content: &str, skill_name: &str, descript
                 // Get the description value after "description:"
                 let value = trimmed.strip_prefix("description:").unwrap_or("").trim();
                 // If it starts with a quote or '>' or '|', it's already properly formatted
-                if value.starts_with('"') || value.starts_with('\'') || value.starts_with('>') || value.starts_with('|') {
+                if value.starts_with('"')
+                    || value.starts_with('\'')
+                    || value.starts_with('>')
+                    || value.starts_with('|')
+                {
                     return false;
                 }
                 // Check if it contains YAML special characters that need quoting
-                value.contains(':') || value.contains('[') || value.contains(']') || value.contains('{') || value.contains('}')
+                value.contains(':')
+                    || value.contains('[')
+                    || value.contains(']')
+                    || value.contains('{')
+                    || value.contains('}')
             } else {
                 false
             }
@@ -1852,7 +2026,8 @@ fn ensure_claudecode_skill_frontmatter(content: &str, skill_name: &str, descript
         }
         if !has_description {
             if let Some(desc) = description {
-                new_frontmatter.push_str(&format!("description: {}\n", format_yaml_description(desc)));
+                new_frontmatter
+                    .push_str(&format!("description: {}\n", format_yaml_description(desc)));
             }
         }
 
@@ -1862,7 +2037,10 @@ fn ensure_claudecode_skill_frontmatter(content: &str, skill_name: &str, descript
             if needs_description_fix && trimmed.starts_with("description:") {
                 // Fix the description line
                 let value = trimmed.strip_prefix("description:").unwrap_or("").trim();
-                new_frontmatter.push_str(&format!("description: {}\n", format_yaml_description(value)));
+                new_frontmatter.push_str(&format!(
+                    "description: {}\n",
+                    format_yaml_description(value)
+                ));
             } else if !trimmed.is_empty() {
                 new_frontmatter.push_str(line);
                 new_frontmatter.push('\n');
@@ -2332,6 +2510,7 @@ pub async fn prepare_custom_workspace(
         None,
         None, // No command_contents for simple workspace preparation
         None, // shared_network: not relevant for host workspaces
+        None, // custom_providers: none for simple workspace preparation
     )
     .await?;
     Ok(workspace_dir)
@@ -2370,6 +2549,7 @@ pub async fn prepare_mission_workspace_in(
         skill_allowlist,
         None, // No command_contents for simple workspace preparation
         workspace.shared_network,
+        None, // custom_providers: none for simple workspace preparation
     )
     .await?;
     Ok(dir)
@@ -2383,8 +2563,42 @@ pub async fn prepare_mission_workspace_with_skills(
     library: Option<&LibraryStore>,
     mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
-    prepare_mission_workspace_with_skills_backend(workspace, mcp, library, mission_id, "opencode")
-        .await
+    prepare_mission_workspace_with_skills_backend(
+        workspace, mcp, library, mission_id, "opencode", None,
+    )
+    .await
+}
+
+/// Read custom providers from the ai_providers.json file.
+fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
+    // Try both possible locations for ai_providers.json
+    let candidates = [
+        workspace_root.join(".openagent").join("ai_providers.json"),
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
+            .join(".openagent")
+            .join("ai_providers.json"),
+    ];
+
+    for path in &candidates {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Ok(providers) = serde_json::from_str::<Vec<AIProvider>>(&contents) {
+                let custom: Vec<AIProvider> = providers
+                    .into_iter()
+                    .filter(|p| p.provider_type == ProviderType::Custom && p.enabled)
+                    .collect();
+                if !custom.is_empty() {
+                    tracing::debug!(
+                        path = %path.display(),
+                        count = custom.len(),
+                        "Loaded custom providers from file"
+                    );
+                    return custom;
+                }
+            }
+        }
+    }
+
+    Vec::new()
 }
 
 /// Prepare a workspace directory for a mission with skill and tool syncing for a specific backend.
@@ -2394,11 +2608,24 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     library: Option<&LibraryStore>,
     mission_id: Uuid,
     backend_id: &str,
+    custom_providers: Option<&[AIProvider]>,
 ) -> anyhow::Result<PathBuf> {
     let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
-    let mcp_configs =
-        filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
+
+    // Get custom providers: use provided list or read from file
+    let providers_from_file;
+    let effective_custom_providers = if let Some(providers) = custom_providers {
+        Some(providers)
+    } else {
+        providers_from_file = read_custom_providers_from_file(&workspace.path);
+        if providers_from_file.is_empty() {
+            None
+        } else {
+            Some(providers_from_file.as_slice())
+        }
+    };
+    let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
     let skill_allowlist = if workspace.skills.is_empty() {
         None
     } else {
@@ -2484,6 +2711,7 @@ pub async fn prepare_mission_workspace_with_skills_backend(
         skill_contents.as_deref(),
         command_contents.as_deref(),
         workspace.shared_network,
+        effective_custom_providers,
     )
     .await?;
 
@@ -2505,6 +2733,10 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                             let dest_path = opencode_dir.join("oh-my-opencode.json");
                             match serde_json::to_string_pretty(&settings) {
                                 Ok(content) => {
+                                    // Patch agent models for Claude Code OAuth compatibility
+                                    let patched_content =
+                                        patch_opencode_agent_models_for_oauth(&content);
+
                                     let jsonc_path = opencode_dir.join("oh-my-opencode.jsonc");
                                     if jsonc_path.exists() {
                                         if let Err(e) = tokio::fs::remove_file(&jsonc_path).await {
@@ -2516,7 +2748,9 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                                             );
                                         }
                                     }
-                                    if let Err(e) = tokio::fs::write(&dest_path, content).await {
+                                    if let Err(e) =
+                                        tokio::fs::write(&dest_path, &patched_content).await
+                                    {
                                         tracing::warn!(
                                             mission = %mission_id,
                                             workspace = %workspace.name,
@@ -2654,6 +2888,7 @@ pub async fn prepare_task_workspace(
         None,
         None, // No command_contents for task workspace
         None, // shared_network: not relevant for host workspaces
+        None, // custom_providers: none for task workspace
     )
     .await?;
     Ok(dir)
@@ -2835,6 +3070,7 @@ pub async fn sync_all_workspaces(config: &Config, mcp: &McpRegistry) -> anyhow::
             None,
             None, // No command_contents for migration
             None, // shared_network: not relevant for host workspaces
+            None, // custom_providers: none for migration
         )
         .await
         .is_ok()
@@ -2983,6 +3219,7 @@ pub async fn build_container_workspace(
     distro: Option<NspawnDistro>,
     force_rebuild: bool,
     working_dir: &Path,
+    library: Option<&LibraryStore>,
 ) -> anyhow::Result<()> {
     if workspace.workspace_type != WorkspaceType::Container {
         return Err(anyhow::anyhow!("Workspace is not a container type"));
@@ -3088,10 +3325,15 @@ pub async fn build_container_workspace(
                 return Err(e);
             }
 
-            if workspace.init_script.as_ref().map_or(false, |s| !s.trim().is_empty()) {
+            let has_init_scripts = !workspace.init_scripts.is_empty();
+            let has_custom_script = workspace
+                .init_script
+                .as_ref()
+                .map_or(false, |s| !s.trim().is_empty());
+            if has_init_scripts || has_custom_script {
                 append_to_init_log(&workspace.path, "[openagent] Running init script...\n");
             }
-            if let Err(e) = run_workspace_init_script(workspace).await {
+            if let Err(e) = run_workspace_init_script(workspace, library).await {
                 append_to_init_log(
                     &workspace.path,
                     &format!("[openagent] Init script failed: {}\n", e),
@@ -3216,7 +3458,8 @@ fn env_var_bool(name: &str, default: bool) -> bool {
 }
 
 async fn bootstrap_workspace_harnesses(workspace: &Workspace) -> anyhow::Result<()> {
-    if workspace.workspace_type != WorkspaceType::Container || !use_nspawn_for_workspace(workspace) {
+    if workspace.workspace_type != WorkspaceType::Container || !use_nspawn_for_workspace(workspace)
+    {
         return Ok(());
     }
 
@@ -3329,19 +3572,84 @@ echo "[openagent] Harness bootstrap done"
     Ok(())
 }
 
-async fn run_workspace_init_script(workspace: &Workspace) -> anyhow::Result<()> {
-    let script = workspace
+async fn run_workspace_init_script(
+    workspace: &Workspace,
+    library: Option<&LibraryStore>,
+) -> anyhow::Result<()> {
+    let has_fragments = !workspace.init_scripts.is_empty();
+    let custom_script = workspace
         .init_script
         .as_ref()
         .map(|s| s.trim())
         .unwrap_or("");
+
+    // If there are fragments and we have a library, assemble them
+    let script = if has_fragments {
+        if let Some(library) = library {
+            // Assemble fragments + custom script
+            let custom = if custom_script.is_empty() {
+                None
+            } else {
+                Some(custom_script)
+            };
+
+            // Collect setup commands from workspace skills
+            let skill_setup_commands = if !workspace.skills.is_empty() {
+                let commands = library
+                    .collect_skill_setup_commands(&workspace.skills)
+                    .await;
+                if commands.is_empty() {
+                    None
+                } else {
+                    tracing::info!(
+                        workspace = %workspace.name,
+                        skills_with_setup = commands.len(),
+                        "Collected setup commands from {} skills",
+                        commands.len()
+                    );
+                    Some(commands)
+                }
+            } else {
+                None
+            };
+
+            match library
+                .assemble_init_script(
+                    &workspace.init_scripts,
+                    custom,
+                    skill_setup_commands.as_deref(),
+                )
+                .await
+            {
+                Ok(assembled) => assembled,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        error = %e,
+                        "Failed to assemble init script fragments, falling back to custom script only"
+                    );
+                    custom_script.to_string()
+                }
+            }
+        } else {
+            // No library available, just use custom script
+            tracing::warn!(
+                workspace = %workspace.name,
+                "Init script fragments specified but library not available"
+            );
+            custom_script.to_string()
+        }
+    } else {
+        // No fragments, just use custom script
+        custom_script.to_string()
+    };
 
     if script.is_empty() {
         return Ok(());
     }
 
     let script_path = workspace.path.join("openagent-init.sh");
-    tokio::fs::write(&script_path, script).await?;
+    tokio::fs::write(&script_path, &script).await?;
 
     #[cfg(unix)]
     {
@@ -3522,5 +3830,71 @@ pub async fn read_openagent_config(
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
         Err(_) => crate::library::OpenAgentConfig::default(),
+    }
+}
+
+/// Patch oh-my-opencode.json agent models for Claude Code OAuth compatibility.
+///
+/// Claude Code OAuth tokens only work with specific models. This function:
+/// - Replaces `anthropic/claude-opus-4-5` with `anthropic/claude-sonnet-4-5`
+/// - Removes the "variant" field from Anthropic model agents (e.g., "max" for extended thinking)
+///
+/// This ensures agents like Prometheus work correctly when using Claude Code OAuth.
+fn patch_opencode_agent_models_for_oauth(content: &str) -> String {
+    let mut json: serde_json::Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return content.to_string(),
+    };
+
+    let Some(agents) = json.get_mut("agents").and_then(|v| v.as_object_mut()) else {
+        return content.to_string();
+    };
+
+    let mut patched = false;
+
+    for (_name, agent) in agents.iter_mut() {
+        let Some(agent_obj) = agent.as_object_mut() else {
+            continue;
+        };
+
+        // Check if this agent uses an Anthropic model
+        let is_anthropic = agent_obj
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|m| m.starts_with("anthropic/"))
+            .unwrap_or(false);
+
+        if is_anthropic {
+            // Replace claude-opus-4-5 with claude-sonnet-4-5
+            if let Some(model_str) = agent_obj
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+            {
+                if model_str.contains("claude-opus-4-5") {
+                    let new_model = model_str.replace("claude-opus-4-5", "claude-sonnet-4-5");
+                    agent_obj.insert("model".to_string(), serde_json::Value::String(new_model));
+                    patched = true;
+                    tracing::info!(
+                        "Patched oh-my-opencode agent model: {} -> claude-sonnet-4-5",
+                        model_str
+                    );
+                }
+            }
+
+            // Remove "variant" field (e.g., "max" for extended thinking) as it's not supported
+            if agent_obj.remove("variant").is_some() {
+                patched = true;
+                tracing::info!(
+                    "Removed 'variant' field from Anthropic agent for OAuth compatibility"
+                );
+            }
+        }
+    }
+
+    if patched {
+        serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string())
+    } else {
+        content.to_string()
     }
 }

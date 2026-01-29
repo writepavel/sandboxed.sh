@@ -71,36 +71,6 @@ pub struct Plugin {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Rule Types (AGENTS.md style instructions)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Rule summary for listing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuleSummary {
-    /// Rule name (filename without .md)
-    pub name: String,
-    /// Description from frontmatter
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Path relative to library root (e.g., "rule/code-style.md")
-    pub path: String,
-}
-
-/// Full rule with content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Rule {
-    /// Rule name
-    pub name: String,
-    /// Description from frontmatter
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Path relative to library root
-    pub path: String,
-    /// Full markdown content
-    pub content: String,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Library Agent Types (OpenCode agent definitions)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -138,9 +108,6 @@ pub struct LibraryAgent {
     /// Permission levels: {"bash": "ask", "write": "allow"}
     #[serde(default)]
     pub permissions: HashMap<String, String>,
-    /// Rules to include by name
-    #[serde(default)]
-    pub rules: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +160,9 @@ pub struct WorkspaceTemplateSummary {
     /// Skills enabled for this template (optional summary)
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Vec<String>,
 }
 
 /// Full workspace template definition.
@@ -217,7 +187,10 @@ pub struct WorkspaceTemplate {
     /// Keys of env vars that should be encrypted at rest
     #[serde(default)]
     pub encrypted_keys: Vec<String>,
-    /// Init script to run on build
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Vec<String>,
+    /// Custom init script to run on build (appended after fragments)
     #[serde(default)]
     pub init_script: String,
     /// Whether to share the host network (default: true).
@@ -229,6 +202,36 @@ pub struct WorkspaceTemplate {
     /// Empty = use default MCPs (those with `default_enabled = true`).
     #[serde(default)]
     pub mcps: Vec<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init Script Fragment Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Init script fragment summary for listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitScriptSummary {
+    /// Fragment name (folder name, e.g., "base", "ssh-keys")
+    pub name: String,
+    /// Description extracted from first comment line
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root (e.g., "init-script/base/SCRIPT.sh")
+    pub path: String,
+}
+
+/// Full init script fragment with content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitScript {
+    /// Fragment name
+    pub name: String,
+    /// Description extracted from first comment line
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Path relative to library root
+    pub path: String,
+    /// Full script content
+    pub content: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,6 +249,37 @@ pub struct SkillFile {
     pub content: String,
 }
 
+/// Source/provenance of a skill - local or from skills.sh registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type")]
+pub enum SkillSource {
+    /// Locally created skill
+    Local,
+    /// Skill installed from skills.sh registry
+    SkillsRegistry {
+        /// Repository identifier (e.g., "vercel-labs/agent-skills")
+        identifier: String,
+        /// Specific skill name within the repo (for multi-skill repos)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skill_name: Option<String>,
+        /// Pinned version/commit hash
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        /// When the skill was first installed
+        #[serde(skip_serializing_if = "Option::is_none")]
+        installed_at: Option<String>,
+        /// When the skill was last updated
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
+    },
+}
+
+impl Default for SkillSource {
+    fn default() -> Self {
+        SkillSource::Local
+    }
+}
+
 /// Skill summary for listing (without full content).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillSummary {
@@ -256,6 +290,12 @@ pub struct SkillSummary {
     pub description: Option<String>,
     /// Path relative to library root (e.g., "skill/frontend-development")
     pub path: String,
+    /// Source/provenance of the skill
+    #[serde(default)]
+    pub source: SkillSource,
+    /// Shell commands to run during workspace setup (e.g., install dependencies)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_commands: Vec<String>,
 }
 
 /// Full skill with content.
@@ -268,6 +308,9 @@ pub struct Skill {
     pub description: Option<String>,
     /// Path relative to library root
     pub path: String,
+    /// Source/provenance of the skill
+    #[serde(default)]
+    pub source: SkillSource,
     /// Primary SKILL.md content (for backwards compatibility)
     pub content: String,
     /// All markdown files in the skill folder
@@ -276,6 +319,9 @@ pub struct Skill {
     /// List of non-.md reference files
     #[serde(default)]
     pub references: Vec<String>,
+    /// Shell commands to run during workspace setup (e.g., install dependencies)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_commands: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

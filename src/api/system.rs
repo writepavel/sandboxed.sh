@@ -108,7 +108,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components", get(get_components))
         .route("/components/:name/update", post(update_component))
         .route("/plugins/installed", get(get_installed_plugins))
-        .route("/plugins/:package/update", post(update_plugin))
+        .route("/plugins/:package/update", get(update_plugin))
 }
 
 /// Get information about all system components.
@@ -371,9 +371,8 @@ async fn check_claude_code_update(current_version: Option<&str>) -> Option<Strin
 
     let json: serde_json::Value = resp.json().await.ok()?;
     let latest_raw = json.get("version")?.as_str()?;
-    let latest = extract_version_token(latest_raw).unwrap_or_else(|| {
-        latest_raw.trim_start_matches('v').to_string()
-    });
+    let latest = extract_version_token(latest_raw)
+        .unwrap_or_else(|| latest_raw.trim_start_matches('v').to_string());
 
     if latest != current && version_is_newer(&latest, &current) {
         Some(latest.to_string())
@@ -575,12 +574,7 @@ async fn get_oh_my_opencode_version() -> Option<String> {
     {
         if output.status.success() {
             let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !version.is_empty()
-                && version
-                    .chars()
-                    .next()
-                    .map_or(false, |c| c.is_ascii_digit())
-            {
+            if !version.is_empty() && version.chars().next().map_or(false, |c| c.is_ascii_digit()) {
                 return Some(version);
             }
         }
@@ -1006,19 +1000,35 @@ fn stream_amp_update() -> impl Stream<Item = Result<Event, std::convert::Infalli
 fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", "Starting oh-my-opencode update...", Some(0));
-        yield sse("log", "Clearing oh-my-opencode cache...", Some(10));
 
-        // Remove only oh-my-opencode from bun cache (not the entire cache)
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+
+        // Remove conflicting npm/nvm global installs (we only use bunx)
+        yield sse("log", "Removing npm/nvm global installs...", Some(5));
         let _ = Command::new("bash")
             .args([
                 "-c",
-                &format!("rm -rf {}/.bun/install/cache/oh-my-opencode@*", home),
+                "npm uninstall -g oh-my-opencode 2>/dev/null || true",
             ])
             .output()
             .await;
 
-        yield sse("log", "Running bunx oh-my-opencode@latest install...", Some(20));
+        // Clear ALL oh-my-opencode caches (bun stores in multiple locations)
+        yield sse("log", "Clearing oh-my-opencode caches...", Some(15));
+        let cache_clear_script = format!(
+            r#"
+            rm -rf {home}/.bun/install/cache/oh-my-opencode* 2>/dev/null
+            rm -rf {home}/.cache/.bun/install/cache/oh-my-opencode* 2>/dev/null
+            rm -rf {home}/.npm/_npx/*/node_modules/oh-my-opencode* 2>/dev/null
+            "#,
+            home = home
+        );
+        let _ = Command::new("bash")
+            .args(["-c", &cache_clear_script])
+            .output()
+            .await;
+
+        yield sse("log", "Running bunx oh-my-opencode@latest install...", Some(25));
 
         // Run the install command with @latest to force the newest version
         // Enable all providers by default for updates

@@ -19,12 +19,15 @@ import {
   FileCode,
   Server,
   Puzzle,
-  ScrollText,
   Wrench,
   LayoutGrid,
   Library,
   Cog,
-  Kanban,
+  Key,
+  Archive,
+  Activity,
+  Shield,
+  Cpu,
 } from 'lucide-react';
 
 type NavItem = {
@@ -37,7 +40,6 @@ type NavItem = {
 const navigation: NavItem[] = [
   { name: 'Overview', href: '/', icon: LayoutDashboard },
   { name: 'Mission', href: '/control', icon: MessageSquare },
-  { name: 'Board', href: '/board', icon: Kanban },
   { name: 'Workspaces', href: '/workspaces', icon: Server },
   { name: 'Console', href: '/console', icon: Terminal },
   {
@@ -47,7 +49,6 @@ const navigation: NavItem[] = [
     children: [
       { name: 'Commands', href: '/config/commands', icon: Terminal },
       { name: 'Skills', href: '/config/skills', icon: FileCode },
-      { name: 'Rules', href: '/config/rules', icon: ScrollText },
       { name: 'Workspaces', href: '/config/workspace-templates', icon: LayoutGrid },
       { name: 'Configs', href: '/config/settings', icon: Cog },
     ],
@@ -62,7 +63,19 @@ const navigation: NavItem[] = [
       { name: 'Tools', href: '/extensions/tools', icon: Wrench },
     ],
   },
-  { name: 'Settings', href: '/settings', icon: Settings },
+  {
+    name: 'Settings',
+    href: '/settings',
+    icon: Settings,
+    children: [
+      { name: 'System', href: '/settings/system', icon: Server },
+      { name: 'Backends', href: '/settings/backends', icon: Cpu },
+      { name: 'Providers', href: '/settings/providers', icon: Key },
+      { name: 'Data', href: '/settings/data', icon: Archive },
+      { name: 'Monitoring', href: '/settings/monitoring', icon: Activity },
+      { name: 'Secrets', href: '/settings/secrets', icon: Shield },
+    ],
+  },
 ];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -82,6 +95,9 @@ export function Sidebar() {
     }
     if (pathname.startsWith('/extensions')) {
       setExpandedItems((prev) => new Set([...prev, 'Extensions']));
+    }
+    if (pathname.startsWith('/settings')) {
+      setExpandedItems((prev) => new Set([...prev, 'Settings']));
     }
   }, [pathname]);
 

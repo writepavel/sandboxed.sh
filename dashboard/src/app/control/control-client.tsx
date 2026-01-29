@@ -39,6 +39,7 @@ import {
   closeDesktopSession,
   keepAliveDesktopSession,
   cleanupOrphanedDesktopSessions,
+  cleanupStoppedDesktopSessions,
   removeFromQueue,
   clearQueue,
   getQueue,
@@ -447,6 +448,35 @@ function QuestionToolItem({
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * Generate a unique fingerprint for comparing message content.
+ * Uses a delimiter that's unlikely to appear in message content to avoid
+ * false matches when content contains newlines or role prefixes.
+ */
+function getMessageFingerprint(kind: string, content: string): string {
+  return `${kind}\x00${content.length}\x00${content}`;
+}
+
+/**
+ * Compare current items with mission history by content fingerprints.
+ * Returns true if the history has changed (contents differ).
+ */
+function hasHistoryChanged(
+  items: ReadonlyArray<{ kind: string; content?: string }>,
+  history: ReadonlyArray<{ role: string; content?: string | null }>
+): boolean {
+  const currentFingerprints = items
+    .filter(i => i.kind === "user" || i.kind === "assistant")
+    .map(i => getMessageFingerprint(i.kind, i.content || ""));
+  
+  const newFingerprints = history.map(e =>
+    getMessageFingerprint(e.role === "user" ? "user" : "assistant", e.content || "")
+  );
+  
+  if (currentFingerprints.length !== newFingerprints.length) return true;
+  return currentFingerprints.some((fp, i) => fp !== newFingerprints[i]);
 }
 
 function formatTime(timestamp: number): string {
@@ -2889,9 +2919,10 @@ export default function ControlClient() {
         setViewingMission(mission);
         // Use events if available, otherwise fall back to basic history
         let historyItems = events ? eventsToItems(events) : missionHistoryToItems(mission);
-        // Merge queued messages
-        if (queuedMessages.length > 0) {
-          const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+        // Merge queued messages that belong to this mission
+        const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === id);
+        if (missionQueuedMessages.length > 0) {
+          const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
             kind: "user" as const,
             id: qm.id,
             content: qm.content,
@@ -2954,9 +2985,10 @@ export default function ControlClient() {
             .then(([events, queuedMessages]) => {
               if (cancelled) return;
               let historyItems = eventsToItems(events);
-              // Merge queued messages
-              if (queuedMessages.length > 0) {
-                const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+              // Merge queued messages that belong to this mission
+              const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === mission.id);
+              if (missionQueuedMessages.length > 0) {
+                const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
                   kind: "user" as const,
                   id: qm.id,
                   content: qm.content,
@@ -3339,10 +3371,10 @@ export default function ControlClient() {
         // Use events if available, otherwise fall back to basic history
         let historyItems = events ? eventsToItems(events) : missionHistoryToItems(mission);
 
-        // Merge queued messages if this is the running mission
-        // Queue is global and applies to whatever mission is currently active
-        if (queuedMessages.length > 0) {
-          const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+        // Merge queued messages that belong to this mission
+        const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === missionId);
+        if (missionQueuedMessages.length > 0) {
+          const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
             kind: "user" as const,
             id: qm.id,
             content: qm.content,
@@ -3475,12 +3507,12 @@ export default function ControlClient() {
   };
 
   // Handle resuming an interrupted mission
-  const handleResumeMission = async (cleanWorkspace: boolean = false) => {
+  const handleResumeMission = async () => {
     const mission = viewingMission ?? currentMission;
-    if (!mission || !["interrupted", "blocked"].includes(mission.status)) return;
+    if (!mission || !["interrupted", "blocked", "failed"].includes(mission.status)) return;
     try {
       setMissionLoading(true);
-      const resumed = await resumeMission(mission.id, cleanWorkspace);
+      const resumed = await resumeMission(mission.id);
       setCurrentMission(resumed);
       setViewingMission(resumed);
       setViewingMissionId(resumed.id);
@@ -3490,9 +3522,11 @@ export default function ControlClient() {
       updateMissionItems(resumed.id, basicItems);
       refreshRecentMissions();
       toast.success(
-        cleanWorkspace
-          ? "Mission resumed with clean workspace"
-          : (mission.status === "blocked" ? "Continuing mission" : "Mission resumed")
+        mission.status === "blocked"
+          ? "Continuing mission"
+          : mission.status === "failed"
+            ? "Retrying mission"
+            : "Mission resumed"
       );
       // Load full events in background (including tool calls)
       getMissionEvents(resumed.id)
@@ -3616,9 +3650,10 @@ export default function ControlClient() {
             .then(([mission, events, queuedMessages]) => {
               if (!mounted) return;
               let historyItems = eventsToItems(events);
-              // Merge queued messages
-              if (queuedMessages.length > 0) {
-                const queuedChatItems: ChatItem[] = queuedMessages.map((qm) => ({
+              // Merge queued messages that belong to this mission
+              const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === viewingId);
+              if (missionQueuedMessages.length > 0) {
+                const queuedChatItems: ChatItem[] = missionQueuedMessages.map((qm) => ({
                   kind: "user" as const,
                   id: qm.id,
                   content: qm.content,
@@ -3745,7 +3780,32 @@ export default function ControlClient() {
             return updated;
           }
 
-          // No matching temp message found, add new (message came from another client/session)
+          // Check if there's an existing user message with the same content but a non-server ID
+          // (e.g., history-* ID from missionHistoryToItems that replaced the UUID-based item).
+          // Search from the end to match the most recent message with this content,
+          // and only match if the ID is not already a server-assigned UUID.
+          const contentIndex = [...prev].reverse().findIndex(
+            (item) =>
+              item.kind === "user" &&
+              item.content === msgContent &&
+              (item.id.startsWith("history-") || item.id.startsWith("temp-"))
+          );
+          if (contentIndex !== -1) {
+            // Convert reversed index back to forward index
+            const actualIndex = prev.length - 1 - contentIndex;
+            const existing = prev[actualIndex];
+            if (existing.kind === "user") {
+              const updated = [...prev];
+              updated[actualIndex] = {
+                ...existing,
+                id: msgId,
+                queued: hasQueuedFlag ? queued : existing.queued,
+              };
+              return updated;
+            }
+          }
+
+          // No matching message found at all, add new (message came from another client/session)
           return [
             ...prev,
             {
@@ -4280,12 +4340,9 @@ export default function ControlClient() {
         setCurrentMission(mission);
         setViewingMission(mission);
         setViewingMissionId(mission.id);
-        // Only update items if history changed (avoid flicker for in-progress conversations)
-        const currentIds = items.filter(i => i.kind === "user" || i.kind === "assistant").map(i => i.id).join(",");
-        const newItems = missionHistoryToItems(mission);
-        const newIds = newItems.filter(i => i.kind === "user" || i.kind === "assistant").map(i => i.id).join(",");
-        if (currentIds !== newIds) {
-          setItems(newItems);
+        // Only update items if history content has actually changed
+        if (hasHistoryChanged(items, mission.history)) {
+          setItems(missionHistoryToItems(mission));
         }
         applyDesktopSessionState(mission);
       } catch (err) {
@@ -4363,18 +4420,16 @@ export default function ControlClient() {
 
     const targetMissionId = viewingMissionIdRef.current;
 
-    // Sync mission state before sending (for UI consistency)
+    // Sync mission state before sending (backend needs current_mission set correctly)
     if (targetMissionId) {
       try {
         const mission = await loadMission(targetMissionId);
         setCurrentMission(mission);
         setViewingMission(mission);
         setViewingMissionId(mission.id);
-        const currentIds = items.filter(i => i.kind === "user" || i.kind === "assistant").map(i => i.id).join(",");
-        const newItems = missionHistoryToItems(mission);
-        const newIds = newItems.filter(i => i.kind === "user" || i.kind === "assistant").map(i => i.id).join(",");
-        if (currentIds !== newIds) {
-          setItems(newItems);
+        // Only update items if history content has actually changed
+        if (hasHistoryChanged(items, mission.history)) {
+          setItems(missionHistoryToItems(mission));
         }
         applyDesktopSessionState(mission);
       } catch (err) {
@@ -4497,19 +4552,20 @@ export default function ControlClient() {
     ? missionStatusLabel(activeMission.status)
     : null;
 
-  // Determine if we should show the resume UI for interrupted/blocked missions
+  // Determine if we should show the resume UI for interrupted/blocked/failed missions
   // Don't show resume UI if:
   // - Mission is running
   // - Last turn completed (assistant message at end - ready for user input)
   // - User just sent a message (waiting for assistant response)
+  // Note: For failed missions, we show resume even if lastTurnCompleted (error message is last)
   const lastItem = items[items.length - 1];
   const lastTurnCompleted = lastItem?.kind === 'assistant';
   const waitingForResponse = lastItem?.kind === 'user';
+  const isFailed = activeMission?.status === 'failed';
   const showResumeUI = activeMission &&
     !viewingMissionIsRunning &&
-    !lastTurnCompleted &&
     !waitingForResponse &&
-    (activeMission.status === 'interrupted' || activeMission.status === 'blocked');
+    (isFailed || (!lastTurnCompleted && (activeMission.status === 'interrupted' || activeMission.status === 'blocked')));
 
   return (
     <div className="flex h-screen flex-col p-6">
@@ -4774,6 +4830,28 @@ export default function ControlClient() {
                             </button>
                           </>
                         )}
+
+                        {/* Separator and cleanup action if there are stopped sessions */}
+                        {desktopSessions.some(s => !s.process_running || s.status === 'stopped') && (
+                          <>
+                            <div className="my-1 h-px bg-white/[0.06]" />
+                            <button
+                              onClick={async () => {
+                                try {
+                                  await cleanupStoppedDesktopSessions();
+                                  toast.success('Stopped sessions cleared');
+                                  await refreshDesktopSessions();
+                                } catch (err) {
+                                  toast.error('Failed to clear stopped sessions');
+                                }
+                              }}
+                              className="flex w-full items-center gap-2 px-3 py-2 text-xs text-white/40 hover:bg-white/[0.04] transition-colors"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Clear stopped sessions
+                            </button>
+                          </>
+                        )}
                       </>
                     ) : (
                       /* Fallback to hardcoded list if no sessions from API */
@@ -5019,7 +5097,7 @@ export default function ControlClient() {
                     {activeMission.status === "blocked" && (
                       <div className="mt-4 flex gap-2">
                         <button
-                          onClick={() => handleResumeMission(false)}
+                          onClick={() => handleResumeMission()}
                           disabled={missionLoading}
                           className="inline-flex items-center gap-2 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50"
                         >
@@ -5029,15 +5107,6 @@ export default function ControlClient() {
                             <PlayCircle className="h-4 w-4" />
                           )}
                           Continue Mission
-                        </button>
-                        <button
-                          onClick={() => handleResumeMission(true)}
-                          disabled={missionLoading}
-                          className="inline-flex items-center gap-2 rounded-lg bg-white/10 border border-white/20 px-4 py-2 text-sm font-medium text-white/70 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-50"
-                          title="Delete work folder and start fresh"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                          Clean & Continue
                         </button>
                       </div>
                     )}
@@ -5190,19 +5259,11 @@ export default function ControlClient() {
                         {!item.success && item.resumable && (
                           <div className="mt-3 flex gap-2">
                             <button
-                              onClick={() => handleResumeMission(false)}
+                              onClick={() => handleResumeMission()}
                               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
                             >
                               <RotateCcw className="h-3 w-3" />
                               Resume Mission
-                            </button>
-                            <button
-                              onClick={() => handleResumeMission(true)}
-                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white/60 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors"
-                              title="Resume and clean workspace"
-                            >
-                              <RefreshCw className="h-3 w-3" />
-                              Clean Resume
                             </button>
                           </div>
                         )}
@@ -5405,19 +5466,11 @@ export default function ControlClient() {
                       {item.resumable && (
                         <div className="mt-3 flex gap-2">
                           <button
-                            onClick={() => handleResumeMission(false)}
+                            onClick={() => handleResumeMission()}
                             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-lg transition-colors"
                           >
                             <RotateCcw className="h-3 w-3" />
                             Resume Mission
-                          </button>
-                          <button
-                            onClick={() => handleResumeMission(true)}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white/60 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] rounded-lg transition-colors"
-                            title="Resume and clean workspace"
-                          >
-                            <RefreshCw className="h-3 w-3" />
-                            Clean Resume
                           </button>
                         </div>
                       )}
@@ -5558,7 +5611,7 @@ export default function ControlClient() {
                       <span className="text-white/50 ml-1">— Agent used all {maxIterations} iterations</span>
                     </div>
                     <button
-                      onClick={() => handleResumeMission(false)}
+                      onClick={() => handleResumeMission()}
                       disabled={missionLoading}
                       className="ml-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-sm font-medium text-black hover:bg-amber-400 transition-colors disabled:opacity-50"
                     >
@@ -5569,19 +5622,10 @@ export default function ControlClient() {
                       )}
                       Continue
                     </button>
-                    <button
-                      onClick={() => handleResumeMission(true)}
-                      disabled={missionLoading}
-                      className="inline-flex items-center gap-1.5 rounded-lg bg-white/10 border border-white/20 px-3 py-1.5 text-sm font-medium text-white/70 hover:bg-white/20 hover:text-white transition-colors disabled:opacity-50"
-                      title="Delete work folder and start fresh"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                      Clean & Continue
-                    </button>
                   </div>
                 </div>
               )}
-              
+
               <div ref={endRef} />
             </div>
           )}
@@ -5693,24 +5737,15 @@ export default function ControlClient() {
             <div className="mx-auto flex max-w-3xl gap-3 items-center justify-center py-2">
               <div className="flex items-center gap-2 text-sm text-white/50 mr-4">
                 <AlertTriangle className="h-4 w-4 text-amber-400" />
-                <span>Mission {activeMission.status === 'blocked' ? 'blocked' : 'interrupted'}</span>
+                <span>Mission {activeMission.status === 'blocked' ? 'blocked' : activeMission.status === 'failed' ? 'failed' : 'interrupted'}</span>
               </div>
               <button
-                onClick={() => handleResumeMission(false)}
-                disabled={missionLoading}
-                className="flex items-center gap-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 px-5 py-3 text-sm font-medium text-white transition-colors disabled:opacity-50"
-              >
-                <PlayCircle className="h-4 w-4" />
-                {activeMission.status === 'blocked' ? 'Continue' : 'Resume'}
-              </button>
-              <button
-                onClick={() => handleResumeMission(true)}
+                onClick={() => handleResumeMission()}
                 disabled={missionLoading}
                 className="flex items-center gap-2 rounded-xl border border-white/[0.06] bg-white/[0.02] hover:bg-white/[0.04] px-5 py-3 text-sm font-medium text-white/70 transition-colors disabled:opacity-50"
-                title="Delete work folder and start fresh"
               >
-                <Trash2 className="h-4 w-4 text-orange-400" />
-                Clean & {activeMission.status === 'blocked' ? 'Continue' : 'Resume'}
+                <PlayCircle className="h-4 w-4" />
+                {activeMission.status === 'blocked' ? 'Continue' : activeMission.status === 'failed' ? 'Retry' : 'Resume'}
               </button>
             </div>
           ) : (

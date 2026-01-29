@@ -425,9 +425,7 @@ fn parse_opencode_sse_event(
                 .get("input")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            state
-                .emitted_tool_calls
-                .insert(tool_id.clone(), ());
+            state.emitted_tool_calls.insert(tool_id.clone(), ());
             Some(AgentEvent::ToolCall {
                 tool_call_id: tool_id,
                 name: tool_name,
@@ -463,9 +461,9 @@ fn parse_opencode_sse_event(
             let message = props
                 .get("error")
                 .and_then(|v| {
-                    v.as_str().map(|s| s.to_string()).or_else(|| {
-                        serde_json::to_string(v).ok()
-                    })
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| serde_json::to_string(v).ok())
                 })
                 .unwrap_or_else(|| "Unknown session error".to_string());
             Some(AgentEvent::Error {
@@ -877,12 +875,14 @@ async fn resolve_claudecode_default_model(library: &SharedLibrary) -> Option<Str
     }?;
 
     match lib.get_claudecode_config().await {
-        Ok(config) => config
-            .default_model
-            .and_then(|model| {
-                let trimmed = model.trim().to_string();
-                if trimmed.is_empty() { None } else { Some(trimmed) }
-            }),
+        Ok(config) => config.default_model.and_then(|model| {
+            let trimmed = model.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }),
         Err(err) => {
             tracing::warn!("Failed to load Claude Code config from library: {}", err);
             None
@@ -917,8 +917,7 @@ async fn resolve_library_command(library: &SharedLibrary, message: &str) -> Stri
     match lib.get_command(command_name).await {
         Ok(command) => {
             // Strip frontmatter from content to get the body
-            let (_frontmatter, body) =
-                crate::library::types::parse_frontmatter(&command.content);
+            let (_frontmatter, body) = crate::library::types::parse_frontmatter(&command.content);
             let body = body.trim();
 
             tracing::info!(
@@ -1050,6 +1049,7 @@ async fn run_mission_turn(
             lib_ref,
             mission_id,
             &backend_id,
+            None, // custom_providers: TODO integrate with provider store
         )
         .await
     } {
@@ -1283,802 +1283,830 @@ pub fn run_claudecode_turn<'a>(
     tool_hub: Option<Arc<FrontendToolHub>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
-    use super::ai_providers::{
-        get_anthropic_auth_from_workspace, get_anthropic_auth_from_host_with_expiry,
-        get_workspace_auth_path, ClaudeCodeAuth, ensure_anthropic_oauth_token_valid,
-        get_anthropic_auth_for_claudecode, refresh_workspace_anthropic_auth,
-        write_claudecode_credentials_for_workspace,
-    };
-    use std::collections::HashMap;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
-        if value.starts_with("sk-ant-oat") {
-            ClaudeCodeAuth::OAuthToken(value)
-        } else {
-            ClaudeCodeAuth::ApiKey(value)
-        }
-    }
-
-    // Ensure OAuth tokens are fresh before resolving credentials.
-    let oauth_refresh_result = ensure_anthropic_oauth_token_valid().await;
-    if let Err(e) = &oauth_refresh_result {
-        tracing::warn!("Failed to refresh Anthropic OAuth token: {}", e);
-    }
-
-    // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
-    // For container workspaces, compare workspace auth vs host auth and use the fresher one.
-    // If workspace auth is expired, try to refresh it using the refresh token.
-    let api_auth = {
-        // For container workspaces, get both workspace and host auth with expiry info
-        let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
-            get_anthropic_auth_from_workspace(&workspace.path)
-        } else {
-            None
+        use super::ai_providers::{
+            ensure_anthropic_oauth_token_valid, get_anthropic_auth_for_claudecode,
+            get_anthropic_auth_from_host_with_expiry, get_anthropic_auth_from_workspace,
+            get_workspace_auth_path, refresh_workspace_anthropic_auth,
+            write_claudecode_credentials_for_workspace, ClaudeCodeAuth,
         };
+        use std::collections::HashMap;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let host_auth = get_anthropic_auth_from_host_with_expiry();
-        let now = chrono::Utc::now().timestamp_millis();
-
-        // If workspace auth is expired and we have no fresh host auth, try to refresh the workspace auth
-        if let Some(ref ws) = workspace_auth {
-            let ws_expiry = ws.expires_at.unwrap_or(i64::MAX);
-            let ws_expired = ws_expiry < now;
-            let host_has_fresh_auth = host_auth.as_ref()
-                .map(|h| h.expires_at.unwrap_or(i64::MAX) > now)
-                .unwrap_or(false);
-
-            if ws_expired && !host_has_fresh_auth {
-                // Workspace auth is expired and no fresh host auth - try to refresh workspace auth
-                tracing::info!(
-                    workspace_path = %workspace.path.display(),
-                    ws_expiry = ws_expiry,
-                    "Workspace auth is expired, attempting to refresh"
-                );
-                match refresh_workspace_anthropic_auth(&workspace.path).await {
-                    Ok(refreshed) => {
-                        tracing::info!(
-                            workspace_path = %workspace.path.display(),
-                            "Successfully refreshed workspace Anthropic auth"
-                        );
-                        workspace_auth = Some(refreshed);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            workspace_path = %workspace.path.display(),
-                            error = %e,
-                            "Failed to refresh workspace auth, will try other sources"
-                        );
-                        // Clear the stale workspace auth so we don't keep trying
-                        workspace_auth = None;
-                    }
-                }
+        fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
+            if value.starts_with("sk-ant-oat") {
+                ClaudeCodeAuth::OAuthToken(value)
+            } else {
+                ClaudeCodeAuth::ApiKey(value)
             }
         }
 
-        // Choose the fresher auth based on expiry timestamps
-        let chosen_auth: Option<ClaudeCodeAuth> = match (&workspace_auth, &host_auth) {
-            (Some(ws), Some(host)) => {
-                // Both available - compare expiry timestamps
-                let ws_expiry = ws.expires_at.unwrap_or(i64::MAX); // API keys never expire
-                let host_expiry = host.expires_at.unwrap_or(i64::MAX);
+        // Ensure OAuth tokens are fresh before resolving credentials.
+        let oauth_refresh_result = ensure_anthropic_oauth_token_valid().await;
+        if let Err(e) = &oauth_refresh_result {
+            tracing::warn!("Failed to refresh Anthropic OAuth token: {}", e);
+        }
 
-                // Check if workspace auth is expired
+        // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
+        // For container workspaces, compare workspace auth vs host auth and use the fresher one.
+        // If workspace auth is expired, try to refresh it using the refresh token.
+        let api_auth = {
+            // For container workspaces, get both workspace and host auth with expiry info
+            let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
+                get_anthropic_auth_from_workspace(&workspace.path)
+            } else {
+                None
+            };
+
+            let host_auth = get_anthropic_auth_from_host_with_expiry();
+            let now = chrono::Utc::now().timestamp_millis();
+
+            // If workspace auth is expired and we have no fresh host auth, try to refresh the workspace auth
+            if let Some(ref ws) = workspace_auth {
+                let ws_expiry = ws.expires_at.unwrap_or(i64::MAX);
                 let ws_expired = ws_expiry < now;
-                let host_expired = host_expiry < now;
+                let host_has_fresh_auth = host_auth
+                    .as_ref()
+                    .map(|h| h.expires_at.unwrap_or(i64::MAX) > now)
+                    .unwrap_or(false);
 
-                if ws_expired && !host_expired {
-                    // Workspace auth is expired but host auth is fresh - use host auth
-                    // Also delete the stale workspace auth file
-                    let ws_auth_path = get_workspace_auth_path(&workspace.path);
-                    if ws_auth_path.exists() {
+                if ws_expired && !host_has_fresh_auth {
+                    // Workspace auth is expired and no fresh host auth - try to refresh workspace auth
+                    tracing::info!(
+                        workspace_path = %workspace.path.display(),
+                        ws_expiry = ws_expiry,
+                        "Workspace auth is expired, attempting to refresh"
+                    );
+                    match refresh_workspace_anthropic_auth(&workspace.path).await {
+                        Ok(refreshed) => {
+                            tracing::info!(
+                                workspace_path = %workspace.path.display(),
+                                "Successfully refreshed workspace Anthropic auth"
+                            );
+                            workspace_auth = Some(refreshed);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                workspace_path = %workspace.path.display(),
+                                error = %e,
+                                "Failed to refresh workspace auth, will try other sources"
+                            );
+                            // Clear the stale workspace auth so we don't keep trying
+                            workspace_auth = None;
+                        }
+                    }
+                }
+            }
+
+            // Choose the fresher auth based on expiry timestamps
+            let chosen_auth: Option<ClaudeCodeAuth> = match (&workspace_auth, &host_auth) {
+                (Some(ws), Some(host)) => {
+                    // Both available - compare expiry timestamps
+                    let ws_expiry = ws.expires_at.unwrap_or(i64::MAX); // API keys never expire
+                    let host_expiry = host.expires_at.unwrap_or(i64::MAX);
+
+                    // Check if workspace auth is expired
+                    let ws_expired = ws_expiry < now;
+                    let host_expired = host_expiry < now;
+
+                    if ws_expired && !host_expired {
+                        // Workspace auth is expired but host auth is fresh - use host auth
+                        // Also delete the stale workspace auth file
+                        let ws_auth_path = get_workspace_auth_path(&workspace.path);
+                        if ws_auth_path.exists() {
+                            tracing::info!(
+                                workspace_path = %workspace.path.display(),
+                                ws_expiry = ws_expiry,
+                                host_expiry = host_expiry,
+                                "Workspace auth is expired, using fresher host auth and removing stale workspace auth"
+                            );
+                            if let Err(e) = std::fs::remove_file(&ws_auth_path) {
+                                tracing::warn!(
+                                    path = %ws_auth_path.display(),
+                                    error = %e,
+                                    "Failed to remove stale workspace auth file"
+                                );
+                            }
+                        }
+                        Some(host.auth.clone())
+                    } else if host_expiry > ws_expiry {
+                        // Host auth has later expiry - use it (it was likely just refreshed)
                         tracing::info!(
                             workspace_path = %workspace.path.display(),
                             ws_expiry = ws_expiry,
                             host_expiry = host_expiry,
-                            "Workspace auth is expired, using fresher host auth and removing stale workspace auth"
+                            "Using fresher host auth (expires later than workspace auth)"
                         );
-                        if let Err(e) = std::fs::remove_file(&ws_auth_path) {
-                            tracing::warn!(
-                                path = %ws_auth_path.display(),
-                                error = %e,
-                                "Failed to remove stale workspace auth file"
-                            );
-                        }
+                        Some(host.auth.clone())
+                    } else {
+                        // Workspace auth is fresher or equal - use it
+                        tracing::info!(
+                            workspace_path = %workspace.path.display(),
+                            ws_expiry = ws_expiry,
+                            host_expiry = host_expiry,
+                            "Using workspace auth"
+                        );
+                        Some(ws.auth.clone())
                     }
-                    Some(host.auth.clone())
-                } else if host_expiry > ws_expiry {
-                    // Host auth has later expiry - use it (it was likely just refreshed)
+                }
+                (Some(ws), None) => {
+                    // Only workspace auth available
                     tracing::info!(
                         workspace_path = %workspace.path.display(),
-                        ws_expiry = ws_expiry,
-                        host_expiry = host_expiry,
-                        "Using fresher host auth (expires later than workspace auth)"
-                    );
-                    Some(host.auth.clone())
-                } else {
-                    // Workspace auth is fresher or equal - use it
-                    tracing::info!(
-                        workspace_path = %workspace.path.display(),
-                        ws_expiry = ws_expiry,
-                        host_expiry = host_expiry,
-                        "Using workspace auth"
+                        "Using Anthropic credentials from container workspace"
                     );
                     Some(ws.auth.clone())
                 }
+                (None, Some(host)) => {
+                    // Only host auth available
+                    tracing::info!("Using Anthropic credentials from host");
+                    Some(host.auth.clone())
+                }
+                (None, None) => None,
+            };
+
+            // If we found auth from workspace/host comparison, use it
+            if let Some(auth) = chosen_auth {
+                Some(auth)
+            } else if let Some(auth) = get_anthropic_auth_for_claudecode(app_working_dir) {
+                tracing::info!("Using Anthropic credentials from provider for Claude Code");
+                Some(auth)
+            } else {
+                // Fall back to secrets vault (legacy support)
+                if let Some(ref store) = secrets {
+                    match store.get_secret("claudecode", "api_key").await {
+                        Ok(key) => {
+                            tracing::info!(
+                                "Using Claude Code credentials from secrets vault (legacy)"
+                            );
+                            Some(classify_claudecode_secret(key))
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to get Claude API key from secrets: {}", e);
+                            // Fall back to environment variable
+                            std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+                                .ok()
+                                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                                .map(classify_claudecode_secret)
+                        }
+                    }
+                } else {
+                    std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+                        .ok()
+                        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                        .map(classify_claudecode_secret)
+                }
             }
-            (Some(ws), None) => {
-                // Only workspace auth available
-                tracing::info!(
-                    workspace_path = %workspace.path.display(),
-                    "Using Anthropic credentials from container workspace"
-                );
-                Some(ws.auth.clone())
-            }
-            (None, Some(host)) => {
-                // Only host auth available
-                tracing::info!("Using Anthropic credentials from host");
-                Some(host.auth.clone())
-            }
-            (None, None) => None,
         };
 
-        // If we found auth from workspace/host comparison, use it
-        if let Some(auth) = chosen_auth {
-            Some(auth)
-        } else if let Some(auth) = get_anthropic_auth_for_claudecode(app_working_dir) {
-            tracing::info!("Using Anthropic credentials from provider for Claude Code");
-            Some(auth)
-        } else {
-            // Fall back to secrets vault (legacy support)
-            if let Some(ref store) = secrets {
-                match store.get_secret("claudecode", "api_key").await {
-                    Ok(key) => {
-                        tracing::info!("Using Claude Code credentials from secrets vault (legacy)");
-                        Some(classify_claudecode_secret(key))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to get Claude API key from secrets: {}", e);
-                        // Fall back to environment variable
-                        std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-                            .ok()
-                            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                            .map(classify_claudecode_secret)
-                    }
-                }
-            } else {
-                std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-                    .ok()
-                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                    .map(classify_claudecode_secret)
-            }
-        }
-    };
-
-    if matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_))) {
-        if let Err(err) = oauth_refresh_result {
-            let err_msg = format!(
+        if matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_))) {
+            if let Err(err) = oauth_refresh_result {
+                let err_msg = format!(
                 "Anthropic OAuth token refresh failed: {}. Please re-authenticate in Settings → AI Providers.",
                 err
             );
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
+        }
+
+        // Fail fast if no auth is available
+        if api_auth.is_none() {
+            let err_msg = "No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
             tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    }
-
-    // Fail fast if no auth is available
-    if api_auth.is_none() {
-        let err_msg = "No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
-        tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-        return AgentResult::failure(err_msg.to_string(), 0)
-            .with_terminal_reason(TerminalReason::LlmError);
-    }
-
-    // Write Claude Code credentials file with refresh token for long-running missions.
-    // This allows Claude Code to refresh tokens automatically during execution.
-    let is_oauth = matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_)));
-    tracing::debug!(
-        mission_id = %mission_id,
-        is_oauth = is_oauth,
-        workspace_path = %workspace.path.display(),
-        workspace_type = ?workspace.workspace_type,
-        "Checking if should write Claude Code credentials"
-    );
-    if is_oauth {
-        match write_claudecode_credentials_for_workspace(&workspace) {
-            Ok(()) => {
-                tracing::info!(
-                    mission_id = %mission_id,
-                    workspace_type = ?workspace.workspace_type,
-                    "Wrote Claude Code credentials with refresh token for automatic token refresh"
-                );
-            }
-            Err(e) => {
-                // Non-fatal: we still have the access token in env var as fallback
-                tracing::warn!(
-                    mission_id = %mission_id,
-                    error = %e,
-                    "Failed to write Claude Code credentials file (token refresh during mission may fail)"
-                );
-            }
-        }
-    }
-
-    // Determine CLI path: prefer backend config, then env var, then default
-    let cli_path = get_claudecode_cli_path_from_config(app_working_dir)
-        .or_else(|| std::env::var("CLAUDE_CLI_PATH").ok())
-        .unwrap_or_else(|| "claude".to_string());
-
-    // Use stored session_id for conversation persistence.
-    // If session_id is None (legacy mission), generate a new one but warn that continuation
-    // won't work correctly since the generated ID isn't persisted back to the mission store.
-    let session_id = match session_id {
-        Some(id) => id.to_string(),
-        None => {
-            let generated = Uuid::new_v4().to_string();
-            tracing::warn!(
-                mission_id = %mission_id,
-                generated_session_id = %generated,
-                "Mission has no stored session_id (legacy mission). Generated temporary ID, but conversation continuation will not work correctly. Consider recreating the mission."
-            );
-            generated
-        }
-    };
-
-    let workspace_exec = WorkspaceExec::new(workspace.clone());
-    let cli_path = match ensure_claudecode_cli_available(&workspace_exec, work_dir, &cli_path).await
-    {
-        Ok(path) => path,
-        Err(err_msg) => {
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    tracing::info!(
-        mission_id = %mission_id,
-        session_id = %session_id,
-        work_dir = %work_dir.display(),
-        workspace_type = ?workspace.workspace_type,
-        model = ?model,
-        agent = ?agent,
-        "Starting Claude Code execution via WorkspaceExec"
-    );
-
-    // Check for Claude Code builtin slash commands that need special handling
-    let trimmed_message = message.trim();
-    let (effective_message, permission_mode) = if trimmed_message == "/plan"
-        || trimmed_message.starts_with("/plan ")
-    {
-        // /plan triggers plan mode via --permission-mode plan
-        let rest = trimmed_message
-            .strip_prefix("/plan")
-            .unwrap_or("")
-            .trim();
-        let msg = if rest.is_empty() {
-            "Please analyze the codebase and create a plan for the task.".to_string()
-        } else {
-            rest.to_string()
-        };
-        (msg, Some("plan"))
-    } else {
-        (message.to_string(), None)
-    };
-
-    // Build CLI arguments
-    let mut args = vec![
-        "--print".to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-        "--include-partial-messages".to_string(),
-    ];
-
-    // Add permission mode if a slash command triggered a special mode
-    if let Some(mode) = permission_mode {
-        args.push("--permission-mode".to_string());
-        args.push(mode.to_string());
-    }
-
-    // Skip all permission checks. IS_SANDBOX=1 is set in env vars below
-    // to allow --dangerously-skip-permissions even when running as root.
-    args.push("--dangerously-skip-permissions".to_string());
-
-    // Ensure per-workspace MCP config is loaded (Claude CLI may not auto-load .claude in --print mode).
-    // For container workspaces, we must translate the path to be relative to the container filesystem.
-    let mcp_config_path = work_dir.join(".claude").join("settings.local.json");
-    if mcp_config_path.exists() {
-        args.push("--mcp-config".to_string());
-        // Translate the path for container execution (host path -> container-relative path)
-        let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
-        args.push(translated_path);
-    }
-
-    if let Some(m) = model {
-        args.push("--model".to_string());
-        args.push(m.to_string());
-    }
-
-    // For continuation turns, use --resume to resume existing session
-    // For first turn, use --session-id to create new session with that ID
-    if is_continuation {
-        args.push("--resume".to_string());
-        args.push(session_id.clone());
-        tracing::debug!(
-            mission_id = %mission_id,
-            session_id = %session_id,
-            "Resuming existing Claude Code session"
-        );
-    } else {
-        args.push("--session-id".to_string());
-        args.push(session_id.clone());
-        tracing::debug!(
-            mission_id = %mission_id,
-            session_id = %session_id,
-            "Starting new Claude Code session"
-        );
-    }
-
-    if let Some(a) = agent {
-        args.push("--agent".to_string());
-        args.push(a.to_string());
-    }
-
-    // Build environment variables
-    let mut env: HashMap<String, String> = HashMap::new();
-    // Allow --dangerously-skip-permissions when running as root inside containers.
-    env.insert("IS_SANDBOX".to_string(), "1".to_string());
-    if let Some(ref auth) = api_auth {
-        match auth {
-            ClaudeCodeAuth::OAuthToken(token) => {
-                env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
-                tracing::debug!(
-                    "Using OAuth token for Claude CLI authentication (token_len={})",
-                    token.len()
-                );
-            }
-            ClaudeCodeAuth::ApiKey(key) => {
-                env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
-                tracing::debug!("Using API key for Claude CLI authentication");
-            }
-        }
-    } else {
-        tracing::warn!("No authentication available for Claude Code!");
-    }
-
-    // Handle case where cli_path might be a wrapper command like "bun /path/to/claude"
-    let (program, mut full_args) = if cli_path.contains(' ') {
-        let parts: Vec<&str> = cli_path.splitn(2, ' ').collect();
-        let program = parts[0].to_string();
-        let mut full_args = if parts.len() > 1 {
-            vec![parts[1].to_string()]
-        } else {
-            vec![]
-        };
-        full_args.extend(args.clone());
-        (program, full_args)
-    } else {
-        (cli_path.clone(), args.clone())
-    };
-
-    // Use WorkspaceExec to spawn the CLI in the correct workspace context
-    let mut child = match workspace_exec
-        .spawn_streaming(work_dir, &program, &full_args, env)
-        .await
-    {
-        Ok(child) => child,
-        Err(e) => {
-            let err_msg = format!("Failed to start Claude CLI: {}", e);
-            tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
-        }
-    };
-
-    // Write message to stdin (use effective_message which may have been transformed from slash commands)
-    if let Some(mut stdin) = child.stdin.take() {
-        let msg = effective_message.clone();
-        tokio::spawn(async move {
-            if let Err(e) = stdin.write_all(msg.as_bytes()).await {
-                tracing::error!("Failed to write to Claude stdin: {}", e);
-            }
-            // Close stdin to signal end of input
-            drop(stdin);
-        });
-    }
-
-    // Get stdout for reading events
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            let err_msg = "Failed to capture Claude stdout";
-            tracing::error!("{}", err_msg);
             return AgentResult::failure(err_msg.to_string(), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
         }
-    };
 
-    // Capture stderr for debugging
-    let stderr = child.stderr.take();
-    let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-    let stderr_capture_clone = stderr_capture.clone();
-    let mission_id_for_stderr = mission_id;
-    let mut stderr_handle = if let Some(stderr) = stderr {
-        Some(tokio::spawn(async move {
-            let stderr_reader = BufReader::new(stderr);
-            let mut stderr_lines = stderr_reader.lines();
-            while let Ok(Some(line)) = stderr_lines.next_line().await {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    tracing::debug!(mission_id = %mission_id_for_stderr, stderr = %trimmed, "Claude Code stderr");
-                    let mut captured = stderr_capture_clone.lock().await;
-                    if !captured.is_empty() {
-                        captured.push('\n');
+        // Write Claude Code credentials file with refresh token for long-running missions.
+        // This allows Claude Code to refresh tokens automatically during execution.
+        let is_oauth = matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_)));
+        let mut wrote_claude_credentials = false;
+        tracing::debug!(
+            mission_id = %mission_id,
+            is_oauth = is_oauth,
+            workspace_path = %workspace.path.display(),
+            workspace_type = ?workspace.workspace_type,
+            "Checking if should write Claude Code credentials"
+        );
+        if is_oauth {
+            match write_claudecode_credentials_for_workspace(&workspace) {
+                Ok(()) => {
+                    wrote_claude_credentials = true;
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        workspace_type = ?workspace.workspace_type,
+                        "Wrote Claude Code credentials with refresh token for automatic token refresh"
+                    );
+                }
+                Err(e) => {
+                    // Non-fatal: we still have the access token in env var as fallback
+                    tracing::warn!(
+                        mission_id = %mission_id,
+                        error = %e,
+                        "Failed to write Claude Code credentials file (token refresh during mission may fail)"
+                    );
+                }
+            }
+        }
+
+        // Determine CLI path: prefer backend config, then env var, then default
+        let cli_path = get_claudecode_cli_path_from_config(app_working_dir)
+            .or_else(|| std::env::var("CLAUDE_CLI_PATH").ok())
+            .unwrap_or_else(|| "claude".to_string());
+
+        // Use stored session_id for conversation persistence.
+        // If session_id is None (legacy mission), generate a new one but warn that continuation
+        // won't work correctly since the generated ID isn't persisted back to the mission store.
+        let session_id = match session_id {
+            Some(id) => id.to_string(),
+            None => {
+                let generated = Uuid::new_v4().to_string();
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    generated_session_id = %generated,
+                    "Mission has no stored session_id (legacy mission). Generated temporary ID, but conversation continuation will not work correctly. Consider recreating the mission."
+                );
+                generated
+            }
+        };
+
+        let workspace_exec = WorkspaceExec::new(workspace.clone());
+        let cli_path =
+            match ensure_claudecode_cli_available(&workspace_exec, work_dir, &cli_path).await {
+                Ok(path) => path,
+                Err(err_msg) => {
+                    tracing::error!("{}", err_msg);
+                    return AgentResult::failure(err_msg, 0)
+                        .with_terminal_reason(TerminalReason::LlmError);
+                }
+            };
+
+        tracing::info!(
+            mission_id = %mission_id,
+            session_id = %session_id,
+            work_dir = %work_dir.display(),
+            workspace_type = ?workspace.workspace_type,
+            model = ?model,
+            agent = ?agent,
+            "Starting Claude Code execution via WorkspaceExec"
+        );
+
+        // Check for Claude Code builtin slash commands that need special handling
+        let trimmed_message = message.trim();
+        let (effective_message, permission_mode) =
+            if trimmed_message == "/plan" || trimmed_message.starts_with("/plan ") {
+                // /plan triggers plan mode via --permission-mode plan
+                let rest = trimmed_message.strip_prefix("/plan").unwrap_or("").trim();
+                let msg = if rest.is_empty() {
+                    "Please analyze the codebase and create a plan for the task.".to_string()
+                } else {
+                    rest.to_string()
+                };
+                (msg, Some("plan"))
+            } else {
+                (message.to_string(), None)
+            };
+
+        // Build CLI arguments
+        let mut args = vec![
+            "--print".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--include-partial-messages".to_string(),
+        ];
+
+        // Add permission mode if a slash command triggered a special mode
+        if let Some(mode) = permission_mode {
+            args.push("--permission-mode".to_string());
+            args.push(mode.to_string());
+        }
+
+        // Skip all permission checks. IS_SANDBOX=1 is set in env vars below
+        // to allow --dangerously-skip-permissions even when running as root.
+        args.push("--dangerously-skip-permissions".to_string());
+
+        // Ensure per-workspace MCP config is loaded (Claude CLI may not auto-load .claude in --print mode).
+        // For container workspaces, we must translate the path to be relative to the container filesystem.
+        let mcp_config_path = work_dir.join(".claude").join("settings.local.json");
+        if mcp_config_path.exists() {
+            args.push("--mcp-config".to_string());
+            // Translate the path for container execution (host path -> container-relative path)
+            let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
+            args.push(translated_path);
+        }
+
+        if let Some(m) = model {
+            args.push("--model".to_string());
+            args.push(m.to_string());
+        }
+
+        // For continuation turns, use --resume to resume existing session
+        // For first turn, use --session-id to create new session with that ID
+        if is_continuation {
+            args.push("--resume".to_string());
+            args.push(session_id.clone());
+            tracing::debug!(
+                mission_id = %mission_id,
+                session_id = %session_id,
+                "Resuming existing Claude Code session"
+            );
+        } else {
+            args.push("--session-id".to_string());
+            args.push(session_id.clone());
+            tracing::debug!(
+                mission_id = %mission_id,
+                session_id = %session_id,
+                "Starting new Claude Code session"
+            );
+        }
+
+        if let Some(a) = agent {
+            args.push("--agent".to_string());
+            args.push(a.to_string());
+        }
+
+        // Build environment variables
+        let mut env: HashMap<String, String> = HashMap::new();
+        // Allow --dangerously-skip-permissions when running as root inside containers.
+        env.insert("IS_SANDBOX".to_string(), "1".to_string());
+        if let Some(ref auth) = api_auth {
+            match auth {
+                ClaudeCodeAuth::OAuthToken(token) => {
+                    env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
+                    if wrote_claude_credentials {
+                        tracing::debug!(
+                            "Claude credentials file also written for token refresh (token_len={})",
+                            token.len()
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Using OAuth token for Claude CLI authentication (token_len={})",
+                            token.len()
+                        );
                     }
-                    captured.push_str(trimmed);
+                }
+                ClaudeCodeAuth::ApiKey(key) => {
+                    env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
+                    tracing::debug!("Using API key for Claude CLI authentication");
                 }
             }
-        }))
-    } else {
-        None
-    };
+        } else {
+            tracing::warn!("No authentication available for Claude Code!");
+        }
 
-    // Track tool calls for result mapping
-    let mut pending_tools: HashMap<String, String> = HashMap::new();
-    let mut total_cost_usd = 0.0f64;
-    let mut final_result = String::new();
-    let mut had_error = false;
+        // Handle case where cli_path might be a wrapper command like "bun /path/to/claude"
+        let (program, mut full_args) = if cli_path.contains(' ') {
+            let parts: Vec<&str> = cli_path.splitn(2, ' ').collect();
+            let program = parts[0].to_string();
+            let mut full_args = if parts.len() > 1 {
+                vec![parts[1].to_string()]
+            } else {
+                vec![]
+            };
+            full_args.extend(args.clone());
+            (program, full_args)
+        } else {
+            (cli_path.clone(), args.clone())
+        };
 
-    // Track content block types and accumulated content for Claude Code streaming
-    // This is needed because Claude sends incremental deltas that need to be accumulated
-    let mut block_types: HashMap<u32, String> = HashMap::new();
-    let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
-    let mut text_buffer: HashMap<u32, String> = HashMap::new();
-    let mut last_thinking_len: usize = 0; // Track last emitted length to avoid re-sending same content
-
-    let auth_missing = api_auth.is_none();
-    let auth_timeout = std::time::Duration::from_secs(45);
-
-    // Create a buffered reader for stdout
-    let reader = BufReader::new(stdout);
-    let mut lines = reader.lines();
-
-    // Process events until completion or cancellation
-    loop {
-        let mut timeout = tokio::time::sleep(auth_timeout);
-        tokio::pin!(timeout);
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
-                // Kill the process to stop consuming API resources
-                let _ = child.kill().await;
-                if let Some(handle) = stderr_handle.take() {
-                    handle.abort();
-                }
-                return AgentResult::failure("Cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
+        // Use WorkspaceExec to spawn the CLI in the correct workspace context
+        let mut child = match workspace_exec
+            .spawn_streaming(work_dir, &program, &full_args, env)
+            .await
+        {
+            Ok(child) => child,
+            Err(e) => {
+                let err_msg = format!("Failed to start Claude CLI: {}", e);
+                tracing::error!("{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
             }
-            _ = &mut timeout, if auth_missing => {
-                let err_msg = "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
-                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
-                let _ = child.kill().await;
-                if let Some(handle) = stderr_handle.take() {
-                    handle.abort();
+        };
+
+        // Write message to stdin (use effective_message which may have been transformed from slash commands)
+        if let Some(mut stdin) = child.stdin.take() {
+            let msg = effective_message.clone();
+            tokio::spawn(async move {
+                if let Err(e) = stdin.write_all(msg.as_bytes()).await {
+                    tracing::error!("Failed to write to Claude stdin: {}", e);
                 }
+                // Close stdin to signal end of input
+                drop(stdin);
+            });
+        }
+
+        // Get stdout for reading events
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let err_msg = "Failed to capture Claude stdout";
+                tracing::error!("{}", err_msg);
                 return AgentResult::failure(err_msg.to_string(), 0)
                     .with_terminal_reason(TerminalReason::LlmError);
             }
-            line_result = lines.next_line() => {
-                match line_result {
-                    Ok(Some(line)) => {
-                        if line.is_empty() {
-                            continue;
-                        }
+        };
 
-                        let claude_event: ClaudeEvent = match serde_json::from_str(&line) {
-                            Ok(event) => event,
-                            Err(e) => {
-                                tracing::warn!(
-                                    mission_id = %mission_id,
-                                    "Failed to parse Claude event: {} - line: {}",
-                                    e,
-                                    if line.len() > 200 {
-                                        let end = safe_truncate_index(&line, 200);
-                                        format!("{}...", &line[..end])
-                                    } else {
-                                        line.clone()
-                                    }
-                                );
+        // Capture stderr for debugging
+        let stderr = child.stderr.take();
+        let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let stderr_capture_clone = stderr_capture.clone();
+        let mission_id_for_stderr = mission_id;
+        let mut stderr_handle = if let Some(stderr) = stderr {
+            Some(tokio::spawn(async move {
+                let stderr_reader = BufReader::new(stderr);
+                let mut stderr_lines = stderr_reader.lines();
+                while let Ok(Some(line)) = stderr_lines.next_line().await {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        tracing::debug!(mission_id = %mission_id_for_stderr, stderr = %trimmed, "Claude Code stderr");
+                        let mut captured = stderr_capture_clone.lock().await;
+                        if !captured.is_empty() {
+                            captured.push('\n');
+                        }
+                        captured.push_str(trimmed);
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Track tool calls for result mapping
+        let mut pending_tools: HashMap<String, String> = HashMap::new();
+        let mut total_cost_usd = 0.0f64;
+        let mut final_result = String::new();
+        let mut had_error = false;
+
+        // Track content block types and accumulated content for Claude Code streaming
+        // This is needed because Claude sends incremental deltas that need to be accumulated
+        let mut block_types: HashMap<u32, String> = HashMap::new();
+        let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
+        let mut text_buffer: HashMap<u32, String> = HashMap::new();
+        let mut last_thinking_len: usize = 0; // Track last emitted length to avoid re-sending same content
+
+        let auth_missing = api_auth.is_none();
+        let auth_timeout = std::time::Duration::from_secs(45);
+
+        // Create a buffered reader for stdout
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+
+        // Process events until completion or cancellation
+        loop {
+            let mut timeout = tokio::time::sleep(auth_timeout);
+            tokio::pin!(timeout);
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
+                    // Kill the process to stop consuming API resources
+                    let _ = child.kill().await;
+                    if let Some(handle) = stderr_handle.take() {
+                        handle.abort();
+                    }
+                    return AgentResult::failure("Cancelled".to_string(), 0)
+                        .with_terminal_reason(TerminalReason::Cancelled);
+                }
+                _ = &mut timeout, if auth_missing => {
+                    let err_msg = "Claude Code produced no output. No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
+                    tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                    let _ = child.kill().await;
+                    if let Some(handle) = stderr_handle.take() {
+                        handle.abort();
+                    }
+                    return AgentResult::failure(err_msg.to_string(), 0)
+                        .with_terminal_reason(TerminalReason::LlmError);
+                }
+                line_result = lines.next_line() => {
+                    match line_result {
+                        Ok(Some(line)) => {
+                            if line.is_empty() {
                                 continue;
                             }
-                        };
 
-                        match claude_event {
-                            ClaudeEvent::System(sys) => {
-                                tracing::debug!(
-                                    "Claude session init: session_id={}, model={:?}",
-                                    sys.session_id, sys.model
-                                );
-                            }
-                            ClaudeEvent::StreamEvent(wrapper) => {
-                                match wrapper.event {
-                                    StreamEvent::ContentBlockDelta { index, delta } => {
-                                        // Check the delta type to determine where to route content
-                                        // "thinking_delta" -> thinking panel (uses delta.thinking field)
-                                        // "text_delta" -> text output (uses delta.text field)
-                                        if delta.delta_type == "thinking_delta" {
-                                            // For thinking deltas, content is in the `thinking` field, not `text`
-                                            if let Some(thinking_text) = delta.thinking {
-                                                if !thinking_text.is_empty() {
-                                                    // Accumulate thinking content
-                                                    let buffer = thinking_buffer.entry(index).or_default();
-                                                    buffer.push_str(&thinking_text);
-
-                                                    // Send accumulated thinking content (cumulative, like OpenCode)
-                                                    // Only send if we have new content since last emit
-                                                    let total_len = thinking_buffer.values().map(|s| s.len()).sum::<usize>();
-                                                    if total_len > last_thinking_len {
-                                                        // Combine all thinking buffers for the cumulative content
-                                                        let accumulated: String = thinking_buffer.values().cloned().collect::<Vec<_>>().join("");
-                                                        last_thinking_len = total_len;
-
-                                                        let _ = events_tx.send(AgentEvent::Thinking {
-                                                            content: accumulated,
-                                                            done: false,
-                                                            mission_id: Some(mission_id),
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        } else if delta.delta_type == "text_delta" {
-                                            // For text deltas, content is in the `text` field
-                                            if let Some(text) = delta.text {
-                                                if !text.is_empty() {
-                                                    // Accumulate text content (will be used for final response)
-                                                    let buffer = text_buffer.entry(index).or_default();
-                                                    buffer.push_str(&text);
-                                                    // Don't send text deltas as thinking events
-                                                }
-                                            }
+                            let claude_event: ClaudeEvent = match serde_json::from_str(&line) {
+                                Ok(event) => event,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        mission_id = %mission_id,
+                                        "Failed to parse Claude event: {} - line: {}",
+                                        e,
+                                        if line.len() > 200 {
+                                            let end = safe_truncate_index(&line, 200);
+                                            format!("{}...", &line[..end])
+                                        } else {
+                                            line.clone()
                                         }
-                                        // Ignore other delta types (e.g., input_json_delta for tool use)
-                                    }
-                                    StreamEvent::ContentBlockStart { index, content_block } => {
-                                        // Track the block type so we know how to handle deltas
-                                        block_types.insert(index, content_block.block_type.clone());
-
-                                        if content_block.block_type == "tool_use" {
-                                            if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                                                pending_tools.insert(id, name);
-                                            }
-                                        }
-                                    }
-                                    _ => {}
+                                    );
+                                    continue;
                                 }
-                            }
-                            ClaudeEvent::Assistant(evt) => {
-                                for block in evt.message.content {
-                                    match block {
-                                        ContentBlock::Text { text } => {
-                                            // Text content is the final assistant response
-                                            // Don't send as Thinking - it will be in the final AssistantMessage
-                                            if !text.is_empty() {
-                                                final_result = text;
-                                            }
-                                        }
-                                        ContentBlock::ToolUse { id, name, input } => {
-                                            pending_tools.insert(id.clone(), name.clone());
-                                            let _ = events_tx.send(AgentEvent::ToolCall {
-                                                tool_call_id: id.clone(),
-                                                name: name.clone(),
-                                                args: input.clone(),
-                                                mission_id: Some(mission_id),
-                                            });
+                            };
 
-                                            if name == "question" || name.starts_with("ui_") {
-                                                if let Some(ref hub) = tool_hub {
-                                                    tracing::info!(
-                                                        mission_id = %mission_id,
-                                                        tool_call_id = %id,
-                                                        tool_name = %name,
-                                                        "Frontend tool detected, pausing for user input"
-                                                    );
-                                                    let hub = Arc::clone(hub);
-                                                    let rx = hub.register(id.clone()).await;
+                            match claude_event {
+                                ClaudeEvent::System(sys) => {
+                                    tracing::debug!(
+                                        "Claude session init: session_id={}, model={:?}",
+                                        sys.session_id, sys.model
+                                    );
+                                }
+                                ClaudeEvent::StreamEvent(wrapper) => {
+                                    match wrapper.event {
+                                        StreamEvent::ContentBlockDelta { index, delta } => {
+                                            // Check the delta type to determine where to route content
+                                            // "thinking_delta" -> thinking panel (uses delta.thinking field)
+                                            // "text_delta" -> text output (uses delta.text field)
+                                            if delta.delta_type == "thinking_delta" {
+                                                // For thinking deltas, content is in the `thinking` field, not `text`
+                                                if let Some(thinking_text) = delta.thinking {
+                                                    if !thinking_text.is_empty() {
+                                                        // Accumulate thinking content
+                                                        let buffer = thinking_buffer.entry(index).or_default();
+                                                        buffer.push_str(&thinking_text);
 
-                                                    let _ = child.kill().await;
-                                                    if let Some(handle) = stderr_handle.take() {
-                                                        handle.abort();
+                                                        // Send accumulated thinking content (cumulative, like OpenCode)
+                                                        // Only send if we have new content since last emit
+                                                        let total_len = thinking_buffer.values().map(|s| s.len()).sum::<usize>();
+                                                        if total_len > last_thinking_len {
+                                                            // Combine all thinking buffers for the cumulative content
+                                                            let accumulated: String = thinking_buffer.values().cloned().collect::<Vec<_>>().join("");
+                                                            last_thinking_len = total_len;
+
+                                                            let _ = events_tx.send(AgentEvent::Thinking {
+                                                                content: accumulated,
+                                                                done: false,
+                                                                mission_id: Some(mission_id),
+                                                            });
+                                                        }
                                                     }
-
-                                                    let answer = tokio::select! {
-                                                        _ = cancel.cancelled() => {
-                                                            return AgentResult::failure("Cancelled".to_string(), 0)
-                                                                .with_terminal_reason(TerminalReason::Cancelled);
-                                                        }
-                                                        res = rx => {
-                                                            match res {
-                                                                Ok(v) => v,
-                                                                Err(_) => {
-                                                                    return AgentResult::failure(
-                                                                        "Frontend tool result channel closed".to_string(), 0
-                                                                    ).with_terminal_reason(TerminalReason::LlmError);
-                                                                }
-                                                            }
-                                                        }
-                                                    };
-
-                                                    let _ = events_tx.send(AgentEvent::ToolResult {
-                                                        tool_call_id: id.clone(),
-                                                        name: name.clone(),
-                                                        result: answer.clone(),
-                                                        mission_id: Some(mission_id),
-                                                    });
-
-                                                    let answer_text = if let Some(answers) = answer.get("answers") {
-                                                        answers.to_string()
-                                                    } else {
-                                                        answer.to_string()
-                                                    };
-
-                                                    return run_claudecode_turn(
-                                                        workspace,
-                                                        work_dir,
-                                                        &answer_text,
-                                                        model,
-                                                        agent,
-                                                        mission_id,
-                                                        events_tx,
-                                                        cancel,
-                                                        secrets,
-                                                        app_working_dir,
-                                                        Some(&session_id),
-                                                        true,
-                                                        tool_hub,
-                                                    ).await;
+                                                }
+                                            } else if delta.delta_type == "text_delta" {
+                                                // For text deltas, content is in the `text` field
+                                                if let Some(text) = delta.text {
+                                                    if !text.is_empty() {
+                                                        // Accumulate text content (will be used for final response)
+                                                        let buffer = text_buffer.entry(index).or_default();
+                                                        buffer.push_str(&text);
+                                                        // Don't send text deltas as thinking events
+                                                    }
                                                 }
                                             }
+                                            // Ignore other delta types (e.g., input_json_delta for tool use)
                                         }
-                                        ContentBlock::Thinking { thinking } => {
-                                            // Only send if this is new content not already streamed
-                                            // The streaming deltas already accumulated this, so this is
-                                            // typically the final complete thinking block
-                                            if !thinking.is_empty() {
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: thinking,
-                                                    done: true, // Mark as done since this is the final block
-                                                    mission_id: Some(mission_id),
-                                                });
+                                        StreamEvent::ContentBlockStart { index, content_block } => {
+                                            // Track the block type so we know how to handle deltas
+                                            block_types.insert(index, content_block.block_type.clone());
+
+                                            if content_block.block_type == "tool_use" {
+                                                if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
+                                                    pending_tools.insert(id, name);
+                                                }
                                             }
                                         }
                                         _ => {}
                                     }
                                 }
-                            }
-                            ClaudeEvent::User(evt) => {
-                                for block in evt.message.content {
-                                    if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
-                                        let name = pending_tools
-                                            .get(&tool_use_id)
-                                            .cloned()
-                                            .unwrap_or_else(|| "unknown".to_string());
+                                ClaudeEvent::Assistant(evt) => {
+                                    for block in evt.message.content {
+                                        match block {
+                                            ContentBlock::Text { text } => {
+                                                // Text content is the final assistant response
+                                                // Don't send as Thinking - it will be in the final AssistantMessage
+                                                if !text.is_empty() {
+                                                    final_result = text;
+                                                }
+                                            }
+                                            ContentBlock::ToolUse { id, name, input } => {
+                                                pending_tools.insert(id.clone(), name.clone());
+                                                let _ = events_tx.send(AgentEvent::ToolCall {
+                                                    tool_call_id: id.clone(),
+                                                    name: name.clone(),
+                                                    args: input.clone(),
+                                                    mission_id: Some(mission_id),
+                                                });
 
-                                        // Convert content to string representation (handles both text and image results)
-                                        let content_str = content.to_string_lossy();
+                                                if name == "question" || name.starts_with("ui_") {
+                                                    if let Some(ref hub) = tool_hub {
+                                                        tracing::info!(
+                                                            mission_id = %mission_id,
+                                                            tool_call_id = %id,
+                                                            tool_name = %name,
+                                                            "Frontend tool detected, pausing for user input"
+                                                        );
+                                                        let hub = Arc::clone(hub);
+                                                        let rx = hub.register(id.clone()).await;
 
-                                        let result_value = if let Some(ref extra) = evt.tool_use_result {
-                                            serde_json::json!({
-                                                "content": content_str,
-                                                "stdout": extra.stdout,
-                                                "stderr": extra.stderr,
-                                                "is_error": is_error,
-                                            })
-                                        } else {
-                                            serde_json::Value::String(content_str)
-                                        };
+                                                        let _ = child.kill().await;
+                                                        if let Some(handle) = stderr_handle.take() {
+                                                            handle.abort();
+                                                        }
 
-                                        let _ = events_tx.send(AgentEvent::ToolResult {
-                                            tool_call_id: tool_use_id,
-                                            name,
-                                            result: result_value,
-                                            mission_id: Some(mission_id),
-                                        });
+                                                        let answer = tokio::select! {
+                                                            _ = cancel.cancelled() => {
+                                                                return AgentResult::failure("Cancelled".to_string(), 0)
+                                                                    .with_terminal_reason(TerminalReason::Cancelled);
+                                                            }
+                                                            res = rx => {
+                                                                match res {
+                                                                    Ok(v) => v,
+                                                                    Err(_) => {
+                                                                        return AgentResult::failure(
+                                                                            "Frontend tool result channel closed".to_string(), 0
+                                                                        ).with_terminal_reason(TerminalReason::LlmError);
+                                                                    }
+                                                                }
+                                                            }
+                                                        };
+
+                                                        let _ = events_tx.send(AgentEvent::ToolResult {
+                                                            tool_call_id: id.clone(),
+                                                            name: name.clone(),
+                                                            result: answer.clone(),
+                                                            mission_id: Some(mission_id),
+                                                        });
+
+                                                        let answer_text = if let Some(answers) = answer.get("answers") {
+                                                            answers.to_string()
+                                                        } else {
+                                                            answer.to_string()
+                                                        };
+
+                                                        return run_claudecode_turn(
+                                                            workspace,
+                                                            work_dir,
+                                                            &answer_text,
+                                                            model,
+                                                            agent,
+                                                            mission_id,
+                                                            events_tx,
+                                                            cancel,
+                                                            secrets,
+                                                            app_working_dir,
+                                                            Some(&session_id),
+                                                            true,
+                                                            tool_hub,
+                                                        ).await;
+                                                    }
+                                                }
+                                            }
+                                            ContentBlock::Thinking { thinking } => {
+                                                // Only send if this is new content not already streamed
+                                                // The streaming deltas already accumulated this, so this is
+                                                // typically the final complete thinking block
+                                                if !thinking.is_empty() {
+                                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                                        content: thinking,
+                                                        done: true, // Mark as done since this is the final block
+                                                        mission_id: Some(mission_id),
+                                                    });
+                                                }
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
-                            }
-                            ClaudeEvent::Result(res) => {
-                                if let Some(cost) = res.total_cost_usd {
-                                    total_cost_usd = cost;
+                                ClaudeEvent::User(evt) => {
+                                    for block in evt.message.content {
+                                        if let ContentBlock::ToolResult { tool_use_id, content, is_error } = block {
+                                            let name = pending_tools
+                                                .get(&tool_use_id)
+                                                .cloned()
+                                                .unwrap_or_else(|| "unknown".to_string());
+
+                                            // Convert content to string representation (handles both text and image results)
+                                            let content_str = content.to_string_lossy();
+
+                                            let result_value = if let Some(ref extra) = evt.tool_use_result {
+                                                serde_json::json!({
+                                                    "content": content_str,
+                                                    "stdout": extra.stdout,
+                                                    "stderr": extra.stderr,
+                                                    "is_error": is_error,
+                                                })
+                                            } else {
+                                                serde_json::Value::String(content_str)
+                                            };
+
+                                            let _ = events_tx.send(AgentEvent::ToolResult {
+                                                tool_call_id: tool_use_id,
+                                                name,
+                                                result: result_value,
+                                                mission_id: Some(mission_id),
+                                            });
+                                        }
+                                    }
                                 }
-                                if res.is_error || res.subtype == "error" {
-                                    had_error = true;
-                                    let err_msg = res.result.unwrap_or_else(|| "Unknown error".to_string());
-                                    // Don't send an Error event here - let the failure propagate
-                                    // through the AgentResult. control.rs will emit an AssistantMessage
-                                    // with success=false which the UI displays as a failure message.
-                                    // Sending Error here would cause duplicate messages.
-                                    final_result = err_msg;
-                                } else if let Some(result) = res.result {
-                                    final_result = result;
+                                ClaudeEvent::Result(res) => {
+                                    if let Some(cost) = res.total_cost_usd {
+                                        total_cost_usd = cost;
+                                    }
+                                    // Check for errors: explicit error flags OR result text that looks like an API error
+                                    let result_text = res.result.clone().unwrap_or_default();
+                                    let looks_like_api_error = result_text.starts_with("API Error:")
+                                        || result_text.contains("\"type\":\"error\"")
+                                        || result_text.contains("\"type\":\"overloaded_error\"")
+                                        || result_text.contains("\"type\":\"api_error\"");
+
+                                    if res.is_error || res.subtype == "error" || looks_like_api_error {
+                                        had_error = true;
+                                        let err_msg = if result_text.is_empty() { "Unknown error".to_string() } else { result_text };
+                                        // Don't send an Error event here - let the failure propagate
+                                        // through the AgentResult. control.rs will emit an AssistantMessage
+                                        // with success=false which the UI displays as a failure message.
+                                        // Sending Error here would cause duplicate messages.
+                                        final_result = err_msg;
+                                    } else if let Some(result) = res.result {
+                                        final_result = result;
+                                    }
+                                    tracing::info!(
+                                        mission_id = %mission_id,
+                                        cost_usd = total_cost_usd,
+                                        "Claude Code execution completed"
+                                    );
+                                    break;
                                 }
-                                tracing::info!(
-                                    mission_id = %mission_id,
-                                    cost_usd = total_cost_usd,
-                                    "Claude Code execution completed"
-                                );
-                                break;
                             }
                         }
-                    }
-                    Ok(None) => {
-                        // EOF - process finished
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Error reading from Claude CLI: {}", e);
-                        break;
+                        Ok(None) => {
+                            // EOF - process finished
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("Error reading from Claude CLI: {}", e);
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Wait for child process to finish and clean up
-    let exit_status = child.wait().await;
+        // Wait for child process to finish and clean up
+        let exit_status = child.wait().await;
 
-    // Wait for stderr capture to complete
-    if let Some(handle) = stderr_handle {
-        let _ = handle.await;
-    }
-
-    // Convert cost from USD to cents
-    let cost_cents = (total_cost_usd * 100.0) as u64;
-
-    // If no final result from Assistant or Result events, use accumulated text buffer
-    // This handles plan mode and other cases where text is streamed incrementally
-    if final_result.trim().is_empty() && !text_buffer.is_empty() {
-        // Sort by content block index to ensure correct ordering (HashMap iteration is non-deterministic)
-        let mut sorted_entries: Vec<_> = text_buffer.iter().collect();
-        sorted_entries.sort_by_key(|(idx, _)| *idx);
-        final_result = sorted_entries.into_iter().map(|(_, text)| text.clone()).collect::<Vec<_>>().join("");
-        tracing::debug!(
-            mission_id = %mission_id,
-            "Using accumulated text buffer as final result ({} chars)",
-            final_result.len()
-        );
-    }
-
-    if final_result.trim().is_empty() && !had_error {
-        had_error = true;
-        // Include stderr in error message if available
-        let stderr_content = stderr_capture.lock().await;
-        if !stderr_content.is_empty() {
-            tracing::warn!(
-                mission_id = %mission_id,
-                stderr = %stderr_content,
-                exit_status = ?exit_status,
-                "Claude Code produced no output but had stderr"
-            );
-            final_result = format!(
-                "Claude Code error: {}",
-                stderr_content.lines().take(5).collect::<Vec<_>>().join(" | ")
-            );
-        } else {
-            tracing::warn!(
-                mission_id = %mission_id,
-                exit_status = ?exit_status,
-                "Claude Code produced no output and no stderr"
-            );
-            final_result =
-                "Claude Code produced no output. Check CLI installation or authentication.".to_string();
+        // Wait for stderr capture to complete
+        if let Some(handle) = stderr_handle {
+            let _ = handle.await;
         }
-    }
 
-    if had_error {
-        AgentResult::failure(final_result, cost_cents)
-            .with_terminal_reason(TerminalReason::LlmError)
-    } else {
-        AgentResult::success(final_result, cost_cents)
-    }
+        // Convert cost from USD to cents
+        let cost_cents = (total_cost_usd * 100.0) as u64;
+
+        // If no final result from Assistant or Result events, use accumulated text buffer
+        // This handles plan mode and other cases where text is streamed incrementally
+        if final_result.trim().is_empty() && !text_buffer.is_empty() {
+            // Sort by content block index to ensure correct ordering (HashMap iteration is non-deterministic)
+            let mut sorted_entries: Vec<_> = text_buffer.iter().collect();
+            sorted_entries.sort_by_key(|(idx, _)| *idx);
+            final_result = sorted_entries
+                .into_iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>()
+                .join("");
+            tracing::debug!(
+                mission_id = %mission_id,
+                "Using accumulated text buffer as final result ({} chars)",
+                final_result.len()
+            );
+        }
+
+        if final_result.trim().is_empty() && !had_error {
+            had_error = true;
+            // Include stderr in error message if available
+            let stderr_content = stderr_capture.lock().await;
+            if !stderr_content.is_empty() {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    stderr = %stderr_content,
+                    exit_status = ?exit_status,
+                    "Claude Code produced no output but had stderr"
+                );
+                final_result = format!(
+                    "Claude Code error: {}",
+                    stderr_content
+                        .lines()
+                        .take(5)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+            } else {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    exit_status = ?exit_status,
+                    "Claude Code produced no output and no stderr"
+                );
+                final_result =
+                    "Claude Code produced no output. Check CLI installation or authentication."
+                        .to_string();
+            }
+        }
+
+        if had_error {
+            AgentResult::failure(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::LlmError)
+        } else {
+            AgentResult::success(final_result, cost_cents)
+                .with_terminal_reason(TerminalReason::Completed)
+        }
     }) // end Box::pin(async move { ... })
 }
 
@@ -2193,20 +2221,20 @@ fn install_opencode_serve_port_wrapper(
     // Determine the wrapper directory.
     // For containers: use /root/.openagent-bin (NOT /tmp) because nspawn mounts
     // a fresh tmpfs over /tmp, hiding anything we write to the container rootfs.
-    let (wrapper_dir_host, wrapper_dir_env) =
-        if workspace.workspace_type == WorkspaceType::Container
-            && workspace::use_nspawn_for_workspace(workspace)
-        {
-            (
-                workspace.path.join("root").join(".openagent-bin"),
-                "/root/.openagent-bin".to_string(),
-            )
-        } else {
-            (
-                std::path::PathBuf::from("/tmp/.openagent-bin"),
-                "/tmp/.openagent-bin".to_string(),
-            )
-        };
+    let (wrapper_dir_host, wrapper_dir_env) = if workspace.workspace_type
+        == WorkspaceType::Container
+        && workspace::use_nspawn_for_workspace(workspace)
+    {
+        (
+            workspace.path.join("root").join(".openagent-bin"),
+            "/root/.openagent-bin".to_string(),
+        )
+    } else {
+        (
+            std::path::PathBuf::from("/tmp/.openagent-bin"),
+            "/tmp/.openagent-bin".to_string(),
+        )
+    };
 
     if let Err(e) = std::fs::create_dir_all(&wrapper_dir_host) {
         tracing::warn!("Failed to create opencode wrapper dir: {}", e);
@@ -2214,9 +2242,13 @@ fn install_opencode_serve_port_wrapper(
     }
 
     // The wrapper script: intercepts `opencode serve` and overrides --port
+    // Note: We exclude our wrapper directory from PATH when searching for the real binary
+    // to avoid finding ourselves in an infinite loop.
     let wrapper_script = r#"#!/bin/sh
 # opencode serve port override wrapper (installed by Open Agent)
-REAL_OPENCODE="$(command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
+WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLEAN_PATH="$(echo "$PATH" | tr ':' '\n' | grep -v "^$WRAPPER_DIR$" | tr '\n' ':' | sed 's/:$//')"
+REAL_OPENCODE="$(PATH="$CLEAN_PATH" command -v opencode 2>/dev/null || echo /usr/local/bin/opencode)"
 if [ -n "$OPENCODE_SERVER_PORT" ] && [ "$1" = "serve" ]; then
   shift
   new_args=""
@@ -2643,7 +2675,10 @@ fn try_copy_host_oh_my_opencode_config(opencode_config_dir: &std::path::Path) ->
             );
             return false;
         }
-        tracing::info!("Copied oh-my-opencode config to workspace {}", dest.display());
+        tracing::info!(
+            "Copied oh-my-opencode config to workspace {}",
+            dest.display()
+        );
         return true;
     }
     false
@@ -2660,7 +2695,8 @@ async fn ensure_oh_my_opencode_config(
     has_anthropic: bool,
     has_google: bool,
 ) {
-    let (omo_path, omo_path_jsonc) = workspace_oh_my_opencode_config_paths(opencode_config_dir_host);
+    let (omo_path, omo_path_jsonc) =
+        workspace_oh_my_opencode_config_paths(opencode_config_dir_host);
     if omo_path.exists() || omo_path_jsonc.exists() {
         return;
     }
@@ -2711,7 +2747,10 @@ async fn ensure_oh_my_opencode_config(
     env.insert("NO_COLOR".to_string(), "1".to_string());
     env.insert("FORCE_COLOR".to_string(), "0".to_string());
 
-    match workspace_exec.output(work_dir, cli_runner, &args, env).await {
+    match workspace_exec
+        .output(work_dir, cli_runner, &args, env)
+        .await
+    {
         Ok(output) => {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2745,7 +2784,9 @@ fn split_package_spec(spec: &str) -> (&str, Option<&str>) {
         }
         return (spec, None);
     }
-    spec.rsplit_once('@').map(|(base, version)| (base, Some(version))).unwrap_or((spec, None))
+    spec.rsplit_once('@')
+        .map(|(base, version)| (base, Some(version)))
+        .unwrap_or((spec, None))
 }
 
 fn package_base(spec: &str) -> &str {
@@ -2755,18 +2796,13 @@ fn package_base(spec: &str) -> &str {
 fn plugin_module_path(node_modules_dir: &std::path::Path, base: &str) -> std::path::PathBuf {
     if let Some(stripped) = base.strip_prefix('@') {
         if let Some((scope, name)) = stripped.split_once('/') {
-            return node_modules_dir
-                .join(format!("@{}", scope))
-                .join(name);
+            return node_modules_dir.join(format!("@{}", scope)).join(name);
         }
     }
     node_modules_dir.join(base)
 }
 
-fn ensure_opencode_plugin_specs(
-    opencode_config_dir: &std::path::Path,
-    plugin_specs: &[&str],
-) {
+fn ensure_opencode_plugin_specs(opencode_config_dir: &std::path::Path, plugin_specs: &[&str]) {
     if plugin_specs.is_empty() {
         return;
     }
@@ -2785,13 +2821,11 @@ fn ensure_opencode_plugin_specs(
     };
 
     let mut updated = false;
-    let plugins = root
-        .as_object_mut()
-        .and_then(|obj| {
-            obj.entry("plugin".to_string())
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-                .as_array_mut()
-        });
+    let plugins = root.as_object_mut().and_then(|obj| {
+        obj.entry("plugin".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+    });
 
     let Some(plugins) = plugins else {
         return;
@@ -2873,13 +2907,11 @@ fn ensure_opencode_google_project_id(opencode_config_dir: &std::path::Path, proj
     };
 
     let mut updated = false;
-    let provider_obj = root
-        .as_object_mut()
-        .and_then(|obj| {
-            obj.entry("provider".to_string())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
-                .as_object_mut()
-        });
+    let provider_obj = root.as_object_mut().and_then(|obj| {
+        obj.entry("provider".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+    });
 
     let Some(provider_obj) = provider_obj else {
         return;
@@ -3091,13 +3123,36 @@ fn sync_opencode_agent_config(
         }
     };
 
+    // When oh-my-opencode is enabled, it injects fully-specified agents
+    // (including prompts/permissions) into OpenCode. If we also write
+    // per-agent overrides into opencode.json, OpenCode treats those as
+    // authoritative and overwrites the plugin-defined agents, which
+    // strips the Prometheus/Metis/Momus/etc prompts. Therefore, we avoid
+    // writing any per-agent overrides for oh-my-opencode agents and
+    // remove any stale overrides that might already exist.
+    let oh_my_opencode_enabled = opencode_json
+        .get("plugin")
+        .and_then(|v| v.as_array())
+        .map(|plugins| {
+            plugins.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .map(|s| s.contains("oh-my-opencode"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
     let mut updated = false;
     if let Some(model) = effective_default {
         if let Some(obj) = opencode_json.as_object_mut() {
             match obj.get("model").and_then(|v| v.as_str()) {
                 Some(existing) if existing == model => {}
                 _ => {
-                    obj.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+                    obj.insert(
+                        "model".to_string(),
+                        serde_json::Value::String(model.to_string()),
+                    );
                     updated = true;
                 }
             }
@@ -3113,66 +3168,68 @@ fn sync_opencode_agent_config(
         }
     }
 
-    let agent_entry = opencode_json
-        .as_object_mut()
-        .and_then(|obj| obj.get_mut("agent"))
-        .and_then(|v| v.as_object_mut());
+    if let Some(obj) = opencode_json.as_object_mut() {
+        let agent_entry = obj
+            .entry("agent".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let agent_entry = match agent_entry.as_object_mut() {
+            Some(entry) => entry,
+            None => return,
+        };
 
-    let agent_entry = match agent_entry {
-        Some(entry) => entry,
-        None => {
-            if let Some(obj) = opencode_json.as_object_mut() {
-                obj.insert("agent".to_string(), serde_json::Value::Object(serde_json::Map::new()));
+        if oh_my_opencode_enabled {
+            for name in omo_agents.keys() {
+                if agent_entry.remove(name).is_some() {
+                    updated = true;
+                }
             }
-            let Some(entry) = opencode_json
-                .as_object_mut()
-                .and_then(|obj| obj.get_mut("agent"))
-                .and_then(|v| v.as_object_mut())
-            else {
-                return;
-            };
-            entry
-        }
-    };
-    for (name, entry) in omo_agents {
-        // Agent-specific model from oh-my-opencode.json takes priority over fallback default
-        let desired_model = entry
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|model| model_allowed(model))
-            .map(|s| s.to_string())
-            .or_else(|| {
-                effective_default
+        } else {
+            for (name, entry) in omo_agents {
+                // Agent-specific model from oh-my-opencode.json takes priority over fallback default
+                let desired_model = entry
+                    .get("model")
+                    .and_then(|v| v.as_str())
                     .filter(|model| model_allowed(model))
                     .map(|s| s.to_string())
-            });
+                    .or_else(|| {
+                        effective_default
+                            .filter(|model| model_allowed(model))
+                            .map(|s| s.to_string())
+                    });
 
-        if let Some(existing) = agent_entry.get_mut(name) {
-            if let (Some(model), Some(existing_obj)) = (desired_model.as_ref(), existing.as_object_mut()) {
-                match existing_obj.get("model").and_then(|v| v.as_str()) {
-                    Some(current) if current == model => {}
-                    _ => {
-                        existing_obj.insert("model".to_string(), serde_json::Value::String(model.clone()));
-                        updated = true;
+                if let Some(existing) = agent_entry.get_mut(name) {
+                    if let (Some(model), Some(existing_obj)) =
+                        (desired_model.as_ref(), existing.as_object_mut())
+                    {
+                        match existing_obj.get("model").and_then(|v| v.as_str()) {
+                            Some(current) if current == model => {}
+                            _ => {
+                                existing_obj.insert(
+                                    "model".to_string(),
+                                    serde_json::Value::String(model.clone()),
+                                );
+                                updated = true;
+                            }
+                        }
+                    } else if let Some(existing_obj) = existing.as_object_mut() {
+                        if let Some(current) = existing_obj.get("model").and_then(|v| v.as_str()) {
+                            if !model_allowed(current) {
+                                existing_obj.remove("model");
+                                updated = true;
+                            }
+                        }
                     }
+                    continue;
                 }
-            } else if let Some(existing_obj) = existing.as_object_mut() {
-                if let Some(current) = existing_obj.get("model").and_then(|v| v.as_str()) {
-                    if !model_allowed(current) {
-                        existing_obj.remove("model");
-                        updated = true;
-                    }
+
+                let mut agent_config = serde_json::Map::new();
+                if let Some(model) = desired_model {
+                    agent_config.insert("model".to_string(), serde_json::Value::String(model));
                 }
+                agent_entry.insert(name.clone(), serde_json::Value::Object(agent_config));
+                updated = true;
             }
-            continue;
         }
-
-        let mut agent_config = serde_json::Map::new();
-        if let Some(model) = desired_model {
-            agent_config.insert("model".to_string(), serde_json::Value::String(model));
-        }
-        agent_entry.insert(name.clone(), serde_json::Value::Object(agent_config));
-        updated = true;
     }
 
     if updated {
@@ -3266,7 +3323,11 @@ fn patch_oh_my_opencode_port_override(workspace: &Workspace) -> bool {
         return true;
     }
 
-    let newline = if contents.contains("\r\n") { "\r\n" } else { "\n" };
+    let newline = if contents.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let needle = format!(
         "const {{ client: client3, server: server2 }} = await createOpencode({{{nl}      signal: abortController.signal{nl}    }});",
         nl = newline
@@ -3319,7 +3380,9 @@ fn opencode_storage_roots(workspace: &Workspace) -> Vec<std::path::PathBuf> {
         );
 
         if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
-            if let Ok(rel) = std::path::Path::new(&data_home).strip_prefix(std::path::Path::new("/")) {
+            if let Ok(rel) =
+                std::path::Path::new(&data_home).strip_prefix(std::path::Path::new("/"))
+            {
                 roots.push(workspace.path.join(rel).join("opencode").join("storage"));
             }
         }
@@ -3393,7 +3456,11 @@ fn host_opencode_auth_path() -> Option<std::path::PathBuf> {
 fn host_opencode_provider_auth_dir() -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
-        candidates.push(std::path::PathBuf::from(home).join(".opencode").join("auth"));
+        candidates.push(
+            std::path::PathBuf::from(home)
+                .join(".opencode")
+                .join("auth"),
+        );
     }
 
     candidates.push(
@@ -3600,9 +3667,10 @@ fn sync_opencode_auth_to_workspace(
         }
     }
 
-    if let (Some(value), Some(dest_dir)) =
-        (auth_json.as_ref(), workspace_opencode_provider_auth_dir(workspace))
-    {
+    if let (Some(value), Some(dest_dir)) = (
+        auth_json.as_ref(),
+        workspace_opencode_provider_auth_dir(workspace),
+    ) {
         let provider_entries = [
             ("openai", "OpenAI"),
             ("anthropic", "Anthropic"),
@@ -3671,7 +3739,8 @@ fn apply_opencode_auth_env(
         if provider_type == crate::ai_providers::ProviderType::Google {
             env.entry("GOOGLE_GENERATIVE_AI_API_KEY".to_string())
                 .or_insert(api_key.clone());
-            env.entry("GOOGLE_API_KEY".to_string()).or_insert(api_key.clone());
+            env.entry("GOOGLE_API_KEY".to_string())
+                .or_insert(api_key.clone());
         }
 
         let provider_id = provider_type.id();
@@ -3712,7 +3781,10 @@ fn extract_model_from_message(value: &serde_json::Value) -> Option<String> {
     }
 
     for candidate in candidates {
-        let provider = get_str(candidate, &["providerID", "providerId", "provider_id", "provider"]);
+        let provider = get_str(
+            candidate,
+            &["providerID", "providerId", "provider_id", "provider"],
+        );
         let model_id = get_str(candidate, &["modelID", "modelId", "model_id", "model"]);
         if let (Some(provider), Some(model_id)) = (provider, model_id) {
             if !provider.is_empty() && !model_id.is_empty() {
@@ -3996,7 +4068,10 @@ async fn ensure_claudecode_cli_available(
     if command_available(workspace_exec, cwd, BUN_GLOBAL_CLAUDE_PATH).await {
         // Claude Code requires Node.js, but if only bun is available, use bun to run it
         if command_available(workspace_exec, cwd, "node").await {
-            tracing::debug!("Found Claude Code at {} (using node)", BUN_GLOBAL_CLAUDE_PATH);
+            tracing::debug!(
+                "Found Claude Code at {} (using node)",
+                BUN_GLOBAL_CLAUDE_PATH
+            );
             return Ok(BUN_GLOBAL_CLAUDE_PATH.to_string());
         } else if command_available(workspace_exec, cwd, "/root/.bun/bin/bun").await {
             // Use full path to bun since it's not in PATH
@@ -4127,30 +4202,21 @@ async fn resolve_opencode_installer_fetcher(
     let curl_candidates = ["curl", "/usr/bin/curl", "/bin/curl"];
     for candidate in curl_candidates {
         if command_available(workspace_exec, cwd, candidate).await {
-            return Some(format!(
-                "{} -fsSL https://opencode.ai/install",
-                candidate
-            ));
+            return Some(format!("{} -fsSL https://opencode.ai/install", candidate));
         }
     }
 
     let wget_candidates = ["wget", "/usr/bin/wget", "/bin/wget"];
     for candidate in wget_candidates {
         if command_available(workspace_exec, cwd, candidate).await {
-            return Some(format!(
-                "{} -qO- https://opencode.ai/install",
-                candidate
-            ));
+            return Some(format!("{} -qO- https://opencode.ai/install", candidate));
         }
     }
 
     None
 }
 
-async fn opencode_binary_available(
-    workspace_exec: &WorkspaceExec,
-    cwd: &std::path::Path,
-) -> bool {
+async fn opencode_binary_available(workspace_exec: &WorkspaceExec, cwd: &std::path::Path) -> bool {
     if command_available(workspace_exec, cwd, "opencode").await {
         return true;
     }
@@ -4182,16 +4248,16 @@ async fn cleanup_opencode_listeners(
         .unwrap_or(4096);
     let mut args = Vec::new();
     args.push("-lc".to_string());
-    args.push(
-        format!(
-            "if command -v lsof >/dev/null 2>&1; then \
+    args.push(format!(
+        "if command -v lsof >/dev/null 2>&1; then \
                pids=$(lsof -t -iTCP:{port} -sTCP:LISTEN 2>/dev/null || true); \
                if [ -n \"$pids\" ]; then kill -9 $pids || true; fi; \
              fi",
-            port = port
-        ),
-    );
-    let _ = workspace_exec.output(cwd, "/bin/sh", &args, HashMap::new()).await;
+        port = port
+    ));
+    let _ = workspace_exec
+        .output(cwd, "/bin/sh", &args, HashMap::new())
+        .await;
 }
 
 async fn ensure_opencode_cli_available(
@@ -4253,7 +4319,10 @@ async fn ensure_opencode_cli_available(
     }
 
     if !opencode_binary_available(workspace_exec, cwd).await {
-        return Err("OpenCode install completed but 'opencode' is still not available in workspace PATH.".to_string());
+        return Err(
+            "OpenCode install completed but 'opencode' is still not available in workspace PATH."
+                .to_string(),
+        );
     }
 
     Ok(())
@@ -4277,13 +4346,13 @@ pub async fn run_opencode_turn(
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
 ) -> AgentResult {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use super::ai_providers::{
         ensure_anthropic_oauth_token_valid, ensure_google_oauth_token_valid,
         ensure_openai_oauth_token_valid,
     };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
     // Determine CLI runner: prefer backend config, then env var, then try bunx/npx
     // We use 'bunx oh-my-opencode run' or 'npx oh-my-opencode run' for per-workspace execution.
@@ -4364,8 +4433,10 @@ pub async fn run_opencode_turn(
             if has_any_provider {
                 Ok(())
             } else {
-                Err("No OpenCode providers configured. Add a provider in Settings → AI Providers."
-                    .to_string())
+                Err(
+                    "No OpenCode providers configured. Add a provider in Settings → AI Providers."
+                        .to_string(),
+                )
             }
         }
         _ => Ok(()),
@@ -4400,38 +4471,16 @@ pub async fn run_opencode_turn(
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
     } else {
-        if command_available(&workspace_exec, work_dir, "oh-my-opencode").await {
-            runner_is_direct = true;
-            "oh-my-opencode".to_string()
+        // Prefer bunx for oh-my-opencode (avoids version conflicts from npm global installs)
+        if command_available(&workspace_exec, work_dir, "bunx").await {
+            "bunx".to_string()
+        } else if command_available(&workspace_exec, work_dir, "npx").await {
+            "npx".to_string()
         } else {
-            let auto_install = env_var_bool("OPEN_AGENT_AUTO_INSTALL_OPENCODE", true);
-            if auto_install && command_available(&workspace_exec, work_dir, "npm").await {
-                let mut install_args = Vec::new();
-                install_args.push("-lc".to_string());
-                install_args.push("npm install -g oh-my-opencode@latest".to_string());
-                if let Err(e) = workspace_exec
-                    .output(work_dir, "/bin/sh", &install_args, HashMap::new())
-                    .await
-                {
-                    tracing::warn!("Failed to auto-install oh-my-opencode: {}", e);
-                }
-            }
-
-            if command_available(&workspace_exec, work_dir, "oh-my-opencode").await {
-                runner_is_direct = true;
-                "oh-my-opencode".to_string()
-            } else if command_available(&workspace_exec, work_dir, "bunx").await {
-                "bunx".to_string()
-            } else if command_available(&workspace_exec, work_dir, "npx").await {
-                "npx".to_string()
-            } else {
-                let err_msg =
-                    "No OpenCode CLI runner found in workspace (expected oh-my-opencode, bunx, or npx)."
-                        .to_string();
-                tracing::error!("{}", err_msg);
-                return AgentResult::failure(err_msg, 0)
-                    .with_terminal_reason(TerminalReason::LlmError);
-            }
+            let err_msg =
+                "No OpenCode CLI runner found in workspace (expected bunx or npx).".to_string();
+            tracing::error!("{}", err_msg);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
     };
 
@@ -4541,10 +4590,6 @@ pub async fn run_opencode_turn(
     // Add timeout (0 = no timeout, let the agent complete)
     args.push("--timeout".to_string());
     args.push("0".to_string());
-
-    // JSON format for structured event streaming on stdout
-    args.push("--format".to_string());
-    args.push("json".to_string());
 
     // The message is passed as the final argument
     args.push(message.to_string());
@@ -4693,160 +4738,170 @@ pub async fn run_opencode_turn(
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
 
-    // With --format json, events stream on stdout so skip the SSE curl approach.
-    let use_json_stdout = true;
-    let sse_handle = if !use_json_stdout && command_available(&workspace_exec, work_dir, "curl").await {
-        let workspace_exec = workspace_exec.clone();
-        let work_dir = work_dir.to_path_buf();
-        let work_dir_arg = work_dir_arg.clone();
-        let session_id_capture = session_id_capture.clone();
-        let sse_emitted_thinking = sse_emitted_thinking.clone();
-        let sse_done_sent = sse_done_sent.clone();
-        let sse_cancel = sse_cancel.clone();
-        let events_tx = events_tx.clone();
-        let opencode_port = opencode_port.clone();
-        let mission_id = mission_id;
-        let sse_host = std::env::var("OPEN_AGENT_OPENCODE_SERVER_HOSTNAME")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
+    // oh-my-opencode doesn't support --format json, so use SSE curl for events.
+    let use_json_stdout = false;
+    let sse_handle =
+        if !use_json_stdout && command_available(&workspace_exec, work_dir, "curl").await {
+            let workspace_exec = workspace_exec.clone();
+            let work_dir = work_dir.to_path_buf();
+            let work_dir_arg = work_dir_arg.clone();
+            let session_id_capture = session_id_capture.clone();
+            let sse_emitted_thinking = sse_emitted_thinking.clone();
+            let sse_done_sent = sse_done_sent.clone();
+            let sse_cancel = sse_cancel.clone();
+            let events_tx = events_tx.clone();
+            let opencode_port = opencode_port.clone();
+            let mission_id = mission_id;
+            let sse_host = std::env::var("OPEN_AGENT_OPENCODE_SERVER_HOSTNAME")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
 
-        Some(tokio::spawn(async move {
-            let event_url = format!(
-                "http://{}:{}/event?directory={}",
-                sse_host,
-                opencode_port,
-                urlencoding::encode(&work_dir_arg)
-            );
+            Some(tokio::spawn(async move {
+                let event_url = format!(
+                    "http://{}:{}/event?directory={}",
+                    sse_host,
+                    opencode_port,
+                    urlencoding::encode(&work_dir_arg)
+                );
 
-            let mut attempts = 0u32;
-            loop {
-                if sse_cancel.is_cancelled() {
-                    break;
-                }
-                if attempts > 5 {
-                    break;
-                }
-                attempts += 1;
-
-                let args = vec![
-                    "-N".to_string(),
-                    "-s".to_string(),
-                    "-H".to_string(),
-                    "Accept: text/event-stream".to_string(),
-                    "-H".to_string(),
-                    "Cache-Control: no-cache".to_string(),
-                    event_url.clone(),
-                ];
-
-                let child = workspace_exec
-                    .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
-                    .await;
-
-                let mut child = match child {
-                    Ok(child) => child,
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        continue;
-                    }
-                };
-
-                let stdout = match child.stdout.take() {
-                    Some(stdout) => stdout,
-                    None => {
-                        let _ = child.kill().await;
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                        continue;
-                    }
-                };
-
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                let mut current_event: Option<String> = None;
-                let mut data_lines: Vec<String> = Vec::new();
-                let mut state = OpencodeSseState::default();
-                let mut saw_complete = false;
-
+                let mut attempts = 0u32;
                 loop {
                     if sse_cancel.is_cancelled() {
-                        let _ = child.kill().await;
-                        return;
+                        break;
                     }
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let trimmed = line.trim_end();
-                            if trimmed.is_empty() {
-                                if !data_lines.is_empty() {
-                                    let data = data_lines.join("\n");
-                                    let current_session = session_id_capture.lock().unwrap().clone();
-                                    if let Some(parsed) = parse_opencode_sse_event(
-                                        &data,
-                                        current_event.as_deref(),
-                                        current_session.as_deref(),
-                                        &mut state,
-                                        mission_id,
-                                    ) {
-                                        if let Some(session_id) = parsed.session_id {
-                                            let mut guard = session_id_capture.lock().unwrap();
-                                            if guard.is_none() {
-                                                *guard = Some(session_id);
+                    if attempts > 5 {
+                        break;
+                    }
+                    attempts += 1;
+
+                    let args = vec![
+                        "-N".to_string(),
+                        "-s".to_string(),
+                        "-H".to_string(),
+                        "Accept: text/event-stream".to_string(),
+                        "-H".to_string(),
+                        "Cache-Control: no-cache".to_string(),
+                        event_url.clone(),
+                    ];
+
+                    let child = workspace_exec
+                        .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
+                        .await;
+
+                    let mut child = match child {
+                        Ok(child) => child,
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            continue;
+                        }
+                    };
+
+                    let stdout = match child.stdout.take() {
+                        Some(stdout) => stdout,
+                        None => {
+                            let _ = child.kill().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            continue;
+                        }
+                    };
+
+                    let mut reader = BufReader::new(stdout);
+                    let mut line = String::new();
+                    let mut current_event: Option<String> = None;
+                    let mut data_lines: Vec<String> = Vec::new();
+                    let mut state = OpencodeSseState::default();
+                    let mut saw_complete = false;
+
+                    loop {
+                        if sse_cancel.is_cancelled() {
+                            let _ = child.kill().await;
+                            return;
+                        }
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let trimmed = line.trim_end();
+                                if trimmed.is_empty() {
+                                    if !data_lines.is_empty() {
+                                        let data = data_lines.join("\n");
+                                        let current_session =
+                                            session_id_capture.lock().unwrap().clone();
+                                        if let Some(parsed) = parse_opencode_sse_event(
+                                            &data,
+                                            current_event.as_deref(),
+                                            current_session.as_deref(),
+                                            &mut state,
+                                            mission_id,
+                                        ) {
+                                            if let Some(session_id) = parsed.session_id {
+                                                let mut guard = session_id_capture.lock().unwrap();
+                                                if guard.is_none() {
+                                                    *guard = Some(session_id);
+                                                }
                                             }
-                                        }
-                                        if let Some(event) = parsed.event {
-                                            if matches!(event, AgentEvent::Thinking { .. }) {
-                                                sse_emitted_thinking.store(true, std::sync::atomic::Ordering::SeqCst);
+                                            if let Some(event) = parsed.event {
+                                                if matches!(event, AgentEvent::Thinking { .. }) {
+                                                    sse_emitted_thinking.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    );
+                                                }
+                                                let _ = events_tx.send(event);
                                             }
-                                            let _ = events_tx.send(event);
-                                        }
-                                        if parsed.message_complete {
-                                            saw_complete = true;
-                                            if sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst)
-                                                && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
-                                            {
-                                                let _ = events_tx.send(AgentEvent::Thinking {
-                                                    content: String::new(),
-                                                    done: true,
-                                                    mission_id: Some(mission_id),
-                                                });
-                                                sse_done_sent.store(true, std::sync::atomic::Ordering::SeqCst);
+                                            if parsed.message_complete {
+                                                saw_complete = true;
+                                                if sse_emitted_thinking
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                    && !sse_done_sent
+                                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                                {
+                                                    let _ = events_tx.send(AgentEvent::Thinking {
+                                                        content: String::new(),
+                                                        done: true,
+                                                        mission_id: Some(mission_id),
+                                                    });
+                                                    sse_done_sent.store(
+                                                        true,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    );
+                                                }
+                                                let _ = child.kill().await;
+                                                break;
                                             }
-                                            let _ = child.kill().await;
-                                            break;
                                         }
                                     }
+
+                                    current_event = None;
+                                    data_lines.clear();
+                                    continue;
                                 }
 
-                                current_event = None;
-                                data_lines.clear();
-                                continue;
-                            }
+                                if let Some(rest) = trimmed.strip_prefix("event:") {
+                                    current_event = Some(rest.trim_start().to_string());
+                                    continue;
+                                }
 
-                            if let Some(rest) = trimmed.strip_prefix("event:") {
-                                current_event = Some(rest.trim_start().to_string());
-                                continue;
+                                if let Some(rest) = trimmed.strip_prefix("data:") {
+                                    data_lines.push(rest.trim_start().to_string());
+                                    continue;
+                                }
                             }
-
-                            if let Some(rest) = trimmed.strip_prefix("data:") {
-                                data_lines.push(rest.trim_start().to_string());
-                                continue;
-                            }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
 
-                let _ = child.kill().await;
-                if saw_complete {
-                    break;
+                    let _ = child.kill().await;
+                    if saw_complete {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            }
-        }))
-    } else {
-        None
-    };
+            }))
+        } else {
+            None
+        };
 
     // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
@@ -4865,8 +4920,8 @@ pub async fn run_opencode_turn(
         None
     };
 
-    // Process stdout NDJSON events from --format json
-    // Each line is a JSON event: {"type":"message.part.updated","properties":{...}}
+    // Process stdout output from oh-my-opencode
+    // Events come via SSE (when curl is available), stdout contains the assistant's text response.
     let stdout_reader = BufReader::new(stdout);
     let mut stdout_lines = stdout_reader.lines();
     let mut state = OpencodeSseState::default();
@@ -4967,8 +5022,8 @@ pub async fn run_opencode_turn(
                                 }
                             }
                         } else {
-                            // Non-JSON line (shouldn't happen with --format json, but handle gracefully)
-                            tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode non-JSON stdout");
+                            // Non-JSON line - this is the expected output format without --format json
+                            tracing::debug!(mission_id = %mission_id, line = %trimmed, "OpenCode stdout");
                             final_result.push_str(trimmed);
                             final_result.push('\n');
                         }
@@ -5069,9 +5124,7 @@ pub async fn run_opencode_turn(
             done: true,
             mission_id: Some(mission_id),
         });
-    } else if sse_emitted
-        && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst)
-    {
+    } else if sse_emitted && !sse_done_sent.load(std::sync::atomic::Ordering::SeqCst) {
         let _ = events_tx.send(AgentEvent::Thinking {
             content: String::new(),
             done: true,
@@ -5095,7 +5148,7 @@ pub async fn run_opencode_turn(
     let mut result = if had_error {
         AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
     } else {
-        AgentResult::success(final_result, 0)
+        AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::Completed)
     };
     if let Some(model) = model_used {
         result = result.with_model(model);
@@ -5133,14 +5186,17 @@ pub async fn run_amp_turn(
             // Try to install via bun first (preferred for container templates), then npm
             let has_bun = command_available(&workspace_exec, work_dir, "bun").await;
             let has_npm = command_available(&workspace_exec, work_dir, "npm").await;
-            
+
             if has_bun {
                 tracing::info!(mission_id = %mission_id, "Auto-installing Amp CLI via bun");
                 let install_result = workspace_exec
                     .output(
                         work_dir,
                         "/bin/sh",
-                        &["-lc".to_string(), "bun install -g @sourcegraph/amp 2>&1".to_string()],
+                        &[
+                            "-lc".to_string(),
+                            "bun install -g @sourcegraph/amp 2>&1".to_string(),
+                        ],
                         HashMap::new(),
                     )
                     .await;
@@ -5164,7 +5220,10 @@ pub async fn run_amp_turn(
                     .output(
                         work_dir,
                         "/bin/sh",
-                        &["-lc".to_string(), "npm install -g @sourcegraph/amp".to_string()],
+                        &[
+                            "-lc".to_string(),
+                            "npm install -g @sourcegraph/amp".to_string(),
+                        ],
                         HashMap::new(),
                     )
                     .await;
@@ -5175,16 +5234,74 @@ pub async fn run_amp_turn(
                 tracing::warn!(mission_id = %mission_id, "Neither bun nor npm available for Amp CLI auto-install");
             }
         }
-
     }
 
+    // Check if node is available (amp CLI is a Node.js script)
+    let has_node = command_available(&workspace_exec, work_dir, "node").await;
+    let has_bun = command_available(&workspace_exec, work_dir, "bun").await
+        || command_available(&workspace_exec, work_dir, "/root/.bun/bin/bun").await;
+
     // Find the amp binary - check standard PATH first, then bun's global bin paths
-    let amp_binary = if command_available(&workspace_exec, work_dir, "amp").await {
-        "amp".to_string()
+    // The amp CLI is a Node.js script, so if node is not available but bun is,
+    // we need to run it via "bun run amp" or "bun /path/to/main.js"
+    let (amp_binary, amp_args_prefix): (String, Vec<String>) = if has_node
+        && command_available(&workspace_exec, work_dir, "amp").await
+    {
+        // Node available and amp in PATH - run directly
+        ("amp".to_string(), vec![])
+    } else if has_bun {
+        // No node, but bun is available - use "bun run amp" or run the JS directly
+        // First check for bun's global install paths
+        let bun_path = if command_available(&workspace_exec, work_dir, "bun").await {
+            "bun".to_string()
+        } else {
+            "/root/.bun/bin/bun".to_string()
+        };
+
+        // Check for amp's main.js in bun's global install location
+        let amp_main_js_paths = [
+            "/root/.bun/install/global/node_modules/@sourcegraph/amp/dist/main.js",
+            "/root/.cache/.bun/install/global/node_modules/@sourcegraph/amp/dist/main.js",
+        ];
+
+        let mut found_js = None;
+        for path in &amp_main_js_paths {
+            let check_result = workspace_exec
+                .output(
+                    work_dir,
+                    "/bin/sh",
+                    &["-c".to_string(), format!("test -f {} && echo exists", path)],
+                    HashMap::new(),
+                )
+                .await;
+            if let Ok(output) = check_result {
+                if String::from_utf8_lossy(&output.stdout).contains("exists") {
+                    found_js = Some(path.to_string());
+                    break;
+                }
+            }
+        }
+
+        if let Some(js_path) = found_js {
+            tracing::info!(
+                mission_id = %mission_id,
+                js_path = %js_path,
+                "Running Amp CLI via bun (node not available)"
+            );
+            (bun_path, vec![js_path])
+        } else {
+            // Try "bun run amp" as fallback
+            tracing::info!(
+                mission_id = %mission_id,
+                "Trying 'bun run amp' (amp main.js not found in expected locations)"
+            );
+            (bun_path, vec!["run".to_string(), "amp".to_string()])
+        }
     } else if command_available(&workspace_exec, work_dir, "/root/.bun/bin/amp").await {
-        "/root/.bun/bin/amp".to_string()
+        // Amp exists but may fail without node - try anyway
+        ("/root/.bun/bin/amp".to_string(), vec![])
     } else if command_available(&workspace_exec, work_dir, "/root/.cache/.bun/bin/amp").await {
-        "/root/.cache/.bun/bin/amp".to_string()
+        ("/root/.cache/.bun/bin/amp".to_string(), vec![])
     } else {
         let err_msg = "Amp CLI not found. Install it with: bun install -g @sourcegraph/amp (or npm install -g @sourcegraph/amp)";
         tracing::error!(mission_id = %mission_id, "{}", err_msg);
@@ -5205,7 +5322,8 @@ pub async fn run_amp_turn(
     // Build CLI arguments
     // Amp CLI format: amp [subcommand] --execute "message" [flags]
     // For continuation: amp threads continue <session_id> --execute "message" [flags]
-    let mut args = vec![];
+    // When running via bun, amp_args_prefix contains ["/path/to/main.js"] or ["run", "amp"]
+    let mut args = amp_args_prefix;
 
     // For continuation, use threads continue subcommand
     if is_continuation {
@@ -5232,28 +5350,28 @@ pub async fn run_amp_turn(
 
     // Build environment
     let mut env = HashMap::new();
-    
+
     // Use API key from config, or fall back to environment variable
     if let Some(key) = api_key {
         env.insert("AMP_API_KEY".to_string(), key.to_string());
     } else if let Ok(key) = std::env::var("AMP_API_KEY") {
         env.insert("AMP_API_KEY".to_string(), key);
     }
-    
+
     // Pass through AMP_URL for CLIProxyAPI integration
     // This allows routing Amp requests through a local proxy (e.g., CLIProxyAPI)
     // AMP_URL sets the Amp service URL (default: https://ampcode.com/)
     if let Ok(amp_url) = std::env::var("AMP_URL") {
         env.insert("AMP_URL".to_string(), amp_url);
     }
-    
+
     // Also support legacy AMP_PROVIDER_URL as an alias
     if !env.contains_key("AMP_URL") {
         if let Ok(provider_url) = std::env::var("AMP_PROVIDER_URL") {
             env.insert("AMP_URL".to_string(), provider_url);
         }
     }
-    
+
     // Fall back to reading amp.url from Amp CLI settings file if no env var set
     if !env.contains_key("AMP_URL") {
         if let Some(amp_url) = get_amp_url_from_settings() {
@@ -5329,7 +5447,7 @@ pub async fn run_amp_turn(
     let mut final_result = String::new();
     let mut had_error = false;
     let mut model_used: Option<String> = None;
-    
+
     // Track token usage for cost calculation
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
@@ -5458,7 +5576,7 @@ pub async fn run_amp_turn(
                                 if evt.message.model.is_some() {
                                     model_used = evt.message.model.clone();
                                 }
-                                
+
                                 // Accumulate token usage for cost calculation
                                 if let Some(usage) = &evt.message.usage {
                                     total_input_tokens += usage.input_tokens.unwrap_or(0);
@@ -5466,7 +5584,7 @@ pub async fn run_amp_turn(
                                     total_cache_creation_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
                                     total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
                                 }
-                                
+
                                 for block in evt.message.content {
                                     match block {
                                         ContentBlock::Text { text } => {
@@ -5559,7 +5677,7 @@ pub async fn run_amp_turn(
                                         final_result = result;
                                     }
                                 }
-                                
+
                                 tracing::debug!(
                                     mission_id = %mission_id,
                                     subtype = %res.subtype,
@@ -5567,7 +5685,7 @@ pub async fn run_amp_turn(
                                     num_turns = ?res.num_turns,
                                     "Amp result received"
                                 );
-                                
+
                                 // Result event means we're done
                                 break;
                             }
@@ -5598,8 +5716,16 @@ pub async fn run_amp_turn(
     let usage = crate::cost::TokenUsage {
         input_tokens: total_input_tokens,
         output_tokens: total_output_tokens,
-        cache_creation_input_tokens: if total_cache_creation_tokens > 0 { Some(total_cache_creation_tokens) } else { None },
-        cache_read_input_tokens: if total_cache_read_tokens > 0 { Some(total_cache_read_tokens) } else { None },
+        cache_creation_input_tokens: if total_cache_creation_tokens > 0 {
+            Some(total_cache_creation_tokens)
+        } else {
+            None
+        },
+        cache_read_input_tokens: if total_cache_read_tokens > 0 {
+            Some(total_cache_read_tokens)
+        } else {
+            None
+        },
     };
     let cost_cents = model_used
         .as_deref()
@@ -5621,7 +5747,11 @@ pub async fn run_amp_turn(
     if final_result.trim().is_empty() && !text_buffer.is_empty() {
         let mut sorted_entries: Vec<_> = text_buffer.iter().collect();
         sorted_entries.sort_by_key(|(idx, _)| *idx);
-        final_result = sorted_entries.into_iter().map(|(_, text)| text.clone()).collect::<Vec<_>>().join("");
+        final_result = sorted_entries
+            .into_iter()
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>()
+            .join("");
         tracing::debug!(
             mission_id = %mission_id,
             "Using accumulated text buffer as final result ({} chars)",
@@ -5642,7 +5772,11 @@ pub async fn run_amp_turn(
             );
             final_result = format!(
                 "Amp error: {}",
-                stderr_content.lines().take(5).collect::<Vec<_>>().join(" | ")
+                stderr_content
+                    .lines()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             );
         } else {
             tracing::warn!(
@@ -5664,7 +5798,11 @@ pub async fn run_amp_turn(
             );
             final_result = format!(
                 "Amp error: {}",
-                stderr_content.lines().take(5).collect::<Vec<_>>().join(" | ")
+                stderr_content
+                    .lines()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             );
         } else {
             final_result = "Amp CLI returned an error with no details. Check API key and network connectivity.".to_string();
@@ -5685,6 +5823,7 @@ pub async fn run_amp_turn(
 
     let mut result = if success {
         AgentResult::success(final_result, cost_cents)
+            .with_terminal_reason(TerminalReason::Completed)
     } else {
         AgentResult::failure(final_result, cost_cents)
             .with_terminal_reason(TerminalReason::LlmError)
@@ -5733,5 +5872,98 @@ impl From<&MissionRunner> for RunningMissionInfo {
             subtask_total: runner.subtasks.len(),
             subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync_opencode_agent_config;
+    use std::fs;
+
+    #[test]
+    fn sync_opencode_agent_config_removes_overrides_when_plugin_enabled() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp_dir.path();
+
+        fs::write(
+            config_dir.join("oh-my-opencode.json"),
+            r#"{
+  "agents": {
+    "prometheus": { "model": "openai/gpt-4o" },
+    "sisyphus": {}
+  }
+}"#,
+        )
+        .expect("write oh-my-opencode.json");
+
+        fs::write(
+            config_dir.join("opencode.json"),
+            r#"{
+  "plugin": ["oh-my-opencode@0.0.1"],
+  "agent": {
+    "prometheus": { "model": "openai/gpt-4o-mini", "foo": "bar" },
+    "sisyphus": {},
+    "custom": { "model": "openai/gpt-4o" }
+  }
+}"#,
+        )
+        .expect("write opencode.json");
+
+        sync_opencode_agent_config(config_dir, Some("openai/gpt-4o-mini"), true, false, false);
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("read opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let agents = opencode_json
+            .get("agent")
+            .and_then(|v| v.as_object())
+            .expect("agent object");
+
+        assert!(agents.get("prometheus").is_none());
+        assert!(agents.get("sisyphus").is_none());
+        assert!(agents.get("custom").is_some());
+    }
+
+    #[test]
+    fn sync_opencode_agent_config_writes_overrides_when_plugin_disabled() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp_dir.path();
+
+        fs::write(
+            config_dir.join("oh-my-opencode.json"),
+            r#"{
+  "agents": {
+    "prometheus": { "model": "openai/gpt-4o" },
+    "sisyphus": {}
+  }
+}"#,
+        )
+        .expect("write oh-my-opencode.json");
+
+        sync_opencode_agent_config(config_dir, Some("openai/gpt-4o-mini"), true, false, false);
+
+        let opencode_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("opencode.json")).expect("read opencode.json"),
+        )
+        .expect("parse opencode.json");
+        let agents = opencode_json
+            .get("agent")
+            .and_then(|v| v.as_object())
+            .expect("agent object");
+
+        let prometheus_model = agents
+            .get("prometheus")
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str())
+            .expect("prometheus model");
+        let sisyphus_model = agents
+            .get("sisyphus")
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.as_str())
+            .expect("sisyphus model");
+
+        assert_eq!(prometheus_model, "openai/gpt-4o");
+        assert_eq!(sisyphus_model, "openai/gpt-4o-mini");
     }
 }

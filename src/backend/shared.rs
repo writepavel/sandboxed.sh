@@ -331,33 +331,31 @@ pub fn convert_cli_event(
             );
         }
 
-        CliEvent::StreamEvent(wrapper) => {
-            match wrapper.event {
-                StreamEvent::ContentBlockDelta { delta, .. } => {
-                    if let Some(text) = delta.text {
-                        if !text.is_empty() {
-                            results.push(ExecutionEvent::TextDelta { content: text });
-                        }
-                    }
-                    if let Some(thinking) = delta.thinking {
-                        if !thinking.is_empty() {
-                            results.push(ExecutionEvent::Thinking { content: thinking });
-                        }
-                    }
-                    if let Some(partial) = delta.partial_json {
-                        debug!("Tool input delta: {}", partial);
+        CliEvent::StreamEvent(wrapper) => match wrapper.event {
+            StreamEvent::ContentBlockDelta { delta, .. } => {
+                if let Some(text) = delta.text {
+                    if !text.is_empty() {
+                        results.push(ExecutionEvent::TextDelta { content: text });
                     }
                 }
-                StreamEvent::ContentBlockStart { content_block, .. } => {
-                    if content_block.block_type == "tool_use" {
-                        if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
-                            pending_tools.insert(id, name);
-                        }
+                if let Some(thinking) = delta.thinking {
+                    if !thinking.is_empty() {
+                        results.push(ExecutionEvent::Thinking { content: thinking });
                     }
                 }
-                _ => {}
+                if let Some(partial) = delta.partial_json {
+                    debug!("Tool input delta: {}", partial);
+                }
             }
-        }
+            StreamEvent::ContentBlockStart { content_block, .. } => {
+                if content_block.block_type == "tool_use" {
+                    if let (Some(id), Some(name)) = (content_block.id, content_block.name) {
+                        pending_tools.insert(id, name);
+                    }
+                }
+            }
+            _ => {}
+        },
 
         CliEvent::Assistant(evt) => {
             for block in evt.message.content {
@@ -422,7 +420,14 @@ pub fn convert_cli_event(
         }
 
         CliEvent::Result(res) => {
-            if res.is_error || res.subtype == "error" {
+            // Check for errors: explicit error flags OR result text that looks like an API error
+            let result_text = res.result.as_deref().unwrap_or("");
+            let looks_like_api_error = result_text.starts_with("API Error:")
+                || result_text.contains("\"type\":\"error\"")
+                || result_text.contains("\"type\":\"overloaded_error\"")
+                || result_text.contains("\"type\":\"api_error\"");
+
+            if res.is_error || res.subtype == "error" || looks_like_api_error {
                 results.push(ExecutionEvent::Error {
                     message: res.error_message(),
                 });

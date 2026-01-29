@@ -6,7 +6,6 @@
 //! - Skills CRUD
 //! - Commands CRUD
 //! - Plugins CRUD
-//! - Rules CRUD
 //! - Library Agents CRUD
 //! - Library Tools CRUD
 //! - OpenCode settings (oh-my-opencode.json)
@@ -14,7 +13,7 @@
 //! - Migration
 
 use axum::{
-    extract::{Path, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
@@ -26,10 +25,10 @@ use tokio::sync::RwLock;
 
 use crate::library::{
     rename::{ItemType, RenameResult},
-    ClaudeCodeConfig, Command, CommandSummary, GitAuthor, LibraryAgent, LibraryAgentSummary,
-    LibraryStatus, LibraryStore, LibraryTool, LibraryToolSummary, McpServer, MigrationReport,
-    OpenAgentConfig, Plugin, Rule, RuleSummary, Skill, SkillSummary, WorkspaceTemplate,
-    WorkspaceTemplateSummary,
+    ClaudeCodeConfig, Command, CommandSummary, GitAuthor, InitScript, InitScriptSummary,
+    LibraryAgent, LibraryAgentSummary, LibraryStatus, LibraryStore, LibraryTool,
+    LibraryToolSummary, McpServer, MigrationReport, OpenAgentConfig, Plugin, Skill, SkillSummary,
+    WorkspaceTemplate, WorkspaceTemplateSummary,
 };
 use crate::nspawn::NspawnDistro;
 use crate::workspace::{self, WorkspaceType, DEFAULT_WORKSPACE_ID};
@@ -233,11 +232,6 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         // Plugins
         .route("/plugins", get(get_plugins))
         .route("/plugins", put(save_plugins))
-        // Rules
-        .route("/rule", get(list_rules))
-        .route("/rule/:name", get(get_rule))
-        .route("/rule/:name", put(save_rule))
-        .route("/rule/:name", delete(delete_rule))
         // Library Agents
         .route("/agent", get(list_library_agents))
         .route("/agent/:name", get(get_library_agent))
@@ -256,6 +250,11 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
             "/workspace-template/:name",
             delete(delete_workspace_template),
         )
+        // Init Scripts
+        .route("/init-script", get(list_init_scripts))
+        .route("/init-script/:name", get(get_init_script))
+        .route("/init-script/:name", put(save_init_script))
+        .route("/init-script/:name", delete(delete_init_script))
         // Migration
         .route("/migrate", post(migrate_library))
         // Rename (works for all item types)
@@ -270,6 +269,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
         // Claude Code Config
         .route("/claudecode/config", get(get_claudecode_config))
         .route("/claudecode/config", put(save_claudecode_config))
+        // Skills Registry (skills.sh)
+        .route("/skill/registry/search", get(search_registry))
+        .route("/skill/registry/list/:identifier", get(list_repo_skills))
+        .route("/skill/registry/install", post(install_from_registry))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -288,11 +291,24 @@ pub struct SaveContentRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ImportSkillRequest {
-    /// Git repository URL
-    url: String,
-    /// Optional path within the repository (for monorepos)
-    path: Option<String>,
-    /// Target skill name (defaults to last path component)
+    /// Skill name (required for file upload)
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegistrySearchQuery {
+    /// Search query
+    q: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InstallFromRegistryRequest {
+    /// Repository identifier (e.g., "vercel-labs/agent-skills")
+    identifier: String,
+    /// Specific skill names to install (optional, installs all if empty)
+    #[serde(default)]
+    skills: Vec<String>,
+    /// Target name for the skill in the library (defaults to skill name)
     name: Option<String>,
 }
 
@@ -303,6 +319,10 @@ pub struct SaveWorkspaceTemplateRequest {
     pub skills: Option<Vec<String>>,
     pub env_vars: Option<HashMap<String, String>>,
     pub encrypted_keys: Option<Vec<String>>,
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    pub init_scripts: Option<Vec<String>>,
+    /// Custom init script to run on build (appended after fragments)
     pub init_script: Option<String>,
     /// Whether to share the host network (default: true).
     /// Set to false for isolated networking (e.g., Tailscale).
@@ -571,46 +591,209 @@ async fn delete_skill_reference(
     Ok((StatusCode::OK, "Reference deleted successfully".to_string()))
 }
 
-/// POST /api/library/skills/import - Import a skill from a Git URL.
+/// POST /api/library/skills/import - Import a skill from a file upload (.zip or .md).
+///
+/// Accepts multipart form data with:
+/// - `name`: skill name (query parameter)
+/// - `file`: the uploaded file (.zip or .md)
+///
+/// For .md files: creates a skill with the file as SKILL.md
+/// For .zip files: extracts and looks for SKILL.md in the archive
 async fn import_skill(
     State(state): State<Arc<super::routes::AppState>>,
     headers: HeaderMap,
-    Json(req): Json<ImportSkillRequest>,
+    Query(req): Query<ImportSkillRequest>,
+    mut multipart: Multipart,
 ) -> Result<Json<Skill>, (StatusCode, String)> {
     let library = ensure_library(&state, &headers).await?;
 
-    // Determine target name
-    let target_name = req.name.clone().unwrap_or_else(|| {
-        // Extract from path or URL
-        if let Some(ref path) = req.path {
-            path.rsplit('/')
-                .next()
-                .unwrap_or("imported-skill")
-                .to_string()
-        } else {
-            req.url
-                .rsplit('/')
-                .next()
-                .map(|s| s.trim_end_matches(".git"))
-                .unwrap_or("imported-skill")
-                .to_string()
-        }
-    });
+    // Validate skill name
+    let skill_name = req.name.trim().to_lowercase();
+    if skill_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Skill name is required".to_string(),
+        ));
+    }
+    if !skill_name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Skill name must contain only lowercase letters, numbers, and hyphens".to_string(),
+        ));
+    }
 
-    let skill = library
-        .import_skill_from_git(&req.url, req.path.as_deref(), &target_name)
-        .await
-        .map_err(|e| {
-            if e.to_string().contains("already exists") {
-                (StatusCode::CONFLICT, e.to_string())
-            } else if e.to_string().contains("No SKILL.md found") {
-                (StatusCode::BAD_REQUEST, e.to_string())
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
+    // Check if skill already exists
+    let skill_dir = library.path().join("skill").join(&skill_name);
+    if skill_dir.exists() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Skill '{}' already exists", skill_name),
+        ));
+    }
+
+    // Extract file from multipart
+    let mut file_data: Option<(String, Vec<u8>)> = None;
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read upload: {}", e),
+        )
+    })? {
+        if field.name() == Some("file") {
+            let filename = field
+                .file_name()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "upload".to_string());
+            let data = field.bytes().await.map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to read file: {}", e),
+                )
+            })?;
+            file_data = Some((filename, data.to_vec()));
+            break;
+        }
+    }
+
+    let (filename, data) =
+        file_data.ok_or_else(|| (StatusCode::BAD_REQUEST, "No file uploaded".to_string()))?;
+
+    // Create skill directory
+    tokio::fs::create_dir_all(&skill_dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create skill directory: {}", e),
+        )
+    })?;
+
+    // Handle based on file type
+    let filename_lower = filename.to_lowercase();
+    if filename_lower.ends_with(".zip") {
+        // Extract ZIP file
+        import_skill_from_zip(&skill_dir, &data)
+            .await
+            .map_err(|e| {
+                // Clean up on error
+                let _ = std::fs::remove_dir_all(&skill_dir);
+                (StatusCode::BAD_REQUEST, e)
+            })?;
+    } else if filename_lower.ends_with(".md") {
+        // Single markdown file - save as SKILL.md
+        let skill_md_path = skill_dir.join("SKILL.md");
+        tokio::fs::write(&skill_md_path, &data).await.map_err(|e| {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to write SKILL.md: {}", e),
+            )
         })?;
-    sync_skill_to_workspaces(&state, library.as_ref(), &target_name).await;
+    } else {
+        let _ = std::fs::remove_dir_all(&skill_dir);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Unsupported file type. Please upload a .zip or .md file".to_string(),
+        ));
+    }
+
+    // Verify SKILL.md exists
+    let skill_md_path = skill_dir.join("SKILL.md");
+    if !skill_md_path.exists() {
+        let _ = std::fs::remove_dir_all(&skill_dir);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No SKILL.md found in the uploaded archive".to_string(),
+        ));
+    }
+
+    // Load and return the skill
+    let skill = library.get_skill(&skill_name).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load imported skill: {}", e),
+        )
+    })?;
+
+    sync_skill_to_workspaces(&state, library.as_ref(), &skill_name).await;
     Ok(Json(skill))
+}
+
+/// Extract a ZIP file into the skill directory.
+async fn import_skill_from_zip(skill_dir: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::{Cursor, Read};
+
+    let cursor = Cursor::new(data);
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid ZIP file: {}", e))?;
+
+    // Find the common prefix (for archives with a single root folder)
+    let prefix = find_zip_prefix(&mut archive);
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| format!("Failed to read ZIP entry: {}", e))?;
+
+        let name = file.name().to_string();
+
+        // Skip directories and hidden files
+        if name.ends_with('/') || name.contains("/.") || name.starts_with('.') {
+            continue;
+        }
+
+        // Remove common prefix if present
+        let relative_path = if let Some(ref p) = prefix {
+            name.strip_prefix(p).unwrap_or(&name)
+        } else {
+            &name
+        };
+
+        if relative_path.is_empty() {
+            continue;
+        }
+
+        let target_path = skill_dir.join(relative_path);
+
+        // Create parent directories
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory: {}", e))?;
+        }
+
+        // Extract file
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|e| format!("Failed to read file from ZIP: {}", e))?;
+        std::fs::write(&target_path, contents)
+            .map_err(|e| format!("Failed to write file: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Find common prefix in ZIP archive (for archives with a single root folder).
+fn find_zip_prefix(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -> Option<String> {
+    let mut first_dir: Option<String> = None;
+
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            let name = file.name();
+            if let Some(slash_pos) = name.find('/') {
+                let dir = &name[..=slash_pos];
+                match &first_dir {
+                    None => first_dir = Some(dir.to_string()),
+                    Some(d) if d != dir => return None, // Multiple root dirs
+                    _ => {}
+                }
+            } else {
+                return None; // File at root level
+            }
+        }
+    }
+
+    first_dir
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -693,7 +876,9 @@ async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
     let opencode_commands = vec![
         CommandSummary {
             name: "ralph-loop".to_string(),
-            description: Some("Start self-referential development loop until completion".to_string()),
+            description: Some(
+                "Start self-referential development loop until completion".to_string(),
+            ),
             path: "builtin".to_string(),
             params: vec![],
         },
@@ -711,7 +896,9 @@ async fn get_builtin_commands() -> Json<BuiltinCommandsResponse> {
         },
         CommandSummary {
             name: "refactor".to_string(),
-            description: Some("Intelligent refactoring with LSP, AST-grep, and TDD verification".to_string()),
+            description: Some(
+                "Intelligent refactoring with LSP, AST-grep, and TDD verification".to_string(),
+            ),
             path: "builtin".to_string(),
             params: vec![],
         },
@@ -851,68 +1038,6 @@ async fn save_plugins(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok((StatusCode::OK, "Plugins saved successfully".to_string()))
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Rules
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// GET /api/library/rule - List all rules.
-async fn list_rules(
-    State(state): State<Arc<super::routes::AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<RuleSummary>>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .list_rules()
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-/// GET /api/library/rule/:name - Get a rule by name.
-async fn get_rule(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<Rule>, (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library.get_rule(&name).await.map(Json).map_err(|e| {
-        if e.to_string().contains("not found") {
-            (StatusCode::NOT_FOUND, e.to_string())
-        } else {
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
-    })
-}
-
-/// PUT /api/library/rule/:name - Save a rule.
-async fn save_rule(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(req): Json<SaveContentRequest>,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .save_rule(&name, &req.content)
-        .await
-        .map(|_| (StatusCode::OK, "Rule saved successfully".to_string()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-/// DELETE /api/library/rule/:name - Delete a rule.
-async fn delete_rule(
-    State(state): State<Arc<super::routes::AppState>>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    let library = ensure_library(&state, &headers).await?;
-    library
-        .delete_rule(&name)
-        .await
-        .map(|_| (StatusCode::OK, "Rule deleted successfully".to_string()))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1115,6 +1240,7 @@ async fn save_workspace_template(
         skills: sanitize_skill_list(req.skills.unwrap_or_default()),
         env_vars: req.env_vars.unwrap_or_default(),
         encrypted_keys: req.encrypted_keys.unwrap_or_default(),
+        init_scripts: req.init_scripts.unwrap_or_default(),
         init_script: req.init_script.unwrap_or_default(),
         shared_network: req.shared_network,
         mcps: req.mcps.unwrap_or_default(),
@@ -1146,6 +1272,73 @@ async fn delete_workspace_template(
             (
                 StatusCode::OK,
                 "Workspace template deleted successfully".to_string(),
+            )
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init Scripts
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/init-script - List all init script fragments.
+async fn list_init_scripts(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<InitScriptSummary>>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .list_init_scripts()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// GET /api/library/init-script/:name - Get an init script fragment by name.
+async fn get_init_script(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<InitScript>, (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library.get_init_script(&name).await.map(Json).map_err(|e| {
+        if e.to_string().contains("not found") {
+            (StatusCode::NOT_FOUND, e.to_string())
+        } else {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    })
+}
+
+/// PUT /api/library/init-script/:name - Save an init script fragment.
+async fn save_init_script(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<SaveContentRequest>,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_init_script(&name, &req.content)
+        .await
+        .map(|_| (StatusCode::OK, "Init script saved successfully".to_string()))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// DELETE /api/library/init-script/:name - Delete an init script fragment.
+async fn delete_init_script(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .delete_init_script(&name)
+        .await
+        .map(|_| {
+            (
+                StatusCode::OK,
+                "Init script deleted successfully".to_string(),
             )
         })
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -1254,8 +1447,8 @@ async fn save_openagent_config(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             // Sync to working directory
-            if let Err(e) = workspace::sync_openagent_config(&library, &state.config.working_dir)
-                .await
+            if let Err(e) =
+                workspace::sync_openagent_config(&library, &state.config.working_dir).await
             {
                 tracing::warn!(error = %e, "Failed to sync openagent config to working dir");
             }
@@ -1266,8 +1459,8 @@ async fn save_openagent_config(
             ))
         }
         Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {
-            if let Err(e) = workspace::write_openagent_config(&state.config.working_dir, &config)
-                .await
+            if let Err(e) =
+                workspace::write_openagent_config(&state.config.working_dir, &config).await
             {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1476,7 +1669,6 @@ async fn rename_item(
     let item_type = match item_type_str.as_str() {
         "skill" => ItemType::Skill,
         "command" => ItemType::Command,
-        "rule" => ItemType::Rule,
         "agent" => ItemType::Agent,
         "tool" => ItemType::Tool,
         "workspace-template" => ItemType::WorkspaceTemplate,
@@ -1484,7 +1676,7 @@ async fn rename_item(
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "Invalid item type '{}'. Valid types: skill, command, rule, agent, tool, workspace-template",
+                    "Invalid item type '{}'. Valid types: skill, command, agent, tool, workspace-template",
                     item_type_str
                 ),
             ))
@@ -1658,4 +1850,309 @@ async fn save_claudecode_config(
         StatusCode::OK,
         "Claude Code config saved successfully".to_string(),
     ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Skills Registry (skills.sh) Handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /api/library/skill/registry/search?q=<query> - Search skills.sh registry.
+async fn search_registry(
+    axum::extract::Query(query): axum::extract::Query<RegistrySearchQuery>,
+) -> Result<Json<Vec<crate::skills_registry::RegistrySkillListing>>, (StatusCode, String)> {
+    let results = crate::skills_registry::search_skills(&query.q)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(results))
+}
+
+/// GET /api/library/skill/registry/list/:identifier - List skills in a repository.
+async fn list_repo_skills(
+    Path(identifier): Path<String>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    let skills = crate::skills_registry::list_repo_skills(&identifier)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(skills))
+}
+
+/// POST /api/library/skill/registry/install - Install a skill from skills.sh.
+async fn install_from_registry(
+    State(state): State<Arc<super::routes::AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<InstallFromRegistryRequest>,
+) -> Result<Json<Skill>, (StatusCode, String)> {
+    use crate::library::SkillSource;
+
+    let library = ensure_library(&state, &headers).await?;
+
+    // Create a temporary directory for the skills CLI to work in
+    let temp_dir = library.path().join(".tmp-registry-install");
+    if temp_dir.exists() {
+        tokio::fs::remove_dir_all(&temp_dir)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    tokio::fs::create_dir_all(&temp_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Initialize a minimal structure for the skills CLI
+    // The skills CLI expects certain directories to exist
+    let claude_skills_dir = temp_dir.join(".claude").join("skills");
+    tokio::fs::create_dir_all(&claude_skills_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Run the install command
+    let skill_refs: Vec<&str> = request.skills.iter().map(|s| s.as_str()).collect();
+    let skill_names = if skill_refs.is_empty() {
+        None
+    } else {
+        Some(skill_refs.as_slice())
+    };
+
+    let result = crate::skills_registry::install_skill(&request.identifier, skill_names, &temp_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !result.errors.is_empty() {
+        // Clean up temp dir
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Installation errors: {}", result.errors.join(", ")),
+        ));
+    }
+
+    // Find the installed skill in .claude/skills/
+    let mut installed_skill_dir = None;
+    let mut entries = tokio::fs::read_dir(&claude_skills_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        let path = entry.path();
+        if path.is_dir() && path.join("SKILL.md").exists() {
+            installed_skill_dir = Some(path);
+            break;
+        }
+    }
+
+    let source_dir = installed_skill_dir.ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "No skill found after installation".to_string(),
+        )
+    })?;
+
+    // Determine target name
+    let skill_name = request.name.unwrap_or_else(|| {
+        source_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "imported-skill".to_string())
+    });
+
+    // Copy to library
+    let target_dir = library.path().join("skill").join(&skill_name);
+    if target_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        return Err((
+            StatusCode::CONFLICT,
+            format!("Skill '{}' already exists", skill_name),
+        ));
+    }
+
+    copy_dir_recursive(&source_dir, &target_dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Write the source metadata file
+    let source = SkillSource::SkillsRegistry {
+        identifier: request.identifier.clone(),
+        skill_name: request.skills.first().cloned(),
+        version: None,
+        installed_at: Some(chrono::Utc::now().to_rfc3339()),
+        updated_at: None,
+    };
+    let source_json = serde_json::to_string_pretty(&source)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tokio::fs::write(target_dir.join(".skill-source.json"), source_json)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Clean up temp directory
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    // Get and return the skill
+    let skill = library
+        .get_skill(&skill_name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Sync to workspaces
+    sync_skill_to_workspaces(&state, &library, &skill_name).await;
+
+    Ok(Json(skill))
+}
+
+/// Recursively copy a directory.
+#[async_recursion::async_recursion]
+async fn copy_dir_recursive(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    tokio::fs::create_dir_all(dst).await?;
+
+    let mut entries = tokio::fs::read_dir(src).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path).await?;
+        } else {
+            tokio::fs::copy(&src_path, &dst_path).await?;
+        }
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unit Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use tempfile::tempdir;
+    use zip::write::SimpleFileOptions;
+
+    /// Create a ZIP archive in memory with the given files.
+    fn create_zip(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let options = SimpleFileOptions::default();
+
+            for (path, content) in files {
+                writer.start_file(*path, options).unwrap();
+                writer.write_all(content.as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_find_zip_prefix_single_root() {
+        let zip_data = create_zip(&[
+            ("my-skill/SKILL.md", "# Test"),
+            ("my-skill/refs/file.md", "content"),
+        ]);
+        let cursor = Cursor::new(zip_data.as_slice());
+        let mut archive = zip::ZipArchive::new(cursor).unwrap();
+        let prefix = find_zip_prefix(&mut archive);
+        assert_eq!(prefix, Some("my-skill/".to_string()));
+    }
+
+    #[test]
+    fn test_find_zip_prefix_multiple_roots() {
+        let zip_data = create_zip(&[
+            ("folder1/file.md", "content1"),
+            ("folder2/file.md", "content2"),
+        ]);
+        let cursor = Cursor::new(zip_data.as_slice());
+        let mut archive = zip::ZipArchive::new(cursor).unwrap();
+        let prefix = find_zip_prefix(&mut archive);
+        assert_eq!(prefix, None);
+    }
+
+    #[test]
+    fn test_find_zip_prefix_file_at_root() {
+        let zip_data = create_zip(&[("SKILL.md", "# Test"), ("refs/file.md", "content")]);
+        let cursor = Cursor::new(zip_data.as_slice());
+        let mut archive = zip::ZipArchive::new(cursor).unwrap();
+        let prefix = find_zip_prefix(&mut archive);
+        assert_eq!(prefix, None);
+    }
+
+    #[tokio::test]
+    async fn test_import_skill_from_zip_flat() {
+        let zip_data = create_zip(&[
+            ("SKILL.md", "---\ndescription: Test skill\n---\n\n# Test"),
+            ("refs/example.md", "Example content"),
+        ]);
+
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        import_skill_from_zip(&skill_dir, &zip_data).await.unwrap();
+
+        // Check files were extracted correctly
+        assert!(skill_dir.join("SKILL.md").exists());
+        let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(content.contains("description: Test skill"));
+
+        assert!(skill_dir.join("refs/example.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_import_skill_from_zip_with_root_folder() {
+        // Simulate a GitHub-style archive with a root folder
+        let zip_data = create_zip(&[
+            (
+                "my-skill-main/SKILL.md",
+                "---\ndescription: GitHub style\n---\n\n# Test",
+            ),
+            ("my-skill-main/refs/doc.md", "Documentation"),
+        ]);
+
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        import_skill_from_zip(&skill_dir, &zip_data).await.unwrap();
+
+        // Root folder prefix should be stripped
+        assert!(skill_dir.join("SKILL.md").exists());
+        let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(content.contains("GitHub style"));
+
+        // Nested file should also have prefix stripped
+        assert!(skill_dir.join("refs/doc.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_import_skill_from_zip_skips_hidden_files() {
+        let zip_data = create_zip(&[
+            ("SKILL.md", "# Test"),
+            (".gitignore", "*.log"),
+            ("refs/.hidden", "secret"),
+        ]);
+
+        let dir = tempdir().unwrap();
+        let skill_dir = dir.path().join("test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        import_skill_from_zip(&skill_dir, &zip_data).await.unwrap();
+
+        // SKILL.md should exist
+        assert!(skill_dir.join("SKILL.md").exists());
+
+        // Hidden files should be skipped
+        assert!(!skill_dir.join(".gitignore").exists());
+        assert!(!skill_dir.join("refs/.hidden").exists());
+    }
 }

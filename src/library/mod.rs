@@ -5,7 +5,6 @@
 //! - Skills (`skill/*/SKILL.md` with additional .md files and references)
 //! - Commands/prompts (`command/*.md`)
 //! - Plugins registry (`plugins.json`)
-//! - Rules (`rule/*.md`)
 //! - Library agents (`agent/*.md`)
 //! - Library tools (`tool/*.ts`)
 //! - OpenCode settings (`opencode/oh-my-opencode.json`)
@@ -40,6 +39,10 @@ struct WorkspaceTemplateConfig {
     /// Keys of env vars that should be encrypted at rest (stored alongside encrypted values)
     #[serde(default)]
     encrypted_keys: Vec<String>,
+    /// Init script fragment names to include (executed in order)
+    #[serde(default)]
+    init_scripts: Vec<String>,
+    /// Custom init script to run on build (appended after fragments)
     #[serde(default)]
     init_script: String,
     /// Whether to share the host network (default: true).
@@ -55,7 +58,7 @@ const SKILL_DIR: &str = "skill";
 const COMMAND_DIR: &str = "command";
 const AGENT_DIR: &str = "agent";
 const TOOL_DIR: &str = "tool";
-const RULE_DIR: &str = "rule";
+const INIT_SCRIPT_DIR: &str = "init-script";
 const PLUGINS_FILE: &str = "plugins.json";
 const WORKSPACE_TEMPLATE_DIR: &str = "workspace-template";
 const OPENCODE_DIR: &str = "opencode";
@@ -103,8 +106,45 @@ impl LibraryStore {
     }
 
     /// Pull latest changes from remote.
+    /// After pulling, encrypts any unversioned <encrypted> tags in skill files.
     pub async fn sync(&self) -> Result<()> {
-        git::pull(&self.path).await
+        git::pull(&self.path).await?;
+
+        // Encrypt any unversioned encrypted tags in all skills
+        self.encrypt_all_skill_files().await?;
+
+        Ok(())
+    }
+
+    /// Encrypt unversioned <encrypted> tags in all skill files.
+    /// This ensures secrets pulled from git are encrypted on disk.
+    pub async fn encrypt_all_skill_files(&self) -> Result<()> {
+        let skills_dir = self.skills_dir();
+        if !skills_dir.exists() {
+            return Ok(());
+        }
+
+        let mut entries = fs::read_dir(&skills_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                let name = entry.file_name();
+                if let Some(name_str) = name.to_str() {
+                    // Skip hidden directories
+                    if name_str.starts_with('.') {
+                        continue;
+                    }
+                    if let Err(e) = self.encrypt_skill_file(name_str).await {
+                        tracing::warn!(
+                            skill = %name_str,
+                            error = %e,
+                            "Failed to encrypt skill file"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Commit all changes with a message and optional author.
@@ -206,11 +246,26 @@ impl LibraryStore {
                 .unwrap_or((None, ""));
 
             let description = extract_description(&frontmatter);
+            let setup_commands = extract_string_array(&frontmatter, "setup_commands");
+
+            // Read skill source metadata if present
+            let source_file = entry_path.join(".skill-source.json");
+            let source = if source_file.exists() {
+                fs::read_to_string(&source_file)
+                    .await
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default()
+            } else {
+                SkillSource::default()
+            };
 
             skills.push(SkillSummary {
                 name,
                 description,
                 path: format!("{}/{}", SKILL_DIR, entry.file_name().to_string_lossy()),
+                source,
+                setup_commands,
             });
         }
 
@@ -249,13 +304,30 @@ impl LibraryStore {
         // Collect all .md files and non-.md reference files
         let (files, references) = self.collect_skill_files(&skill_dir).await?;
 
+        // Read skill source metadata if present
+        let source_file = skill_dir.join(".skill-source.json");
+        let source = if source_file.exists() {
+            fs::read_to_string(&source_file)
+                .await
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            SkillSource::default()
+        };
+
+        // Extract setup_commands from frontmatter
+        let setup_commands = extract_string_array(&frontmatter, "setup_commands");
+
         Ok(Skill {
             name: name.to_string(),
             description,
             path: format!("{}/{}", SKILL_DIR, name),
+            source,
             content,
             files,
             references,
+            setup_commands,
         })
     }
 
@@ -373,17 +445,40 @@ impl LibraryStore {
         let skill_dir = self.skills_dir().join(name);
         let skill_md = skill_dir.join("SKILL.md");
 
+        tracing::debug!(
+            skill = %name,
+            path = %skill_md.display(),
+            has_encrypted_tags = env_crypto::has_encrypted_tags(content),
+            content_len = content.len(),
+            "Saving skill"
+        );
+
         // Ensure directory exists
         fs::create_dir_all(&skill_dir).await?;
 
         // Encrypt any unversioned encrypted tags (lazily generates key if needed)
-        let key = env_crypto::ensure_private_key().await
+        let key = env_crypto::ensure_private_key()
+            .await
             .context("Failed to ensure encryption key for saving skill")?;
+
+        tracing::debug!(skill = %name, "Encryption key loaded, encrypting content tags");
+
         let encrypted_content = env_crypto::encrypt_content_tags(&key, content)?;
 
-        fs::write(&skill_md, encrypted_content)
+        let content_changed = encrypted_content != content;
+        tracing::info!(
+            skill = %name,
+            content_changed = content_changed,
+            original_len = content.len(),
+            encrypted_len = encrypted_content.len(),
+            "Skill content encryption complete"
+        );
+
+        fs::write(&skill_md, &encrypted_content)
             .await
             .context("Failed to write SKILL.md")?;
+
+        tracing::debug!(skill = %name, path = %skill_md.display(), "Skill saved successfully");
 
         Ok(())
     }
@@ -511,7 +606,8 @@ impl LibraryStore {
 
         // Encrypt tags in .md files (lazily generates key if needed)
         let content_to_write = if ref_path.ends_with(".md") {
-            let key = env_crypto::ensure_private_key().await
+            let key = env_crypto::ensure_private_key()
+                .await
                 .context("Failed to ensure encryption key for saving reference")?;
             env_crypto::encrypt_content_tags(&key, content)?
         } else {
@@ -631,8 +727,55 @@ impl LibraryStore {
         // Clean up temp directory
         let _ = fs::remove_dir_all(&temp_dir).await;
 
+        // Encrypt any unversioned <encrypted> tags in the imported SKILL.md
+        self.encrypt_skill_file(target_name).await?;
+
         // Return the imported skill
         self.get_skill(target_name).await
+    }
+
+    /// Encrypt unversioned <encrypted> tags in a skill's SKILL.md file.
+    /// This is called after importing or syncing to ensure secrets are encrypted on disk.
+    async fn encrypt_skill_file(&self, name: &str) -> Result<()> {
+        let skill_md = self.skills_dir().join(name).join("SKILL.md");
+        if !skill_md.exists() {
+            return Ok(());
+        }
+
+        let content = fs::read_to_string(&skill_md).await?;
+
+        // Check if there are any unversioned encrypted tags that need encryption
+        if !env_crypto::has_encrypted_tags(&content) {
+            return Ok(());
+        }
+
+        // Only encrypt if there are unversioned tags (user input format)
+        let has_unversioned = content.contains("<encrypted>")
+            && !content
+                .lines()
+                .filter(|l| l.contains("<encrypted>"))
+                .all(|l| l.contains("<encrypted v=\""));
+
+        if !has_unversioned {
+            return Ok(());
+        }
+
+        tracing::info!(
+            skill = %name,
+            "Encrypting unversioned <encrypted> tags in imported skill"
+        );
+
+        let key = env_crypto::ensure_private_key()
+            .await
+            .context("Failed to ensure encryption key")?;
+        let encrypted_content = env_crypto::encrypt_content_tags(&key, &content)?;
+
+        if encrypted_content != content {
+            fs::write(&skill_md, &encrypted_content).await?;
+            tracing::debug!(skill = %name, "Skill file encrypted and saved");
+        }
+
+        Ok(())
     }
 
     /// Recursively copy a directory.
@@ -816,108 +959,6 @@ impl LibraryStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Rules (rule/*.md)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// List all rules with their summaries.
-    pub async fn list_rules(&self) -> Result<Vec<RuleSummary>> {
-        let rules_dir = self.path.join(RULE_DIR);
-
-        if !rules_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut rules = Vec::new();
-        let mut entries = fs::read_dir(&rules_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            let entry_path = entry.path();
-
-            // Only process .md files
-            let Some(ext) = entry_path.extension() else {
-                continue;
-            };
-            if ext != "md" {
-                continue;
-            }
-
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            let name = file_name.trim_end_matches(".md").to_string();
-
-            // Read and parse frontmatter for description
-            let content = fs::read_to_string(&entry_path).await.ok();
-            let (frontmatter, _) = content
-                .as_ref()
-                .map(|c| parse_frontmatter(c))
-                .unwrap_or((None, ""));
-
-            let description = extract_description(&frontmatter);
-
-            rules.push(RuleSummary {
-                name,
-                description,
-                path: format!("{}/{}", RULE_DIR, file_name),
-            });
-        }
-
-        rules.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(rules)
-    }
-
-    /// Get a rule by name with full content.
-    pub async fn get_rule(&self, name: &str) -> Result<Rule> {
-        Self::validate_name(name)?;
-        let rule_path = self.path.join(RULE_DIR).join(format!("{}.md", name));
-
-        if !rule_path.exists() {
-            anyhow::bail!("Rule not found: {}", name);
-        }
-
-        let content = fs::read_to_string(&rule_path)
-            .await
-            .context("Failed to read rule file")?;
-
-        let (frontmatter, _body) = parse_frontmatter(&content);
-        let description = extract_description(&frontmatter);
-
-        Ok(Rule {
-            name: name.to_string(),
-            description,
-            path: format!("{}/{}.md", RULE_DIR, name),
-            content,
-        })
-    }
-
-    /// Save a rule's content.
-    pub async fn save_rule(&self, name: &str, content: &str) -> Result<()> {
-        Self::validate_name(name)?;
-        let rules_dir = self.path.join(RULE_DIR);
-        let rule_path = rules_dir.join(format!("{}.md", name));
-
-        fs::create_dir_all(&rules_dir).await?;
-
-        fs::write(&rule_path, content)
-            .await
-            .context("Failed to write rule file")?;
-
-        Ok(())
-    }
-
-    /// Delete a rule.
-    pub async fn delete_rule(&self, name: &str) -> Result<()> {
-        Self::validate_name(name)?;
-        let rule_path = self.path.join(RULE_DIR).join(format!("{}.md", name));
-
-        if rule_path.exists() {
-            fs::remove_file(&rule_path)
-                .await
-                .context("Failed to delete rule file")?;
-        }
-
-        Ok(())
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Library Agents (agent/*.md)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -984,7 +1025,6 @@ impl LibraryStore {
         let model = extract_model(&frontmatter);
         let tools = extract_tools(&frontmatter);
         let permissions = extract_permissions(&frontmatter);
-        let rules = extract_string_array(&frontmatter, "rules");
 
         Ok(LibraryAgent {
             name: name.to_string(),
@@ -994,7 +1034,6 @@ impl LibraryStore {
             model,
             tools,
             permissions,
-            rules,
         })
     }
 
@@ -1201,6 +1240,10 @@ impl LibraryStore {
                 .as_ref()
                 .map(|c| c.skills.clone())
                 .unwrap_or_default();
+            let init_scripts = config
+                .as_ref()
+                .map(|c| c.init_scripts.clone())
+                .unwrap_or_default();
             let template_name = config
                 .as_ref()
                 .and_then(|c| c.name.clone())
@@ -1211,6 +1254,7 @@ impl LibraryStore {
                 description,
                 distro,
                 skills,
+                init_scripts,
                 path: format!("{}/{}", WORKSPACE_TEMPLATE_DIR, file_name),
             });
         }
@@ -1239,24 +1283,22 @@ impl LibraryStore {
         let config: WorkspaceTemplateConfig =
             serde_json::from_str(&content).context("Failed to parse workspace template file")?;
 
-        // Decrypt env vars if we have a key configured
-        let env_vars = match env_crypto::load_private_key_from_env()? {
-            Some(key) => env_crypto::decrypt_env_vars(&key, &config.env_vars)
-                .context("Failed to decrypt template env vars")?,
-            None => {
-                // No key configured - check if any values are encrypted
-                let has_encrypted = config
-                    .env_vars
-                    .values()
-                    .any(|v| env_crypto::is_encrypted(v));
-                if has_encrypted {
-                    tracing::warn!(
-                        "Template '{}' has encrypted env vars but PRIVATE_KEY is not configured",
-                        name
-                    );
-                }
-                config.env_vars.clone()
-            }
+        // Decrypt env vars if we have a key configured (file or env var)
+        let has_encrypted = config
+            .env_vars
+            .values()
+            .any(|v| env_crypto::is_encrypted(v));
+
+        let env_vars = if has_encrypted {
+            // Try to load key from env var or file
+            let key = env_crypto::ensure_private_key()
+                .await
+                .context("Failed to load encryption key for decrypting template env vars")?;
+            env_crypto::decrypt_env_vars(&key, &config.env_vars)
+                .context("Failed to decrypt template env vars")?
+        } else {
+            // No encrypted values, pass through as-is
+            config.env_vars.clone()
         };
 
         // Determine encrypted_keys: use stored list if available, otherwise detect from values
@@ -1281,6 +1323,7 @@ impl LibraryStore {
             skills: config.skills,
             env_vars,
             encrypted_keys,
+            init_scripts: config.init_scripts,
             init_script: config.init_script,
             shared_network: config.shared_network,
             mcps: config.mcps,
@@ -1306,15 +1349,15 @@ impl LibraryStore {
         let env_vars = if encrypted_set.is_empty() {
             template.env_vars.clone()
         } else {
-            let key = env_crypto::ensure_private_key().await
+            let key = env_crypto::ensure_private_key()
+                .await
                 .context("Failed to ensure encryption key for saving template")?;
             let mut result = HashMap::with_capacity(template.env_vars.len());
             for (k, v) in &template.env_vars {
                 if encrypted_set.contains(k) {
                     result.insert(
                         k.clone(),
-                        env_crypto::encrypt_value(&key, v)
-                            .context("Failed to encrypt env var")?,
+                        env_crypto::encrypt_value(&key, v).context("Failed to encrypt env var")?,
                     );
                 } else {
                     result.insert(k.clone(), v.clone());
@@ -1330,6 +1373,7 @@ impl LibraryStore {
             skills: template.skills.clone(),
             env_vars,
             encrypted_keys: template.encrypted_keys.clone(),
+            init_scripts: template.init_scripts.clone(),
             init_script: template.init_script.clone(),
             shared_network: template.shared_network,
             mcps: template.mcps.clone(),
@@ -1361,6 +1405,283 @@ impl LibraryStore {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Init Script Fragments (init-script/*/SCRIPT.sh)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// List all init script fragments with their summaries.
+    pub async fn list_init_scripts(&self) -> Result<Vec<InitScriptSummary>> {
+        let init_scripts_dir = self.path.join(INIT_SCRIPT_DIR);
+
+        if !init_scripts_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut scripts = Vec::new();
+        let mut entries = fs::read_dir(&init_scripts_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let entry_path = entry.path();
+
+            // Only process directories
+            if !entry_path.is_dir() {
+                continue;
+            }
+
+            let script_sh = entry_path.join("SCRIPT.sh");
+            if !script_sh.exists() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Read and extract description from first comment line
+            let content = fs::read_to_string(&script_sh).await.ok();
+            let description = content
+                .as_ref()
+                .and_then(|c| Self::extract_script_description(c));
+
+            scripts.push(InitScriptSummary {
+                name,
+                description,
+                path: format!(
+                    "{}/{}/SCRIPT.sh",
+                    INIT_SCRIPT_DIR,
+                    entry.file_name().to_string_lossy()
+                ),
+            });
+        }
+
+        // Sort by name
+        scripts.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(scripts)
+    }
+
+    /// Get an init script fragment by name with full content.
+    pub async fn get_init_script(&self, name: &str) -> Result<InitScript> {
+        Self::validate_name(name)?;
+        let script_dir = self.path.join(INIT_SCRIPT_DIR).join(name);
+        let script_sh = script_dir.join("SCRIPT.sh");
+
+        if !script_sh.exists() {
+            anyhow::bail!("Init script not found: {}", name);
+        }
+
+        let content = fs::read_to_string(&script_sh)
+            .await
+            .context("Failed to read SCRIPT.sh")?;
+
+        let description = Self::extract_script_description(&content);
+
+        Ok(InitScript {
+            name: name.to_string(),
+            description,
+            path: format!("{}/{}/SCRIPT.sh", INIT_SCRIPT_DIR, name),
+            content,
+        })
+    }
+
+    /// Save an init script fragment.
+    pub async fn save_init_script(&self, name: &str, content: &str) -> Result<()> {
+        Self::validate_name(name)?;
+
+        let script_dir = self.path.join(INIT_SCRIPT_DIR).join(name);
+        let script_sh = script_dir.join("SCRIPT.sh");
+
+        // Ensure directory exists
+        fs::create_dir_all(&script_dir).await?;
+
+        fs::write(&script_sh, content)
+            .await
+            .context("Failed to write SCRIPT.sh")?;
+
+        Ok(())
+    }
+
+    /// Delete an init script fragment and its directory.
+    pub async fn delete_init_script(&self, name: &str) -> Result<()> {
+        Self::validate_name(name)?;
+
+        let script_dir = self.path.join(INIT_SCRIPT_DIR).join(name);
+
+        if script_dir.exists() {
+            fs::remove_dir_all(&script_dir)
+                .await
+                .context("Failed to delete init script directory")?;
+        }
+
+        Ok(())
+    }
+
+    /// Assemble a combined init script from fragments, skill setup commands, and optional custom script.
+    /// Each fragment is prefixed with a header comment for debugging.
+    pub async fn assemble_init_script(
+        &self,
+        fragment_names: &[String],
+        custom_script: Option<&str>,
+        skill_setup_commands: Option<&[(String, Vec<String>)]>,
+    ) -> Result<String> {
+        let mut assembled = String::new();
+
+        // Add shebang
+        assembled.push_str("#!/usr/bin/env bash\n");
+        assembled.push_str("# Auto-assembled init script from fragments\n\n");
+
+        // Add each fragment
+        for name in fragment_names {
+            let script = self.get_init_script(name).await?;
+
+            // Add header for this fragment
+            assembled.push_str(&format!("\n# === {} ===\n", name));
+
+            // Strip shebang from fragment content if present
+            let content = if script.content.starts_with("#!") {
+                // Skip the first line (shebang)
+                script
+                    .content
+                    .lines()
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                script.content.clone()
+            };
+
+            assembled.push_str(&content);
+            assembled.push_str("\n");
+        }
+
+        // Add skill setup commands if provided
+        if let Some(skills) = skill_setup_commands {
+            let has_commands = skills.iter().any(|(_, cmds)| !cmds.is_empty());
+            if has_commands {
+                assembled.push_str("\n# === Skill Setup Commands ===\n");
+                assembled.push_str("# (npm commands auto-substituted to use bun if available)\n");
+                for (skill_name, commands) in skills {
+                    if !commands.is_empty() {
+                        assembled.push_str(&format!("# Skill: {}\n", skill_name));
+                        for cmd in commands {
+                            // Auto-substitute npm with bun for faster installs
+                            let cmd = Self::substitute_npm_with_bun(cmd);
+                            assembled.push_str(&cmd);
+                            assembled.push_str("\n");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add custom script at the end if provided
+        if let Some(custom) = custom_script {
+            let trimmed = custom.trim();
+            if !trimmed.is_empty() {
+                assembled.push_str("\n# === Custom Script ===\n");
+
+                // Strip shebang from custom script if present
+                let content = if trimmed.starts_with("#!") {
+                    trimmed.lines().skip(1).collect::<Vec<_>>().join("\n")
+                } else {
+                    trimmed.to_string()
+                };
+
+                assembled.push_str(&content);
+                assembled.push_str("\n");
+            }
+        }
+
+        Ok(assembled)
+    }
+
+    /// Collect setup commands from skills by name.
+    /// Returns a list of (skill_name, setup_commands) pairs.
+    pub async fn collect_skill_setup_commands(
+        &self,
+        skill_names: &[String],
+    ) -> Vec<(String, Vec<String>)> {
+        let mut result = Vec::new();
+        for name in skill_names {
+            match self.get_skill(name).await {
+                Ok(skill) => {
+                    if !skill.setup_commands.is_empty() {
+                        result.push((skill.name, skill.setup_commands));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        skill = %name,
+                        error = %e,
+                        "Failed to load skill for setup commands"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// Substitute npm commands with bun equivalents for faster package installation.
+    /// Generates a shell command that uses bun if available, falling back to npm.
+    fn substitute_npm_with_bun(cmd: &str) -> String {
+        // Check if this is an npm install command
+        let trimmed = cmd.trim();
+        if trimmed.starts_with("npm install") || trimmed.starts_with("npm i ") {
+            // Extract the rest of the command after "npm install" or "npm i"
+            let rest = if trimmed.starts_with("npm install") {
+                trimmed.strip_prefix("npm install").unwrap_or("")
+            } else {
+                trimmed.strip_prefix("npm i").unwrap_or("")
+            };
+
+            // Generate command that prefers bun but falls back to npm
+            format!(
+                "if command -v bun >/dev/null 2>&1; then bun install{}; else npm install{}; fi",
+                rest, rest
+            )
+        } else {
+            cmd.to_string()
+        }
+    }
+
+    /// Extract description from the first comment line after shebang.
+    /// Supports formats like:
+    /// - `# Description: Base logging and error handling`
+    /// - `# Base logging and error handling`
+    fn extract_script_description(content: &str) -> Option<String> {
+        for line in content.lines() {
+            let trimmed = line.trim();
+
+            // Skip shebang
+            if trimmed.starts_with("#!") {
+                continue;
+            }
+
+            // Skip empty lines
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // Found a comment line - extract description
+            if trimmed.starts_with('#') {
+                let comment = trimmed.trim_start_matches('#').trim();
+
+                // Handle "Description: ..." format
+                if let Some(desc) = comment.strip_prefix("Description:") {
+                    return Some(desc.trim().to_string());
+                }
+
+                // Otherwise use the whole comment as description
+                if !comment.is_empty() {
+                    return Some(comment.to_string());
+                }
+            }
+
+            // Non-comment, non-empty line - stop looking
+            break;
+        }
+
+        None
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // OpenCode Settings (opencode/oh-my-opencode.json)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -1370,16 +1691,97 @@ impl LibraryStore {
     /// Returns an empty object if neither file exists.
     pub async fn get_opencode_settings(&self) -> Result<serde_json::Value> {
         let path = self.path.join(OPENCODE_DIR).join("oh-my-opencode.json");
+        let system_path = Self::resolve_system_opencode_path();
 
-        if path.exists() {
+        let mut library_settings = if path.exists() {
             let content = fs::read_to_string(&path)
                 .await
                 .context("Failed to read opencode/oh-my-opencode.json")?;
-            return serde_json::from_str(&content).context("Failed to parse oh-my-opencode.json");
+            serde_json::from_str(&content).context("Failed to parse oh-my-opencode.json")?
+        } else {
+            serde_json::json!({})
+        };
+
+        let system_settings = if system_path.exists() {
+            let content = fs::read_to_string(&system_path)
+                .await
+                .context("Failed to read system oh-my-opencode.json")?;
+            Some(
+                serde_json::from_str::<serde_json::Value>(&content)
+                    .context("Failed to parse system oh-my-opencode.json")?,
+            )
+        } else {
+            None
+        };
+
+        if path.exists() {
+            let mut changed = false;
+
+            if !library_settings.is_object() {
+                library_settings = serde_json::json!({});
+                changed = true;
+            }
+
+            // If the library file is empty but the system config exists, prefer the system version.
+            if library_settings
+                .as_object()
+                .map(|o| o.is_empty())
+                .unwrap_or(true)
+            {
+                if let Some(system_settings) = system_settings.clone() {
+                    library_settings = system_settings;
+                    changed = true;
+                }
+            } else if let Some(system_settings) = system_settings.as_ref() {
+                // Merge missing agents from the system config (preserve library overrides).
+                if let Some(system_agents) =
+                    system_settings.get("agents").and_then(|v| v.as_object())
+                {
+                    let lib_agents = library_settings
+                        .get_mut("agents")
+                        .and_then(|v| v.as_object_mut());
+
+                    match lib_agents {
+                        Some(lib_agents) => {
+                            for (name, entry) in system_agents {
+                                if !lib_agents.contains_key(name) {
+                                    lib_agents.insert(name.clone(), entry.clone());
+                                    changed = true;
+                                }
+                            }
+                        }
+                        None => {
+                            if !system_agents.is_empty() {
+                                library_settings.as_object_mut().unwrap().insert(
+                                    "agents".to_string(),
+                                    serde_json::Value::Object(system_agents.clone()),
+                                );
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if changed {
+                let opencode_dir = self.path.join(OPENCODE_DIR);
+                if let Err(e) = fs::create_dir_all(&opencode_dir).await {
+                    tracing::warn!("Failed to create opencode directory in Library: {}", e);
+                } else if let Ok(content) = serde_json::to_string_pretty(&library_settings) {
+                    if let Err(e) = fs::write(&path, content).await {
+                        tracing::warn!("Failed to update oh-my-opencode.json in Library: {}", e);
+                    } else {
+                        tracing::info!(
+                            "Merged missing agents from system oh-my-opencode.json into Library"
+                        );
+                    }
+                }
+            }
+
+            return Ok(library_settings);
         }
 
         // Library file doesn't exist - try to copy from system location
-        let system_path = Self::resolve_system_opencode_path();
         if system_path.exists() {
             let content = fs::read_to_string(&system_path)
                 .await
@@ -1521,7 +1923,7 @@ impl LibraryStore {
         let _ = fs::create_dir_all(self.path.join(COMMAND_DIR)).await;
         let _ = fs::create_dir_all(self.path.join(AGENT_DIR)).await;
         let _ = fs::create_dir_all(self.path.join(TOOL_DIR)).await;
-        let _ = fs::create_dir_all(self.path.join(RULE_DIR)).await;
+        let _ = fs::create_dir_all(self.path.join(INIT_SCRIPT_DIR)).await;
 
         report.success = true;
         Ok(report)
@@ -1605,6 +2007,79 @@ impl LibraryStore {
 
         Ok(())
     }
+
+    #[cfg(test)]
+    async fn with_test_store(path: PathBuf) -> LibraryStore {
+        LibraryStore {
+            path,
+            remote: "test-remote".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod opencode_settings_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn merges_missing_agents_from_system_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let library_path = temp.path().join("library");
+        let system_path = temp.path().join("system");
+
+        tokio::fs::create_dir_all(library_path.join("opencode"))
+            .await
+            .expect("create library dir");
+        tokio::fs::create_dir_all(&system_path)
+            .await
+            .expect("create system dir");
+
+        let library_settings = serde_json::json!({
+            "agents": {
+                "sisyphus": { "model": "openai/gpt-4o-mini" }
+            }
+        });
+        tokio::fs::write(
+            library_path.join("opencode").join("oh-my-opencode.json"),
+            serde_json::to_string_pretty(&library_settings).unwrap(),
+        )
+        .await
+        .expect("write library settings");
+
+        let system_settings = serde_json::json!({
+            "agents": {
+                "sisyphus": { "model": "openai/gpt-4o-mini" },
+                "prometheus": { "model": "openai/gpt-4o" }
+            }
+        });
+        tokio::fs::write(
+            system_path.join("oh-my-opencode.json"),
+            serde_json::to_string_pretty(&system_settings).unwrap(),
+        )
+        .await
+        .expect("write system settings");
+
+        std::env::set_var("OPENCODE_CONFIG_DIR", &system_path);
+
+        let store = LibraryStore::with_test_store(library_path).await;
+        let merged = store.get_opencode_settings().await.expect("get settings");
+
+        let agents = merged.get("agents").and_then(|v| v.as_object()).unwrap();
+        assert!(agents.contains_key("sisyphus"));
+        assert!(agents.contains_key("prometheus"));
+
+        // Library file should be updated with prometheus.
+        let updated =
+            tokio::fs::read_to_string(temp.path().join("library/opencode/oh-my-opencode.json"))
+                .await
+                .expect("read updated library");
+        let updated_value: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        let updated_agents = updated_value
+            .get("agents")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(updated_agents.contains_key("prometheus"));
+    }
 }
 
 #[cfg(test)]
@@ -1669,5 +2144,203 @@ This is the body."#;
     #[test]
     fn test_validate_name_rejects_empty() {
         assert!(LibraryStore::validate_name("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod skill_encryption_tests {
+    use super::*;
+
+    /// Helper to set up a test encryption key
+    fn setup_test_key() {
+        let test_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        std::env::set_var(env_crypto::PRIVATE_KEY_ENV, test_key);
+    }
+
+    #[tokio::test]
+    async fn test_save_skill_encrypts_unversioned_tags() {
+        setup_test_key();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+
+        // Create skills directory
+        fs::create_dir_all(store.skills_dir()).await.unwrap();
+
+        // Save a skill with unversioned encrypted tag
+        let content = r#"---
+description: Test skill with secret
+---
+
+# Test Skill
+
+API Key: <encrypted>sk-secret-key-12345</encrypted>
+"#;
+
+        store.save_skill("test-skill", content).await.unwrap();
+
+        // Read the raw file from disk
+        let skill_md = store.skills_dir().join("test-skill").join("SKILL.md");
+        let raw_content = fs::read_to_string(&skill_md).await.unwrap();
+
+        // Verify the file has versioned (encrypted) tags, not plaintext
+        assert!(
+            raw_content.contains("<encrypted v=\"1\">"),
+            "File should contain versioned encrypted tag"
+        );
+        assert!(
+            !raw_content.contains("<encrypted>sk-secret-key-12345</encrypted>"),
+            "File should NOT contain plaintext secret"
+        );
+        assert!(
+            !raw_content.contains("sk-secret-key-12345"),
+            "Plaintext secret should not appear anywhere in file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_skill_decrypts_for_display() {
+        setup_test_key();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+
+        // Create skills directory
+        fs::create_dir_all(store.skills_dir()).await.unwrap();
+
+        // Save a skill with unversioned encrypted tag
+        let content = r#"---
+description: Test skill with secret
+---
+
+# Test Skill
+
+API Key: <encrypted>sk-secret-key-12345</encrypted>
+"#;
+
+        store.save_skill("test-skill", content).await.unwrap();
+
+        // Get the skill (should decrypt for display)
+        let skill = store.get_skill("test-skill").await.unwrap();
+
+        // The returned content should have unversioned tags with plaintext
+        assert!(
+            skill
+                .content
+                .contains("<encrypted>sk-secret-key-12345</encrypted>"),
+            "Skill content should show decrypted value in unversioned tag format"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_skill_file_processes_unversioned_tags() {
+        setup_test_key();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+
+        // Create skill directory and write file with unversioned tag (simulating git pull)
+        let skill_dir = store.skills_dir().join("imported-skill");
+        fs::create_dir_all(&skill_dir).await.unwrap();
+
+        let content = r#"---
+description: Imported skill
+---
+
+Secret: <encrypted>my-api-key</encrypted>
+"#;
+        fs::write(skill_dir.join("SKILL.md"), content)
+            .await
+            .unwrap();
+
+        // Encrypt the skill file
+        store.encrypt_skill_file("imported-skill").await.unwrap();
+
+        // Verify the file is now encrypted
+        let raw_content = fs::read_to_string(skill_dir.join("SKILL.md"))
+            .await
+            .unwrap();
+
+        assert!(
+            raw_content.contains("<encrypted v=\"1\">"),
+            "File should be encrypted after encrypt_skill_file"
+        );
+        assert!(
+            !raw_content.contains("<encrypted>my-api-key</encrypted>"),
+            "Plaintext should be replaced with ciphertext"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_all_skill_files() {
+        setup_test_key();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+
+        // Create multiple skills with unversioned tags
+        let skills_dir = store.skills_dir();
+        fs::create_dir_all(&skills_dir).await.unwrap();
+
+        for name in ["skill-a", "skill-b"] {
+            let skill_dir = skills_dir.join(name);
+            fs::create_dir_all(&skill_dir).await.unwrap();
+            let content = format!(
+                "---\ndescription: {}\n---\n\nKey: <encrypted>secret-{}</encrypted>\n",
+                name, name
+            );
+            fs::write(skill_dir.join("SKILL.md"), content)
+                .await
+                .unwrap();
+        }
+
+        // Encrypt all skills
+        store.encrypt_all_skill_files().await.unwrap();
+
+        // Verify both are encrypted
+        for name in ["skill-a", "skill-b"] {
+            let raw = fs::read_to_string(skills_dir.join(name).join("SKILL.md"))
+                .await
+                .unwrap();
+            assert!(
+                raw.contains("<encrypted v=\"1\">"),
+                "Skill {} should be encrypted",
+                name
+            );
+            assert!(
+                !raw.contains(&format!("secret-{}", name)),
+                "Skill {} should not have plaintext secret",
+                name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_already_encrypted_not_double_encrypted() {
+        setup_test_key();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LibraryStore::with_test_store(temp.path().to_path_buf()).await;
+
+        fs::create_dir_all(store.skills_dir()).await.unwrap();
+
+        // Save a skill (gets encrypted)
+        let content = "---\ndescription: test\n---\n\nKey: <encrypted>secret</encrypted>\n";
+        store.save_skill("test-skill", content).await.unwrap();
+
+        // Read the encrypted content
+        let skill_md = store.skills_dir().join("test-skill").join("SKILL.md");
+        let first_save = fs::read_to_string(&skill_md).await.unwrap();
+
+        // Save again (should not change)
+        store.save_skill("test-skill", content).await.unwrap();
+        let second_save = fs::read_to_string(&skill_md).await.unwrap();
+
+        // Both saves should produce encrypted content (though ciphertext may differ due to random nonce)
+        assert!(first_save.contains("<encrypted v=\"1\">"));
+        assert!(second_save.contains("<encrypted v=\"1\">"));
+
+        // The number of encrypted tags should be the same
+        let count1 = first_save.matches("<encrypted v=\"1\">").count();
+        let count2 = second_save.matches("<encrypted v=\"1\">").count();
+        assert_eq!(
+            count1, count2,
+            "Should not create additional encrypted tags"
+        );
     }
 }

@@ -1,6 +1,7 @@
 export default {
   index: "Overview",
   setup: "Setup",
+  "install-docker": "Docker Install",
   "first-mission": "First Mission",
   "-- Concepts": {
     type: "separator",

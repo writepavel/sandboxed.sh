@@ -11,11 +11,8 @@ import { CopyButton } from "@/components/ui/copy-button";
 import { RelativeTime } from "@/components/ui/relative-time";
 import { AgentTreeCanvas, type AgentNode } from "@/components/agent-tree";
 import {
-  CheckCircle,
-  XCircle,
   Clock,
   Loader,
-  Ban,
   ArrowRight,
   Search,
   MessageSquare,
@@ -28,18 +25,7 @@ import {
   Trash2,
   Sparkles,
 } from "lucide-react";
-
-const statusIcons: Record<string, typeof Clock> = {
-  pending: Clock,
-  running: Loader,
-  completed: CheckCircle,
-  failed: XCircle,
-  cancelled: Ban,
-  active: Clock,
-  interrupted: Ban,
-  blocked: Ban,
-  not_feasible: XCircle,
-};
+import { getStatusIcon } from "@/components/ui/status-icons";
 
 const statusConfig: Record<string, { color: string; bg: string }> = {
   pending: { color: "text-amber-400", bg: "bg-amber-500/10" },
@@ -425,7 +411,7 @@ export default function HistoryPage() {
                   </thead>
                   <tbody className="divide-y divide-white/[0.04]">
                     {filteredMissions.map((mission) => {
-                      const Icon = statusIcons[mission.status] || Target;
+                      const Icon = getStatusIcon(mission.status, Target);
                       const config = statusConfig[mission.status] || statusConfig.active;
                       const title = mission.title || "Untitled Mission";
                       const displayTitle = title.length > 80 ? title.slice(0, 80) + "..." : title;

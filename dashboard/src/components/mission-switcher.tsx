@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { Search, XCircle, Check, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { type Mission, type MissionStatus, type RunningMissionInfo } from '@/lib/api';
+import { STATUS_DOT_COLORS, STATUS_LABELS, getMissionDotColor, getMissionTitle } from '@/lib/mission-status';
 
 interface MissionSwitcherProps {
   open: boolean;
@@ -17,40 +18,6 @@ interface MissionSwitcherProps {
   onRefresh?: () => void;
 }
 
-function missionStatusDotClass(status: MissionStatus): string {
-  switch (status) {
-    case 'active':
-      return 'bg-emerald-400';
-    case 'completed':
-      return 'bg-emerald-400';
-    case 'failed':
-      return 'bg-red-400';
-    case 'interrupted':
-      return 'bg-amber-400';
-    case 'blocked':
-      return 'bg-orange-400';
-    case 'not_feasible':
-      return 'bg-rose-400';
-  }
-}
-
-function missionStatusLabel(status: MissionStatus): string {
-  switch (status) {
-    case 'active':
-      return 'Active';
-    case 'completed':
-      return 'Completed';
-    case 'failed':
-      return 'Failed';
-    case 'interrupted':
-      return 'Interrupted';
-    case 'blocked':
-      return 'Blocked';
-    case 'not_feasible':
-      return 'Not Feasible';
-  }
-}
-
 function getMissionDisplayName(mission: Mission): string {
   const parts: string[] = [];
   if (mission.workspace_name) parts.push(mission.workspace_name);
@@ -60,14 +27,7 @@ function getMissionDisplayName(mission: Mission): string {
 }
 
 function getMissionDescription(mission: Mission): string {
-  if (mission.title) return mission.title;
-  // Get first user message from history as fallback
-  const firstUserMessage = mission.history?.find(h => h.role === 'user');
-  if (firstUserMessage?.content) {
-    const content = firstUserMessage.content.trim();
-    return content.length > 60 ? content.slice(0, 60) + '...' : content;
-  }
-  return '';
+  return getMissionTitle(mission, { maxLength: 60, fallback: '' });
 }
 
 export function MissionSwitcher({
@@ -366,9 +326,7 @@ export function MissionSwitcher({
                           className={cn(
                             'h-2 w-2 rounded-full shrink-0',
                             mission
-                              ? missionStatusDotClass(mission.status)
-                              : isRunning
-                              ? 'bg-emerald-400'
+                              ? getMissionDotColor(mission.status, isRunning)
                               : 'bg-gray-400',
                             isRunning &&
                               runningInfo?.state === 'running' &&
@@ -405,7 +363,7 @@ export function MissionSwitcher({
                           : isRunning
                           ? runningInfo?.state || 'running'
                           : mission
-                          ? missionStatusLabel(mission.status)
+                          ? STATUS_LABELS[mission.status]
                           : ''}
                       </span>
 
