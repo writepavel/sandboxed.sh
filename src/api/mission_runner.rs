@@ -4463,11 +4463,9 @@ pub async fn run_opencode_turn(
             "npx".to_string()
         } else {
             let err_msg =
-                "No OpenCode CLI runner found in workspace (expected bunx or npx)."
-                    .to_string();
+                "No OpenCode CLI runner found in workspace (expected bunx or npx).".to_string();
             tracing::error!("{}", err_msg);
-            return AgentResult::failure(err_msg, 0)
-                .with_terminal_reason(TerminalReason::LlmError);
+            return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
     };
 

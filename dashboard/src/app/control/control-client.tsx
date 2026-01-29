@@ -3504,8 +3504,7 @@ export default function ControlClient() {
   };
 
   // Handle resuming an interrupted mission
-  // cleanWorkspace parameter is reserved for future use (workspace cleanup before resume)
-  const handleResumeMission = async (_cleanWorkspace?: boolean) => {
+  const handleResumeMission = async () => {
     const mission = viewingMission ?? currentMission;
     if (!mission || !["interrupted", "blocked", "failed"].includes(mission.status)) return;
     try {
@@ -3519,7 +3518,13 @@ export default function ControlClient() {
       setItems(basicItems);
       updateMissionItems(resumed.id, basicItems);
       refreshRecentMissions();
-      toast.success(mission.status === "blocked" ? "Continuing mission" : "Mission resumed");
+      toast.success(
+        mission.status === "blocked"
+          ? "Continuing mission"
+          : mission.status === "failed"
+            ? "Retrying mission"
+            : "Mission resumed"
+      );
       // Load full events in background (including tool calls)
       getMissionEvents(resumed.id)
         .then((events) => {

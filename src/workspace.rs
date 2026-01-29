@@ -2602,7 +2602,9 @@ pub async fn prepare_mission_workspace_with_skills_backend(
                                             );
                                         }
                                     }
-                                    if let Err(e) = tokio::fs::write(&dest_path, &patched_content).await {
+                                    if let Err(e) =
+                                        tokio::fs::write(&dest_path, &patched_content).await
+                                    {
                                         tracing::warn!(
                                             mission = %mission_id,
                                             workspace = %workspace.name,
@@ -3710,7 +3712,9 @@ fn patch_opencode_agent_models_for_oauth(content: &str) -> String {
             // Remove "variant" field (e.g., "max" for extended thinking) as it's not supported
             if agent_obj.remove("variant").is_some() {
                 patched = true;
-                tracing::info!("Removed 'variant' field from Anthropic agent for OAuth compatibility");
+                tracing::info!(
+                    "Removed 'variant' field from Anthropic agent for OAuth compatibility"
+                );
             }
         }
     }
