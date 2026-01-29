@@ -36,7 +36,6 @@ import {
   Pencil,
   Search,
   Globe,
-  Link2,
   Package,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -755,7 +754,7 @@ export default function SkillsPage() {
   const [registrySearch, setRegistrySearch] = useState('');
   const [registryResults, setRegistryResults] = useState<RegistrySkillListing[]>([]);
   const [searchingRegistry, setSearchingRegistry] = useState(false);
-  const [installingSkill, setInstallingSkill] = useState<string | null>(null);
+  const [installingSkills, setInstallingSkills] = useState<Set<string>>(new Set());
 
   // Dialog state
   const [showNewSkillDialog, setShowNewSkillDialog] = useState(false);
@@ -1069,9 +1068,18 @@ Describe what this skill does.
     }, 300);
   }, []);
 
+  // Cleanup debounce timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const handleInstallFromRegistry = async (identifier: string, skillName: string) => {
     const skillKey = `${identifier}@${skillName}`;
-    setInstallingSkill(skillKey);
+    setInstallingSkills(prev => new Set(prev).add(skillKey));
     try {
       const skill = await installFromRegistry({ identifier, skills: [skillName] });
       await refresh();
@@ -1080,7 +1088,11 @@ Describe what this skill does.
     } catch (err) {
       console.error('Failed to install skill:', err);
     } finally {
-      setInstallingSkill(null);
+      setInstallingSkills(prev => {
+        const next = new Set(prev);
+        next.delete(skillKey);
+        return next;
+      });
     }
   };
 
@@ -1342,7 +1354,7 @@ Describe what this skill does.
                     registryResults.map((result) => {
                       const skillKey = `${result.identifier}@${result.name}`;
                       const installed = isSkillInstalled(result.identifier, result.name);
-                      const installing = installingSkill === skillKey;
+                      const installing = installingSkills.has(skillKey);
                       return (
                         <div
                           key={skillKey}
