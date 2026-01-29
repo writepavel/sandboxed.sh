@@ -108,7 +108,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/components", get(get_components))
         .route("/components/:name/update", post(update_component))
         .route("/plugins/installed", get(get_installed_plugins))
-        .route("/plugins/:package/update", post(update_plugin))
+        .route("/plugins/:package/update", get(update_plugin))
 }
 
 /// Get information about all system components.
