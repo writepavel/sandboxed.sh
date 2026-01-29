@@ -328,10 +328,10 @@ async fn check_amp_update(current_version: Option<&str>) -> Option<String> {
     let current_raw = current_version?;
     let current = extract_version_token(current_raw)?;
 
-    // Check npm registry for @anthropic-ai/amp (note: actual package name may differ)
+    // Check npm registry for @sourcegraph/amp
     let client = reqwest::Client::new();
     let resp = client
-        .get("https://registry.npmjs.org/@anthropic-ai/amp/latest")
+        .get("https://registry.npmjs.org/@sourcegraph/amp/latest")
         .header("User-Agent", "open-agent")
         .send()
         .await
@@ -971,10 +971,10 @@ fn stream_claude_code_update() -> impl Stream<Item = Result<Event, std::convert:
 fn stream_amp_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     async_stream::stream! {
         yield sse("log", "Starting Amp update...", Some(0));
-        yield sse("log", "Running npm install -g @anthropic-ai/amp@latest...", Some(20));
+        yield sse("log", "Running npm install -g @sourcegraph/amp@latest...", Some(20));
 
         match Command::new("npm")
-            .args(["install", "-g", "@anthropic-ai/amp@latest"])
+            .args(["install", "-g", "@sourcegraph/amp@latest"])
             .output()
             .await
         {
