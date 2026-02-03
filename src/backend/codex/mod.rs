@@ -144,6 +144,38 @@ fn convert_codex_event(
 ) -> Vec<ExecutionEvent> {
     let mut results = vec![];
 
+    let mut emit_text_delta = |item_id: &str, text: &str| {
+        let last_content = item_content_cache.get(item_id);
+        let new_content = if let Some(last) = last_content {
+            if text.starts_with(last) {
+                text[last.len()..].to_string()
+            } else {
+                text.to_string()
+            }
+        } else {
+            text.to_string()
+        };
+
+        if !new_content.is_empty() {
+            results.push(ExecutionEvent::TextDelta {
+                content: new_content,
+            });
+        }
+
+        item_content_cache.insert(item_id.to_string(), text.to_string());
+    };
+
+    let mut emit_thinking_if_changed = |item_id: &str, text: &str| {
+        if item_content_cache.get(item_id).map(|v| v.as_str()) == Some(text) {
+            return;
+        }
+
+        results.push(ExecutionEvent::Thinking {
+            content: text.to_string(),
+        });
+        item_content_cache.insert(item_id.to_string(), text.to_string());
+    };
+
     match event {
         CodexEvent::ThreadStarted { thread_id } => {
             debug!("Codex thread started: thread_id={}", thread_id);
@@ -173,37 +205,13 @@ fn convert_codex_event(
                 "message" | "agent_message" | "assistant_message" => {
                     // Extract message content
                     if let Some(text) = extract_text_field(&item.data) {
-                        // Check if this is new content or an update
-                        let last_content = item_content_cache.get(&item.id);
-                        let new_content = if let Some(last) = last_content {
-                            // ItemUpdated: only emit the delta (new text)
-                            if text.starts_with(last) {
-                                text[last.len()..].to_string()
-                            } else {
-                                // Content was replaced, emit full text
-                                text.to_string()
-                            }
-                        } else {
-                            // ItemCreated: emit full text
-                            text.to_string()
-                        };
-
-                        if !new_content.is_empty() {
-                            results.push(ExecutionEvent::TextDelta {
-                                content: new_content,
-                            });
-                        }
-
-                        // Update cache with current full content
-                        item_content_cache.insert(item.id.clone(), text.to_string());
+                        emit_text_delta(&item.id, text);
                     }
                 }
                 "reasoning" | "thinking" => {
                     // Extract thinking/reasoning content
                     if let Some(text) = extract_text_field(&item.data) {
-                        results.push(ExecutionEvent::Thinking {
-                            content: text.to_string(),
-                        });
+                        emit_thinking_if_changed(&item.id, text);
                     }
                 }
                 "command" | "tool" => {
@@ -240,16 +248,12 @@ fn convert_codex_event(
                 }
                 "message" | "agent_message" | "assistant_message" => {
                     if let Some(text) = extract_text_field(&item.data) {
-                        results.push(ExecutionEvent::TextDelta {
-                            content: text.to_string(),
-                        });
+                        emit_text_delta(&item.id, text);
                     }
                 }
                 "reasoning" | "thinking" => {
                     if let Some(text) = extract_text_field(&item.data) {
-                        results.push(ExecutionEvent::Thinking {
-                            content: text.to_string(),
-                        });
+                        emit_thinking_if_changed(&item.id, text);
                     }
                 }
                 _ => {}

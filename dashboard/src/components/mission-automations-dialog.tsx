@@ -46,11 +46,20 @@ export function MissionAutomationsDialog({
   onClose,
 }: MissionAutomationsDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const requestIdRef = useRef(0);
+  const cacheRef = useRef<Map<string, Automation[]>>(new Map());
+  const automationsRef = useRef<Automation[]>([]);
   const { commands, loading: commandsLoading, libraryUnavailable } = useLibrary();
 
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [loading, setLoading] = useState(false);
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const [loadedMissionId, setLoadedMissionId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    automationsRef.current = automations;
+  }, [automations]);
 
   const [commandName, setCommandName] = useState('');
   const [intervalValue, setIntervalValue] = useState('5');
@@ -72,29 +81,72 @@ export function MissionAutomationsDialog({
     return Math.round(value * unitMultiplier);
   }, [intervalValue, intervalUnit]);
 
-  const loadAutomations = useCallback(async () => {
+  const setAutomationsForMission = useCallback(
+    (targetMissionId: string, nextAutomations: Automation[]) => {
+      cacheRef.current.set(targetMissionId, nextAutomations);
+      setAutomations(nextAutomations);
+      setHasLoaded(true);
+      setLoadedMissionId(targetMissionId);
+    },
+    []
+  );
+
+  const loadAutomations = useCallback(async (force = false) => {
     if (!missionId) {
       setAutomations([]);
+      setHasLoaded(false);
+      setLoadedMissionId(null);
       return;
     }
+    const cached = cacheRef.current.get(missionId);
+    if (cached && !force) {
+      setAutomationsForMission(missionId, cached);
+      return;
+    }
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
     setLoading(true);
     setError(null);
     try {
       const data = await listMissionAutomations(missionId);
-      setAutomations(data);
+      if (requestIdRef.current !== requestId) return;
+      setAutomationsForMission(missionId, data);
     } catch (err) {
+      if (requestIdRef.current !== requestId) return;
       const message = err instanceof Error ? err.message : 'Failed to load automations';
       setError(message);
+      setHasLoaded(true);
+      setLoadedMissionId(missionId);
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) {
+        setLoading(false);
+      }
     }
-  }, [missionId]);
+  }, [missionId, setAutomationsForMission]);
 
   useEffect(() => {
-    if (open) {
+    if (!open) return;
+    if (!missionId) {
+      setAutomations([]);
+      setHasLoaded(false);
+      setLoadedMissionId(null);
+      return;
+    }
+    if (missionId !== loadedMissionId) {
+      const cached = cacheRef.current.get(missionId);
+      if (cached) {
+        setAutomationsForMission(missionId, cached);
+      } else {
+        setAutomations([]);
+        setHasLoaded(false);
+        void loadAutomations();
+      }
+      return;
+    }
+    if (!hasLoaded) {
       void loadAutomations();
     }
-  }, [open, loadAutomations]);
+  }, [open, missionId, loadedMissionId, hasLoaded, loadAutomations, setAutomationsForMission]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -144,7 +196,10 @@ export function MissionAutomationsDialog({
       if (!createActive) {
         created = await updateAutomationActive(created.id, false);
       }
-      setAutomations((prev) => [created, ...prev.filter((a) => a.id !== created.id)]);
+      setAutomationsForMission(
+        missionId,
+        [created, ...automationsRef.current.filter((a) => a.id !== created.id)]
+      );
       setCommandName('');
       setIntervalValue('5');
       setIntervalUnit('minutes');
@@ -162,7 +217,14 @@ export function MissionAutomationsDialog({
     setTogglingId(automation.id);
     try {
       const updated = await updateAutomationActive(automation.id, nextActive);
-      setAutomations((prev) => prev.map((item) => (item.id === automation.id ? updated : item)));
+      if (missionId) {
+        const next = automationsRef.current.map((item) =>
+          item.id === automation.id ? updated : item
+        );
+        setAutomationsForMission(missionId, next);
+      } else {
+        setAutomations((prev) => prev.map((item) => (item.id === automation.id ? updated : item)));
+      }
       toast.success(nextActive ? 'Automation enabled' : 'Automation paused');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to update automation';
@@ -177,7 +239,12 @@ export function MissionAutomationsDialog({
     setDeleting(true);
     try {
       await deleteAutomation(pendingDelete.id);
-      setAutomations((prev) => prev.filter((item) => item.id !== pendingDelete.id));
+      if (missionId) {
+        const next = automationsRef.current.filter((item) => item.id !== pendingDelete.id);
+        setAutomationsForMission(missionId, next);
+      } else {
+        setAutomations((prev) => prev.filter((item) => item.id !== pendingDelete.id));
+      }
       toast.success('Automation deleted');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to delete automation';
@@ -194,6 +261,11 @@ export function MissionAutomationsDialog({
     !creating &&
     commandName.trim().length > 0 &&
     intervalSeconds > 0;
+
+  const isMissionDataReady = !!missionId && loadedMissionId === missionId;
+  const showLoadingPlaceholder = !!missionId && (!isMissionDataReady || (loading && !hasLoaded));
+  const visibleAutomations = isMissionDataReady ? automations : [];
+  const visibleError = isMissionDataReady ? error : null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -236,7 +308,7 @@ export function MissionAutomationsDialog({
                     Create Automation
                   </div>
                   <button
-                    onClick={loadAutomations}
+                    onClick={() => loadAutomations(true)}
                     className="flex items-center gap-2 text-xs text-white/50 hover:text-white/80 transition-colors"
                   >
                     <RefreshCw className={cn('h-3 w-3', loading && 'animate-spin')} />
@@ -353,20 +425,26 @@ export function MissionAutomationsDialog({
                   )}
                 </div>
 
-                {error && (
+                {visibleError && (
                   <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200">
-                    {error}
+                    {visibleError}
                   </div>
                 )}
 
-                {!loading && automations.length === 0 && !error && (
+                {showLoadingPlaceholder && (
+                  <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6 text-center text-sm text-white/40">
+                    Loading automations…
+                  </div>
+                )}
+
+                {isMissionDataReady && !loading && visibleAutomations.length === 0 && !visibleError && (
                   <div className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-6 text-center text-sm text-white/40">
                     No automations yet. Create one to start scheduled command runs.
                   </div>
                 )}
 
                 <div className="space-y-2">
-                  {automations.map((automation) => {
+                  {visibleAutomations.map((automation) => {
                     const command = commandsByName.get(automation.command_name);
                     const lastRunLabel = automation.last_triggered_at
                       ? formatRelativeTime(new Date(automation.last_triggered_at))

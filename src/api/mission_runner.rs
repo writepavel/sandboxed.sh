@@ -2142,11 +2142,7 @@ pub fn run_claudecode_turn<'a>(
                                                                 },
                                                             );
                                                             thinking_emitted = true;
-                                                            if !cleaned.is_empty() {
-                                                                final_result = cleaned;
-                                                            } else {
-                                                                final_result = text;
-                                                            }
+                                                            final_result = cleaned;
                                                         } else {
                                                             final_result = text;
                                                         }
@@ -6351,11 +6347,7 @@ pub async fn run_amp_turn(
                                                             },
                                                         );
                                                         thinking_streamed = true;
-                                                        if !cleaned.is_empty() {
-                                                            final_result = cleaned;
-                                                        } else {
-                                                            final_result = text;
-                                                        }
+                                                        final_result = cleaned;
                                                     } else {
                                                         final_result = text;
                                                     }
@@ -6834,9 +6826,7 @@ pub async fn run_codex_turn(
             });
             thinking_emitted = true;
             thinking_done_emitted = true;
-            if !cleaned.is_empty() {
-                assistant_message = cleaned;
-            }
+            assistant_message = cleaned;
         }
     }
 
