@@ -411,6 +411,7 @@ export function NewMissionDialog({
         router.push(url);
         setOpen(false);
         resetForm();
+        onClose?.();
       }
     } finally {
       setSubmitting(false);

@@ -54,6 +54,7 @@ const encryptedTagHighlighter = ViewPlugin.fromClass(
       const builder = new RangeSetBuilder<Decoration>();
       const failedRegex = /<encrypted-failed(?:\s+v="\d+")?>[\s\S]*?<\/encrypted-failed>/gi;
       const encryptedRegex = /<encrypted(?:\s+v="\d+")?>[\s\S]*?<\/encrypted>/gi;
+      const ranges: Array<{ from: number; to: number; deco: Decoration }> = [];
 
       for (const { from, to } of view.visibleRanges) {
         const text = view.state.doc.sliceString(from, to);
@@ -61,14 +62,19 @@ const encryptedTagHighlighter = ViewPlugin.fromClass(
           if (match.index === undefined) continue;
           const start = from + match.index;
           const end = start + match[0].length;
-          builder.add(start, end, encryptedFailedTag);
+          ranges.push({ from: start, to: end, deco: encryptedFailedTag });
         }
         for (const match of text.matchAll(encryptedRegex)) {
           if (match.index === undefined) continue;
           const start = from + match.index;
           const end = start + match[0].length;
-          builder.add(start, end, encryptedTag);
+          ranges.push({ from: start, to: end, deco: encryptedTag });
         }
+      }
+
+      ranges.sort((a, b) => (a.from === b.from ? a.to - b.to : a.from - b.from));
+      for (const range of ranges) {
+        builder.add(range.from, range.to, range.deco);
       }
 
       return builder.finish();
