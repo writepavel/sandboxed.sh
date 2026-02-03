@@ -1323,10 +1323,12 @@ pub async fn create_mission(
     }
 
     // Validate agent exists before creating mission (fail fast with clear error)
-    // Skip validation for Claude Code and Amp - they have their own built-in agents
+    // Skip validation for Claude Code, Amp, and Codex - they have their own built-in agents
     if let Some(ref agent_name) = agent {
         let backend_id = backend.as_deref();
-        let skip_validation = backend_id == Some("claudecode") || backend_id == Some("amp");
+        let skip_validation = backend_id == Some("claudecode")
+            || backend_id == Some("amp")
+            || backend_id == Some("codex");
         if !skip_validation {
             super::library::validate_agent_exists(&state, agent_name)
                 .await
@@ -2331,7 +2333,11 @@ async fn automation_scheduler_loop(
             let automations = match mission_store.get_mission_automations(mission.id).await {
                 Ok(automations) => automations,
                 Err(e) => {
-                    tracing::debug!("Failed to get automations for mission {}: {}", mission.id, e);
+                    tracing::debug!(
+                        "Failed to get automations for mission {}: {}",
+                        mission.id,
+                        e
+                    );
                     continue;
                 }
             };
@@ -2339,10 +2345,12 @@ async fn automation_scheduler_loop(
             // Filter to active automations only
             for automation in automations.into_iter().filter(|a| a.active) {
                 // Check if enough time has passed since last trigger
-                let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
+                let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at
+                {
                     match chrono::DateTime::parse_from_rfc3339(last_triggered) {
                         Ok(last_time) => {
-                            let elapsed = chrono::Utc::now().signed_duration_since(last_time.with_timezone(&chrono::Utc));
+                            let elapsed = chrono::Utc::now()
+                                .signed_duration_since(last_time.with_timezone(&chrono::Utc));
                             elapsed.num_seconds() >= automation.interval_seconds as i64
                         }
                         Err(_) => true, // If we can't parse, trigger anyway
@@ -2359,17 +2367,27 @@ async fn automation_scheduler_loop(
                 // Check if the mission is currently busy (has a running task or queued messages)
                 let is_busy = {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    if cmd_tx.send(ControlCommand::ListRunning { respond: tx }).await.is_err() {
-                        tracing::warn!("Failed to send ListRunning command for automation busy check");
+                    if cmd_tx
+                        .send(ControlCommand::ListRunning { respond: tx })
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            "Failed to send ListRunning command for automation busy check"
+                        );
                         continue;
                     }
                     match rx.await {
                         Ok(running) => running.iter().any(|r| {
                             r.mission_id == mission.id
-                                && (r.queue_len > 0 || r.state == "running" || r.state == "waiting_for_tool")
+                                && (r.queue_len > 0
+                                    || r.state == "running"
+                                    || r.state == "waiting_for_tool")
                         }),
                         Err(_) => {
-                            tracing::warn!("Failed to receive ListRunning response for automation busy check");
+                            tracing::warn!(
+                                "Failed to receive ListRunning response for automation busy check"
+                            );
                             continue;
                         }
                     }
@@ -2428,7 +2446,9 @@ async fn automation_scheduler_loop(
                 }
 
                 // Update last triggered time
-                if let Err(e) = mission_store.update_automation_last_triggered(automation.id).await
+                if let Err(e) = mission_store
+                    .update_automation_last_triggered(automation.id)
+                    .await
                 {
                     tracing::warn!("Failed to update automation last triggered time: {}", e);
                 }
@@ -2498,13 +2518,12 @@ async fn control_actor_loop(
         paths
     }
 
-    // Helper to persist history to current mission
-    async fn persist_mission_history(
+    // Helper to persist history to a specific mission ID
+    async fn persist_mission_history_to(
         mission_store: &Arc<dyn MissionStore>,
-        current_mission: &Arc<RwLock<Option<Uuid>>>,
+        mission_id: Option<Uuid>,
         history: &[(String, String)],
     ) {
-        let mission_id = current_mission.read().await.clone();
         if let Some(mid) = mission_id {
             let entries: Vec<MissionHistoryEntry> = history
                 .iter()
@@ -2550,6 +2569,16 @@ async fn control_actor_loop(
                 }
             }
         }
+    }
+
+    // Helper to persist history to current mission (wrapper for backwards compatibility)
+    async fn persist_mission_history(
+        mission_store: &Arc<dyn MissionStore>,
+        current_mission: &Arc<RwLock<Option<Uuid>>>,
+        history: &[(String, String)],
+    ) {
+        let mission_id = current_mission.read().await.clone();
+        persist_mission_history_to(mission_store, mission_id, history).await;
     }
 
     fn parse_tool_result_object(result: &serde_json::Value) -> Option<serde_json::Value> {
@@ -3060,7 +3089,7 @@ async fn control_actor_loop(
 
                                 // Immediately persist user message so it's visible when loading mission
                                 history.push(("user".to_string(), msg.clone()));
-                                persist_mission_history(&mission_store, &current_mission, &history)
+                                persist_mission_history_to(&mission_store, msg_target_mid, &history)
                                     .await;
 
                                 let cfg = config.clone();
@@ -4025,7 +4054,7 @@ async fn control_actor_loop(
 
                     // Immediately persist user message so it's visible when loading mission
                     history.push(("user".to_string(), msg.clone()));
-                    persist_mission_history(&mission_store, &current_mission, &history)
+                    persist_mission_history_to(&mission_store, msg_target_mid, &history)
                         .await;
 
                     let cfg = config.clone();
@@ -4164,7 +4193,7 @@ async fn control_actor_loop(
                             // If runner has no more queued messages, update status and mark for cleanup
                             if runner.queue.is_empty() && !runner.is_running() {
                                 // Only update status if agent hasn't already set a terminal status
-                                if let Ok(mission) = mission_store.get_mission(*mission_id).await {
+                                if let Ok(Some(mission)) = mission_store.get_mission(*mission_id).await {
                                     let should_update = matches!(
                                         mission.status,
                                         MissionStatus::Pending | MissionStatus::Active
@@ -4586,8 +4615,8 @@ async fn run_single_control_turn(
             config.default_model = Some(default_model);
         }
     }
-    if let Some(agent) = agent_override {
-        config.opencode_agent = Some(agent);
+    if let Some(ref agent) = agent_override {
+        config.opencode_agent = Some(agent.clone());
     }
     // Ensure a workspace directory for this mission (if applicable).
     let (working_dir_path, runtime_workspace) = if let Some(mid) = mission_id {
@@ -4749,6 +4778,36 @@ async fn run_single_control_turn(
             )
             .await
         }
+        Some("codex") => {
+            let mid = match mission_id {
+                Some(id) => id,
+                None => {
+                    let _ = events_tx.send(AgentEvent::Error {
+                        message: "Codex backend requires a mission ID".to_string(),
+                        mission_id: None,
+                        resumable: false,
+                    });
+                    return crate::agents::AgentResult::failure(
+                        "Codex backend requires a mission ID".to_string(),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::LlmError);
+                }
+            };
+            super::mission_runner::run_codex_turn(
+                exec_workspace,
+                &ctx.working_dir,
+                &user_message,
+                config.default_model.as_deref(),
+                agent_override.as_deref(),
+                mid,
+                events_tx.clone(),
+                cancel,
+                &config.working_dir,
+                session_id.as_deref(),
+            )
+            .await
+        }
         Some(backend) if backend != "opencode" => {
             let _ = events_tx.send(AgentEvent::Error {
                 message: format!("Unsupported backend: {}", backend),
@@ -4820,7 +4879,7 @@ pub async fn create_automation(
     // Validate the command exists in the library
     if let Some(lib) = state.library.read().await.as_ref() {
         match lib.get_command(&req.command_name).await {
-            Ok(_) => {}, // Command exists, continue
+            Ok(_) => {} // Command exists, continue
             Err(e) => {
                 // Check if it's a "not found" error
                 let error_msg = e.to_string();

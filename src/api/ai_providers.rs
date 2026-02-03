@@ -694,6 +694,90 @@ pub fn is_anthropic_configured_for_claudecode(working_dir: &Path) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// OpenAI/Codex Backend Access
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Codex authentication material (same as Claude Code auth).
+pub type CodexAuth = ClaudeCodeAuth;
+
+/// Get the OpenAI API key or OAuth access token for the Codex backend.
+///
+/// This checks if the OpenAI provider has "codex" in its use_for_backends
+/// configuration and returns the API key or OAuth access token if available.
+///
+/// Credential sources checked (in order):
+/// 1. OpenCode auth.json (API key or OAuth)
+/// 2. Open Agent ai_providers.json (API key or OAuth)
+///
+/// Returns None if:
+/// - OpenAI provider is not configured for codex
+/// - No credentials are available (neither API key nor OAuth)
+/// - Any error occurs reading the config
+
+/// Get OpenAI auth from OpenCode auth.json (shared with OpenCode).
+
+/// Write Codex config.toml from explicit OAuth values.
+fn write_codex_config_from_entry(
+    config_dir: &std::path::Path,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    if let Err(e) = std::fs::create_dir_all(config_dir) {
+        return Err(format!("Failed to create Codex config dir: {}", e));
+    }
+
+    let config_path = config_dir.join("config.toml");
+    let contents = format!(
+        "[auth]\ntype = \"oauth\"\naccess_token = \"{}\"\nrefresh_token = \"{}\"\n",
+        access_token, refresh_token
+    );
+
+    let mut file = std::fs::File::create(&config_path)
+        .map_err(|e| format!("Failed to create Codex config.toml: {}", e))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|e| format!("Failed to write Codex config.toml: {}", e))?;
+
+    tracing::debug!("Wrote Codex config.toml to {}", config_path.display());
+    Ok(())
+}
+
+/// Write Codex credentials to a workspace.
+///
+/// For container workspaces, writes to the container's root home directory.
+/// For host workspaces, writes to the host's home directory.
+pub fn write_codex_credentials_for_workspace(
+    workspace: &crate::workspace::Workspace,
+) -> Result<(), String> {
+    use crate::workspace::WorkspaceType;
+
+    let entry = read_oauth_token_entry(ProviderType::OpenAI)
+        .ok_or_else(|| "No OpenAI OAuth entry found".to_string())?;
+
+    let codex_dir = match workspace.workspace_type {
+        WorkspaceType::Container => {
+            // For container workspaces, write to <workspace_root>/root/.codex
+            workspace.path.join("root").join(".codex")
+        }
+        WorkspaceType::Host => {
+            // For host workspaces, use host home directory
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            std::path::PathBuf::from(home).join(".codex")
+        }
+    };
+
+    write_codex_config_from_entry(&codex_dir, &entry.access_token, &entry.refresh_token)?;
+
+    tracing::info!(
+        workspace_id = %workspace.id,
+        workspace_type = ?workspace.workspace_type,
+        "Wrote Codex credentials for workspace"
+    );
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Request/Response Types
 // ─────────────────────────────────────────────────────────────────────────────
 

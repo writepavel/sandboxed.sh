@@ -1142,6 +1142,21 @@ async fn run_mission_turn(
             )
             .await
         }
+        "codex" => {
+            run_codex_turn(
+                &workspace,
+                &mission_work_dir,
+                &user_message,
+                config.default_model.as_deref(),
+                effective_agent.as_deref(),
+                mission_id,
+                events_tx.clone(),
+                cancel,
+                &config.working_dir,
+                session_id.as_deref(),
+            )
+            .await
+        }
         _ => {
             // Don't send Error event - the failure will be emitted as an AssistantMessage
             // with success=false by the caller (control.rs), avoiding duplicate messages.
@@ -6523,6 +6538,202 @@ impl From<&MissionRunner> for RunningMissionInfo {
             subtask_completed: runner.subtasks.iter().filter(|s| s.completed).count(),
         }
     }
+}
+
+pub async fn run_codex_turn(
+    workspace: &Workspace,
+    mission_work_dir: &std::path::Path,
+    user_message: &str,
+    model: Option<&str>,
+    agent: Option<&str>,
+    mission_id: Uuid,
+    events_tx: broadcast::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    _working_dir: &std::path::Path,
+    _session_id: Option<&str>,
+) -> AgentResult {
+    use crate::backend::codex::CodexBackend;
+    use crate::backend::events::ExecutionEvent;
+    use crate::backend::{Backend, SessionConfig};
+
+    tracing::info!(
+        mission_id = %mission_id,
+        model = ?model,
+        agent = ?agent,
+        "Starting Codex turn"
+    );
+
+    // Write Codex credentials to workspace
+    if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(workspace) {
+        tracing::error!("Failed to write Codex credentials: {}", e);
+        return AgentResult::failure(
+            format!("Failed to configure Codex authentication: {}", e),
+            0,
+        )
+        .with_terminal_reason(TerminalReason::LlmError);
+    }
+
+    // Create Codex backend
+    let backend = CodexBackend::new();
+
+    // Create session
+    let session = match backend
+        .create_session(SessionConfig {
+            directory: mission_work_dir.to_string_lossy().to_string(),
+            title: Some(format!("Mission {}", mission_id)),
+            model: model.map(|s| s.to_string()),
+            agent: agent.map(|s| s.to_string()),
+        })
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to create Codex session: {}", e);
+            return AgentResult::failure(format!("Failed to start Codex: {}", e), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Send message streaming
+    let (mut event_rx, _handle) = match backend.send_message_streaming(&session, user_message).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("Failed to send message to Codex: {}", e);
+            return AgentResult::failure(format!("Codex execution failed: {}", e), 0)
+                .with_terminal_reason(TerminalReason::LlmError);
+        }
+    };
+
+    // Process events with timeout handling
+    let mut assistant_message = String::new();
+    let mut success = false;
+    let mut error_message: Option<String> = None;
+    let mut received_any_event = false;
+    let mut last_activity = std::time::Instant::now();
+    let mut pending_tools: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    // Timeout configuration (similar to Amp)
+    let startup_timeout = std::time::Duration::from_secs(30);
+    let inactivity_timeout = std::time::Duration::from_secs(120);
+    let tool_in_progress_timeout = std::time::Duration::from_secs(180);
+
+    loop {
+        let timeout_duration = if !pending_tools.is_empty() {
+            tool_in_progress_timeout
+        } else if !received_any_event {
+            startup_timeout
+        } else {
+            inactivity_timeout
+        };
+        let time_since_activity = last_activity.elapsed();
+        let remaining = timeout_duration.saturating_sub(time_since_activity);
+        let mut timeout = tokio::time::sleep(remaining);
+        tokio::pin!(timeout);
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("Codex turn cancelled for mission {}", mission_id);
+                // Note: Codex process will be cleaned up automatically when the event stream task ends
+                return AgentResult::failure("Mission cancelled".to_string(), 0)
+                    .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            _ = &mut timeout => {
+                let err_msg = if !received_any_event {
+                    format!(
+                        "Codex produced no output after {}s. This may indicate network connectivity issues, missing API credentials, or a CLI startup failure.",
+                        startup_timeout.as_secs()
+                    )
+                } else if !pending_tools.is_empty() {
+                    let tool_names: Vec<_> = pending_tools.values().cloned().collect();
+                    format!(
+                        "Codex stopped responding after {}s while waiting for tool(s): {}. The tool(s) may be stuck or taking too long.",
+                        tool_in_progress_timeout.as_secs(),
+                        tool_names.join(", ")
+                    )
+                } else {
+                    format!(
+                        "Codex stopped responding after {}s of inactivity. This may indicate a network issue or API timeout.",
+                        inactivity_timeout.as_secs()
+                    )
+                };
+                tracing::warn!(mission_id = %mission_id, "{}", err_msg);
+                return AgentResult::failure(err_msg, 0)
+                    .with_terminal_reason(TerminalReason::LlmError);
+            }
+            Some(event) = event_rx.recv() => {
+                received_any_event = true;
+                last_activity = std::time::Instant::now();
+                match event {
+                    ExecutionEvent::TextDelta { content } => {
+                        assistant_message.push_str(&content);
+                        let _ = events_tx.send(AgentEvent::TextDelta {
+                            content: assistant_message.clone(),
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::Thinking { content } => {
+                        let _ = events_tx.send(AgentEvent::Thinking {
+                            content,
+                            done: false,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::ToolCall { id, name, args } => {
+                        pending_tools.insert(id.clone(), name.clone());
+                        let _ = events_tx.send(AgentEvent::ToolCall {
+                            tool_call_id: id,
+                            name,
+                            args,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::ToolResult { id, name, result } => {
+                        pending_tools.remove(&id);
+                        let _ = events_tx.send(AgentEvent::ToolResult {
+                            tool_call_id: id,
+                            name,
+                            result,
+                            mission_id: Some(mission_id),
+                        });
+                    }
+                    ExecutionEvent::Error { message } => {
+                        error_message = Some(message.clone());
+                        tracing::error!("Codex error: {}", message);
+                    }
+                    ExecutionEvent::MessageComplete { session_id: _ } => {
+                        success = error_message.is_none();
+                        break;
+                    }
+                }
+            }
+            else => {
+                // Channel closed
+                break;
+            }
+        }
+    }
+
+    let final_message = if let Some(err) = error_message {
+        err
+    } else if !assistant_message.is_empty() {
+        assistant_message
+    } else {
+        "No response from Codex".to_string()
+    };
+
+    let mut result = if success {
+        AgentResult::success(final_message, 0) // TODO: Calculate cost from Codex usage
+    } else {
+        AgentResult::failure(final_message, 0).with_terminal_reason(TerminalReason::LlmError)
+    };
+
+    if let Some(m) = model {
+        result = result.with_model(m.to_string());
+    }
+
+    result
 }
 
 #[cfg(test)]
