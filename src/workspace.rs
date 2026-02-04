@@ -1425,7 +1425,7 @@ async fn write_codex_config(
     _workspace_root: &Path,
     _workspace_type: WorkspaceType,
     _workspace_env: &HashMap<String, String>,
-    _skill_contents: Option<&[SkillContent]>,
+    skill_contents: Option<&[SkillContent]>,
     _shared_network: Option<bool>,
 ) -> anyhow::Result<()> {
     // Codex doesn't require workspace-specific config files
@@ -1437,6 +1437,11 @@ async fn write_codex_config(
     tokio::fs::create_dir_all(&codex_dir).await?;
 
     tracing::debug!("Created Codex config directory at {}", codex_dir.display());
+
+    // Write skills to .codex/skills/ using Codex's native skills format
+    if let Some(skills) = skill_contents {
+        write_codex_skills_to_workspace(workspace_dir, skills).await?;
+    }
 
     Ok(())
 }
@@ -1872,6 +1877,82 @@ pub async fn write_claudecode_skills_to_workspace(
         count = skills.len(),
         workspace = %workspace_dir.display(),
         "Wrote Claude Code skills to workspace"
+    );
+
+    Ok(())
+}
+
+/// Write skill files to the workspace's `.codex/skills/` directory.
+/// This makes skills available to Codex using its native skills format.
+/// Codex looks for skills in `.codex/skills/<name>/SKILL.md`.
+pub async fn write_codex_skills_to_workspace(
+    workspace_dir: &Path,
+    skills: &[SkillContent],
+) -> anyhow::Result<()> {
+    let skills_dir = workspace_dir.join(".codex").join("skills");
+
+    tracing::debug!(
+        workspace = %workspace_dir.display(),
+        skills_dir = %skills_dir.display(),
+        skill_count = skills.len(),
+        skill_names = ?skills.iter().map(|s| &s.name).collect::<Vec<_>>(),
+        "Writing Codex skills to workspace"
+    );
+
+    // Clean up old skills directory to remove stale skills
+    if skills_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&skills_dir).await;
+    }
+
+    if skills.is_empty() {
+        tracing::warn!(
+            workspace = %workspace_dir.display(),
+            "No skills to write for Codex"
+        );
+        return Ok(());
+    }
+
+    tokio::fs::create_dir_all(&skills_dir).await?;
+
+    for skill in skills {
+        let skill_dir = skills_dir.join(&skill.name);
+        tokio::fs::create_dir_all(&skill_dir).await?;
+
+        // Ensure skill content has required frontmatter fields for Codex
+        let content_with_frontmatter = ensure_claudecode_skill_frontmatter(
+            &skill.content,
+            &skill.name,
+            skill.description.as_deref(),
+        );
+
+        // Strip <encrypted> tags - deployed skills should have bare plaintext values
+        let content_for_workspace = strip_encrypted_tags(&content_with_frontmatter);
+
+        // Write SKILL.md
+        let skill_md_path = skill_dir.join("SKILL.md");
+        tokio::fs::write(&skill_md_path, &content_for_workspace).await?;
+
+        // Write additional files (preserving subdirectory structure)
+        for (relative_path, file_content) in &skill.files {
+            let file_path = skill_dir.join(relative_path);
+            if let Some(parent) = file_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let file_content_stripped = strip_encrypted_tags(file_content);
+            tokio::fs::write(&file_path, file_content_stripped).await?;
+        }
+
+        tracing::debug!(
+            skill = %skill.name,
+            workspace = %workspace_dir.display(),
+            "Wrote Codex skill to workspace"
+        );
+    }
+
+    tracing::info!(
+        count = skills.len(),
+        workspace = %workspace_dir.display(),
+        "Wrote Codex skills to workspace"
     );
 
     Ok(())
@@ -2576,8 +2657,8 @@ pub async fn prepare_mission_workspace_with_skills_backend(
             command_contents = Some(commands);
         }
 
-        // Collect skills (only for claudecode and amp, which use skill contents directly)
-        if backend_id == "claudecode" || backend_id == "amp" {
+        // Collect skills (for backends that use skill contents directly)
+        if backend_id == "claudecode" || backend_id == "amp" || backend_id == "codex" {
             let skill_names = match resolve_workspace_skill_names(workspace, lib).await {
                 Ok(names) => {
                     tracing::debug!(
