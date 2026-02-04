@@ -3653,12 +3653,18 @@ async fn control_actor_loop(
                         // instead of current_mission (which can change when user creates a new mission)
                         if running.is_some() {
                             if let Some(mission_id) = running_mission_id {
+                                let seconds_since_activity =
+                                    main_runner_last_activity.elapsed().as_secs();
                                 running_list.push(super::mission_runner::RunningMissionInfo {
                                     mission_id,
                                     state: "running".to_string(),
                                     queue_len: queue.len(),
                                     history_len: history.len(),
-                                    seconds_since_activity: main_runner_last_activity.elapsed().as_secs(),
+                                    seconds_since_activity,
+                                    health: super::mission_runner::running_health(
+                                        super::mission_runner::MissionRunState::Running,
+                                        seconds_since_activity,
+                                    ),
                                     expected_deliverables: 0,
                                     current_activity: main_runner_activity.clone(),
                                     subtask_total: main_runner_subtasks.len(),
@@ -4463,9 +4469,16 @@ async fn control_actor_loop(
                         AgentEvent::ToolCall { mission_id, .. } => *mission_id,
                         AgentEvent::ToolResult { mission_id, .. } => *mission_id,
                         AgentEvent::Thinking { mission_id, .. } => *mission_id,
+                        AgentEvent::TextDelta { mission_id, .. } => *mission_id,
+                        AgentEvent::UserMessage { mission_id, .. } => *mission_id,
+                        AgentEvent::AssistantMessage { mission_id, .. } => *mission_id,
+                        AgentEvent::Error { mission_id, .. } => *mission_id,
+                        AgentEvent::MissionStatusChanged { mission_id, .. } => Some(*mission_id),
                         AgentEvent::AgentPhase { mission_id, .. } => *mission_id,
                         AgentEvent::AgentTree { mission_id, .. } => *mission_id,
                         AgentEvent::Progress { mission_id, .. } => *mission_id,
+                        AgentEvent::MissionActivity { mission_id, .. } => *mission_id,
+                        AgentEvent::SessionIdUpdate { mission_id, .. } => Some(*mission_id),
                         _ => None,
                     };
                     // Update last_activity for matching runner (main or parallel)

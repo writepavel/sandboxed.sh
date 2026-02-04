@@ -299,14 +299,12 @@ export function MissionSwitcher({
                 const isRunning = item.type === 'running';
                 const runningInfo = item.runningInfo;
 
-                const isStalled =
-                  isRunning &&
-                  runningInfo?.state === 'running' &&
-                  (runningInfo?.seconds_since_activity ?? 0) > 60;
-                const isSeverlyStalled =
-                  isRunning &&
-                  runningInfo?.state === 'running' &&
-                  (runningInfo?.seconds_since_activity ?? 0) > 120;
+                const stallInfo =
+                  isRunning && runningInfo?.health?.status === 'stalled'
+                    ? runningInfo.health
+                    : null;
+                const isStalled = Boolean(stallInfo);
+                const isSeverlyStalled = stallInfo?.severity === 'severe';
                 const isLoading = loadingMissionId === item.id;
 
                 return (
@@ -374,7 +372,7 @@ export function MissionSwitcher({
                           </span>
                           {isStalled && (
                             <span className="text-[10px] text-amber-400 tabular-nums shrink-0">
-                              {Math.floor(runningInfo?.seconds_since_activity ?? 0)}s
+                              {Math.floor(stallInfo?.seconds_since_activity ?? 0)}s
                             </span>
                           )}
                         </div>

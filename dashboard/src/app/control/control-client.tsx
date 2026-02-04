@@ -2243,12 +2243,11 @@ export default function ControlClient() {
     }
   }, [items, visibleItemsLimit]);
 
-  // Check if the mission we're viewing appears stalled (no activity for 60+ seconds)
-  const viewingMissionStallSeconds = useMemo(() => {
-    if (!viewingMissionId) return 0;
-    if (!viewingRunningInfo) return 0;
-    if (viewingRunningInfo.state !== "running") return 0;
-    return viewingRunningInfo.seconds_since_activity;
+  const viewingMissionStallInfo = useMemo(() => {
+    if (!viewingMissionId) return null;
+    if (!viewingRunningInfo) return null;
+    if (viewingRunningInfo.health?.status !== "stalled") return null;
+    return viewingRunningInfo.health;
   }, [viewingMissionId, viewingRunningInfo]);
 
   const hasPendingQuestion = useMemo(
@@ -2262,25 +2261,10 @@ export default function ControlClient() {
     [items]
   );
 
-  // Check if there are any pending tool calls (tools without results)
-  // These may be long-running operations like desktop automation or subagents
-  // When tools are running, we should be less aggressive about stall warnings
-  const hasPendingToolCalls = useMemo(
-    () =>
-      items.some(
-        (item) =>
-          item.kind === "tool" &&
-          item.name !== "question" &&
-          item.result === undefined
-      ),
-    [items]
-  );
-
-  // Use higher threshold when tools are actively running (they may not emit events during execution)
-  const stallThreshold = hasPendingToolCalls ? 180 : 60;
-  const severeStallThreshold = hasPendingToolCalls ? 300 : 120;
-  const isViewingMissionStalled = viewingMissionStallSeconds >= stallThreshold;
-  const isViewingMissionSeverelyStalled = viewingMissionStallSeconds >= severeStallThreshold;
+  const viewingMissionStallSeconds = viewingMissionStallInfo?.seconds_since_activity ?? 0;
+  const isViewingMissionStalled = Boolean(viewingMissionStallInfo);
+  const isViewingMissionSeverelyStalled =
+    viewingMissionStallInfo?.severity === "severe";
 
   const recentMissionList = useMemo(() => {
     if (recentMissions.length === 0) return [];

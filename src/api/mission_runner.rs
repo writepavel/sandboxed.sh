@@ -557,8 +557,19 @@ pub enum MissionRunState {
     Finished,
 }
 
+const STALL_WARN_SECS: u64 = 120;
+const STALL_SEVERE_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionStallSeverity {
+    Warning,
+    Severe,
+}
+
 /// Health status of a mission.
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum MissionHealth {
     /// Mission is progressing normally
     Healthy,
@@ -566,11 +577,38 @@ pub enum MissionHealth {
     Stalled {
         seconds_since_activity: u64,
         last_state: String,
+        severity: MissionStallSeverity,
     },
     /// Mission completed without deliverables
     MissingDeliverables { missing: Vec<String> },
     /// Mission ended unexpectedly
     UnexpectedEnd { reason: String },
+}
+
+fn stall_severity(seconds_since_activity: u64) -> Option<MissionStallSeverity> {
+    if seconds_since_activity > STALL_SEVERE_SECS {
+        Some(MissionStallSeverity::Severe)
+    } else if seconds_since_activity > STALL_WARN_SECS {
+        Some(MissionStallSeverity::Warning)
+    } else {
+        None
+    }
+}
+
+pub fn running_health(state: MissionRunState, seconds_since_activity: u64) -> MissionHealth {
+    if matches!(
+        state,
+        MissionRunState::Running | MissionRunState::WaitingForTool
+    ) {
+        if let Some(severity) = stall_severity(seconds_since_activity) {
+            return MissionHealth::Stalled {
+                seconds_since_activity,
+                last_state: format!("{:?}", state),
+                severity,
+            };
+        }
+    }
+    MissionHealth::Healthy
 }
 
 /// A message queued for this mission.
@@ -701,12 +739,15 @@ impl MissionRunner {
     pub async fn check_health(&self) -> MissionHealth {
         let seconds_since = self.last_activity.elapsed().as_secs();
 
-        // If running and no activity for 60+ seconds, consider stalled
-        if self.is_running() && seconds_since > 60 {
-            return MissionHealth::Stalled {
-                seconds_since_activity: seconds_since,
-                last_state: format!("{:?}", self.state),
-            };
+        // If running and no activity for a while, consider stalled
+        if self.is_running() {
+            if let Some(severity) = stall_severity(seconds_since) {
+                return MissionHealth::Stalled {
+                    seconds_since_activity: seconds_since,
+                    last_state: format!("{:?}", self.state),
+                    severity,
+                };
+            }
         }
 
         // If finished without explicit completion and has deliverables, check them
@@ -6450,6 +6491,7 @@ pub struct RunningMissionInfo {
     pub queue_len: usize,
     pub history_len: usize,
     pub seconds_since_activity: u64,
+    pub health: MissionHealth,
     pub expected_deliverables: usize,
     /// Current activity label (e.g., "Reading: main.rs")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6462,6 +6504,7 @@ pub struct RunningMissionInfo {
 
 impl From<&MissionRunner> for RunningMissionInfo {
     fn from(runner: &MissionRunner) -> Self {
+        let seconds_since_activity = runner.last_activity.elapsed().as_secs();
         Self {
             mission_id: runner.mission_id,
             state: match runner.state {
@@ -6472,7 +6515,8 @@ impl From<&MissionRunner> for RunningMissionInfo {
             },
             queue_len: runner.queue.len(),
             history_len: runner.history.len(),
-            seconds_since_activity: runner.last_activity.elapsed().as_secs(),
+            seconds_since_activity,
+            health: running_health(runner.state, seconds_since_activity),
             expected_deliverables: runner.deliverables.deliverables.len(),
             current_activity: runner.current_activity.clone(),
             subtask_total: runner.subtasks.len(),
