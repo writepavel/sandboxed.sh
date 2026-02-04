@@ -122,9 +122,7 @@ pub fn substitute_variables(command: &str, context: &SubstitutionContext) -> Str
 
     // Custom variables
     for (key, value) in &context.custom_variables {
-        let placeholder = format!("<{}/
-
->", key);
+        let placeholder = format!("<{}/>", key);
         result = result.replace(&placeholder, value);
     }
 
@@ -205,8 +203,7 @@ mod tests {
             }
         });
 
-        let context = SubstitutionContext::new(Uuid::new_v4())
-            .with_webhook_payload(payload);
+        let context = SubstitutionContext::new(Uuid::new_v4()).with_webhook_payload(payload);
 
         let command = "Analyze commit <webhook.head_commit.id/> in <webhook.repository.name/>";
         let result = substitute_variables(command, &context);
@@ -241,8 +238,7 @@ mod tests {
         custom_vars.insert("target_env".to_string(), "production".to_string());
         custom_vars.insert("version".to_string(), "v1.2.3".to_string());
 
-        let context = SubstitutionContext::new(Uuid::new_v4())
-            .with_custom_variables(custom_vars);
+        let context = SubstitutionContext::new(Uuid::new_v4()).with_custom_variables(custom_vars);
 
         let command = "Deploy <version/> to <target_env/>";
         let result = substitute_variables(command, &context);

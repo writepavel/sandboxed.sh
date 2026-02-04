@@ -199,8 +199,8 @@ impl SqliteMissionStore {
         };
 
         // Parse variables
-        let variables: HashMap<String, String> = serde_json::from_str(&variables_json)
-            .unwrap_or_default();
+        let variables: HashMap<String, String> =
+            serde_json::from_str(&variables_json).unwrap_or_default();
 
         Ok(Automation {
             id: Uuid::parse_str(&id)
@@ -222,7 +222,9 @@ impl SqliteMissionStore {
     }
 
     /// Parse an automation execution row from the database.
-    fn parse_execution_row(row: &rusqlite::Row<'_>) -> Result<AutomationExecution, rusqlite::Error> {
+    fn parse_execution_row(
+        row: &rusqlite::Row<'_>,
+    ) -> Result<AutomationExecution, rusqlite::Error> {
         let id: String = row.get(0)?;
         let automation_id: String = row.get(1)?;
         let mission_id: String = row.get(2)?;
@@ -247,12 +249,11 @@ impl SqliteMissionStore {
         };
 
         // Parse webhook payload
-        let webhook_payload_value = webhook_payload
-            .and_then(|s| serde_json::from_str(&s).ok());
+        let webhook_payload_value = webhook_payload.and_then(|s| serde_json::from_str(&s).ok());
 
         // Parse variables
-        let variables_used: HashMap<String, String> = serde_json::from_str(&variables_used_json)
-            .unwrap_or_default();
+        let variables_used: HashMap<String, String> =
+            serde_json::from_str(&variables_used_json).unwrap_or_default();
 
         Ok(AutomationExecution {
             id: Uuid::parse_str(&id)
@@ -436,8 +437,8 @@ impl SqliteMissionStore {
                 .prepare("SELECT id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at FROM automations")
                 .map_err(|e| format!("Failed to read old automations: {}", e))?;
 
-            let old_automations: Vec<(String, String, String, i64, i64, String, Option<String>)> = stmt
-                .query_map([], |row| {
+            let old_automations: Vec<(String, String, String, i64, i64, String, Option<String>)> =
+                stmt.query_map([], |row| {
                     Ok((
                         row.get(0)?,
                         row.get(1)?,
@@ -503,15 +504,26 @@ impl SqliteMissionStore {
 
             // Migrate old data to new schema
             let automation_count = old_automations.len();
-            for (id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at) in old_automations {
+            for (
+                id,
+                mission_id,
+                command_name,
+                interval_seconds,
+                active,
+                created_at,
+                last_triggered_at,
+            ) in old_automations
+            {
                 // Convert old format to new format
                 let command_source_data = serde_json::json!({
                     "name": command_name
-                }).to_string();
+                })
+                .to_string();
 
                 let trigger_data = serde_json::json!({
                     "seconds": interval_seconds
-                }).to_string();
+                })
+                .to_string();
 
                 conn.execute(
                     "INSERT INTO automations (id, mission_id, command_source_type, command_source_data,
@@ -523,7 +535,10 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to migrate automation: {}", e))?;
             }
 
-            tracing::info!("Successfully migrated {} automations to new schema", automation_count);
+            tracing::info!(
+                "Successfully migrated {} automations to new schema",
+                automation_count
+            );
         } else {
             // Check if automation_executions table exists
             let has_executions_table: bool = conn
@@ -1496,19 +1511,34 @@ impl MissionStore for SqliteMissionStore {
 
         // Serialize command source
         let (command_source_type, command_source_data) = match &automation.command_source {
-            CommandSource::Library { name } => ("library", serde_json::json!({ "name": name }).to_string()),
-            CommandSource::LocalFile { path } => ("local_file", serde_json::json!({ "path": path }).to_string()),
-            CommandSource::Inline { content } => ("inline", serde_json::json!({ "content": content }).to_string()),
+            CommandSource::Library { name } => {
+                ("library", serde_json::json!({ "name": name }).to_string())
+            }
+            CommandSource::LocalFile { path } => (
+                "local_file",
+                serde_json::json!({ "path": path }).to_string(),
+            ),
+            CommandSource::Inline { content } => (
+                "inline",
+                serde_json::json!({ "content": content }).to_string(),
+            ),
         };
 
         // Serialize trigger
         let (trigger_type, trigger_data) = match &automation.trigger {
-            TriggerType::Interval { seconds } => ("interval", serde_json::json!({ "seconds": seconds }).to_string()),
-            TriggerType::Webhook { config } => ("webhook", serde_json::to_string(config).map_err(|e| e.to_string())?),
+            TriggerType::Interval { seconds } => (
+                "interval",
+                serde_json::json!({ "seconds": seconds }).to_string(),
+            ),
+            TriggerType::Webhook { config } => (
+                "webhook",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
         };
 
         // Serialize variables
-        let variables_json = serde_json::to_string(&automation.variables).map_err(|e| e.to_string())?;
+        let variables_json =
+            serde_json::to_string(&automation.variables).map_err(|e| e.to_string())?;
 
         let a = automation.clone();
         tokio::task::spawn_blocking(move || {
@@ -1677,19 +1707,34 @@ impl MissionStore for SqliteMissionStore {
 
         // Serialize command source
         let (command_source_type, command_source_data) = match &automation.command_source {
-            CommandSource::Library { name } => ("library", serde_json::json!({ "name": name }).to_string()),
-            CommandSource::LocalFile { path } => ("local_file", serde_json::json!({ "path": path }).to_string()),
-            CommandSource::Inline { content } => ("inline", serde_json::json!({ "content": content }).to_string()),
+            CommandSource::Library { name } => {
+                ("library", serde_json::json!({ "name": name }).to_string())
+            }
+            CommandSource::LocalFile { path } => (
+                "local_file",
+                serde_json::json!({ "path": path }).to_string(),
+            ),
+            CommandSource::Inline { content } => (
+                "inline",
+                serde_json::json!({ "content": content }).to_string(),
+            ),
         };
 
         // Serialize trigger
         let (trigger_type, trigger_data) = match &automation.trigger {
-            TriggerType::Interval { seconds } => ("interval", serde_json::json!({ "seconds": seconds }).to_string()),
-            TriggerType::Webhook { config } => ("webhook", serde_json::to_string(config).map_err(|e| e.to_string())?),
+            TriggerType::Interval { seconds } => (
+                "interval",
+                serde_json::json!({ "seconds": seconds }).to_string(),
+            ),
+            TriggerType::Webhook { config } => (
+                "webhook",
+                serde_json::to_string(config).map_err(|e| e.to_string())?,
+            ),
         };
 
         // Serialize variables
-        let variables_json = serde_json::to_string(&automation.variables).map_err(|e| e.to_string())?;
+        let variables_json =
+            serde_json::to_string(&automation.variables).map_err(|e| e.to_string())?;
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
@@ -1759,8 +1804,8 @@ impl MissionStore for SqliteMissionStore {
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
 
-        let variables_used_json = serde_json::to_string(&execution.variables_used)
-            .unwrap_or_else(|_| "{}".to_string());
+        let variables_used_json =
+            serde_json::to_string(&execution.variables_used).unwrap_or_else(|_| "{}".to_string());
 
         let status_str = match execution.status {
             ExecutionStatus::Pending => "pending",
@@ -1813,8 +1858,8 @@ impl MissionStore for SqliteMissionStore {
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "null".to_string()));
 
-        let variables_used_json = serde_json::to_string(&execution.variables_used)
-            .unwrap_or_else(|_| "{}".to_string());
+        let variables_used_json =
+            serde_json::to_string(&execution.variables_used).unwrap_or_else(|_| "{}".to_string());
 
         let status_str = match execution.status {
             ExecutionStatus::Pending => "pending",
