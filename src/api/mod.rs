@@ -16,8 +16,10 @@
 //! - `POST /api/tools/{name}/toggle` - Enable/disable a tool
 
 pub mod ai_providers;
+pub mod ampcode;
 mod auth;
 pub mod backends;
+pub mod claudecode;
 mod console;
 pub mod control;
 pub mod desktop;

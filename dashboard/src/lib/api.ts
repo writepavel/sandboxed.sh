@@ -1693,6 +1693,34 @@ export async function updateOpenCodeConfig(config: Record<string, unknown>): Pro
   return apiPut("/api/opencode/config", config, "Failed to update OpenCode config");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Claude Code Host Config API
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getClaudeCodeHostConfig(): Promise<Record<string, unknown>> {
+  return apiGet("/api/claudecode/config", "Failed to get Claude Code host config");
+}
+
+export async function updateClaudeCodeHostConfig(
+  config: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  return apiPut("/api/claudecode/config", config, "Failed to update Claude Code host config");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Amp Host Config API
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getAmpCodeHostConfig(): Promise<Record<string, unknown>> {
+  return apiGet("/api/amp/config", "Failed to get Amp host config");
+}
+
+export async function updateAmpCodeHostConfig(
+  config: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  return apiPut("/api/amp/config", config, "Failed to update Amp host config");
+}
+
 // Restart OpenCode service (to apply settings changes)
 export async function restartOpenCodeService(): Promise<{ success: boolean; message: string }> {
   return apiPost("/api/opencode/restart", undefined, "Failed to restart OpenCode service");

@@ -40,8 +40,10 @@ fn cli_available(name: &str) -> bool {
 }
 
 use super::ai_providers as ai_providers_api;
+use super::ampcode as ampcode_api;
 use super::auth::{self, AuthUser};
 use super::backends as backends_api;
+use super::claudecode as claudecode_api;
 use super::console;
 use super::control;
 use super::desktop;
@@ -540,6 +542,19 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .route(
             "/api/opencode/config",
             axum::routing::put(opencode_api::update_opencode_config),
+        )
+        .route(
+            "/api/claudecode/config",
+            get(claudecode_api::get_claudecode_config),
+        )
+        .route(
+            "/api/claudecode/config",
+            axum::routing::put(claudecode_api::update_claudecode_config),
+        )
+        .route("/api/amp/config", get(ampcode_api::get_amp_config))
+        .route(
+            "/api/amp/config",
+            axum::routing::put(ampcode_api::update_amp_config),
         )
         .route(
             "/api/opencode/restart",

@@ -16,6 +16,10 @@ import {
   updateOpenCodeSettings,
   getOpenCodeConfig,
   updateOpenCodeConfig,
+  getClaudeCodeHostConfig,
+  updateClaudeCodeHostConfig,
+  getAmpCodeHostConfig,
+  updateAmpCodeHostConfig,
   ConfigProfileSummary,
   DivergedHistoryError,
 } from '@/lib/api';
@@ -191,6 +195,20 @@ const HOST_SYNC_MAP: Partial<Record<HarnessId, Record<string, HostSyncHandler>>>
       label: 'oh-my-opencode.json',
       load: getOpenCodeSettings,
       save: updateOpenCodeSettings,
+    },
+  },
+  claudecode: {
+    'settings.json': {
+      label: '~/.claude/settings.json',
+      load: getClaudeCodeHostConfig,
+      save: updateClaudeCodeHostConfig,
+    },
+  },
+  ampcode: {
+    'settings.json': {
+      label: '~/.config/amp/settings.json',
+      load: getAmpCodeHostConfig,
+      save: updateAmpCodeHostConfig,
     },
   },
 };
