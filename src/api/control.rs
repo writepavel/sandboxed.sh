@@ -4382,7 +4382,9 @@ async fn control_actor_loop(
                             // Mark failures as resumable
                             let resumable = !result.success;
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
-                                id: msg_id,
+                                // Use a unique id so we don't overwrite the user_message event
+                                // (event_id is used for de-dupe in the SQLite event logger).
+                                id: Uuid::new_v4(),
                                 content: result.output.clone(),
                                 success: result.success,
                                 cost_cents: result.cost_cents,
