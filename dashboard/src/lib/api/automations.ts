@@ -18,6 +18,10 @@ export async function listMissionAutomations(missionId: string): Promise<Automat
   return apiGet(`/api/control/missions/${missionId}/automations`, "Failed to fetch automations");
 }
 
+export async function listActiveAutomations(): Promise<Automation[]> {
+  return apiGet(`/api/control/automations`, "Failed to fetch active automations");
+}
+
 export async function createMissionAutomation(
   missionId: string,
   input: { commandName: string; intervalSeconds: number }

@@ -4873,6 +4873,22 @@ pub async fn list_mission_automations(
     Ok(Json(automations))
 }
 
+/// List all active automations across missions.
+pub async fn list_active_automations(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Vec<mission_store::Automation>>, (StatusCode, String)> {
+    let control = control_for_user(&state, &user).await;
+
+    let automations = control
+        .mission_store
+        .list_active_automations()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(automations))
+}
+
 /// Create an automation for a mission.
 pub async fn create_automation(
     State(state): State<Arc<AppState>>,

@@ -106,6 +106,7 @@ export {
 export {
   type Automation,
   listMissionAutomations,
+  listActiveAutomations,
   createMissionAutomation,
   getAutomation,
   updateAutomationActive,
