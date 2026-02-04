@@ -502,6 +502,7 @@ impl SqliteMissionStore {
             .map_err(|e| format!("Failed to create new automations table: {}", e))?;
 
             // Migrate old data to new schema
+            let automation_count = old_automations.len();
             for (id, mission_id, command_name, interval_seconds, active, created_at, last_triggered_at) in old_automations {
                 // Convert old format to new format
                 let command_source_data = serde_json::json!({
@@ -522,7 +523,7 @@ impl SqliteMissionStore {
                 .map_err(|e| format!("Failed to migrate automation: {}", e))?;
             }
 
-            tracing::info!("Successfully migrated {} automations to new schema", old_automations.len());
+            tracing::info!("Successfully migrated {} automations to new schema", automation_count);
         } else {
             // Check if automation_executions table exists
             let has_executions_table: bool = conn

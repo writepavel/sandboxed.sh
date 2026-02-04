@@ -2085,7 +2085,7 @@ fn spawn_control_session(
         config.clone(),
         root_agent,
         mcp,
-        workspaces,
+        workspaces.clone(),
         library.clone(),
         cmd_rx,
         mission_cmd_rx,
