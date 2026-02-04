@@ -84,8 +84,8 @@ impl CodexClient {
             cmd.arg("--model").arg(m);
         }
 
-        // Add the message as an argument
-        cmd.arg(message);
+        // Add the message as a positional arg (guard prompts starting with '-')
+        cmd.arg("--").arg(message);
 
         info!(
             "Spawning Codex CLI: directory={}, model={:?}",

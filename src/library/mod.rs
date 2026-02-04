@@ -2334,6 +2334,32 @@ impl LibraryStore {
         Ok(files)
     }
 
+    /// Save a harness default file to the library.
+    pub async fn save_harness_default_file(
+        &self,
+        harness: &str,
+        file_name: &str,
+        content: &str,
+    ) -> Result<()> {
+        // Validate harness name
+        let valid_harnesses = ["opencode", "claudecode", "ampcode", "sandboxed"];
+        if !valid_harnesses.contains(&harness) {
+            anyhow::bail!("Invalid harness: {}", harness);
+        }
+
+        let harness_dir = self.path.join(harness);
+        if !harness_dir.exists() {
+            fs::create_dir_all(&harness_dir).await?;
+        }
+
+        let path = harness_dir.join(file_name);
+        fs::write(&path, content)
+            .await
+            .context("Failed to write harness default file")?;
+
+        Ok(())
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Migration
     // ─────────────────────────────────────────────────────────────────────────

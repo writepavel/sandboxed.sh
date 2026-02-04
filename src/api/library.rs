@@ -298,6 +298,10 @@ pub fn routes() -> Router<Arc<super::routes::AppState>> {
             "/harness-default/:harness/*file_name",
             get(get_harness_default_file),
         )
+        .route(
+            "/harness-default/:harness/*file_name",
+            put(save_harness_default_file),
+        )
         // Skills Registry (skills.sh)
         .route("/skill/registry/search", get(search_registry))
         .route("/skill/registry/list/:identifier", get(list_repo_skills))
@@ -2218,6 +2222,27 @@ async fn get_harness_default_file(
             if e.to_string().contains("not found") {
                 (StatusCode::NOT_FOUND, e.to_string())
             } else if e.to_string().contains("Invalid harness") {
+                (StatusCode::BAD_REQUEST, e.to_string())
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })
+}
+
+/// PUT /api/library/harness-default/:harness/*file_name - Save a harness default file.
+async fn save_harness_default_file(
+    State(state): State<Arc<super::routes::AppState>>,
+    Path((harness, file_name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    let library = ensure_library(&state, &headers).await?;
+    library
+        .save_harness_default_file(&harness, &file_name, &body)
+        .await
+        .map(|_| (StatusCode::OK, "Harness default file saved".to_string()))
+        .map_err(|e| {
+            if e.to_string().contains("Invalid harness") {
                 (StatusCode::BAD_REQUEST, e.to_string())
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())

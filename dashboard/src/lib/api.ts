@@ -1679,6 +1679,20 @@ export async function updateOpenCodeSettings(settings: Record<string, unknown>):
   return apiPut("/api/opencode/settings", settings, "Failed to update OpenCode settings");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenCode Config API (opencode.json)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Get OpenCode config (opencode.json)
+export async function getOpenCodeConfig(): Promise<Record<string, unknown>> {
+  return apiGet("/api/opencode/config", "Failed to get OpenCode config");
+}
+
+// Update OpenCode config (opencode.json)
+export async function updateOpenCodeConfig(config: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return apiPut("/api/opencode/config", config, "Failed to update OpenCode config");
+}
+
 // Restart OpenCode service (to apply settings changes)
 export async function restartOpenCodeService(): Promise<{ success: boolean; message: string }> {
   return apiPost("/api/opencode/restart", undefined, "Failed to restart OpenCode service");
@@ -1982,6 +1996,28 @@ export async function getHarnessDefaultFile(harness: string, fileName: string): 
     throw new Error(`Failed to get harness default file: ${response.statusText}`);
   }
   return response.text();
+}
+
+// Save a harness default file in the library
+export async function saveHarnessDefaultFile(
+  harness: string,
+  fileName: string,
+  content: string
+): Promise<void> {
+  const response = await fetch(
+    apiUrl(`/api/library/harness-default/${encodeURIComponent(harness)}/${fileName}`),
+    {
+      method: "PUT",
+      headers: {
+        ...authHeader(),
+        "Content-Type": "text/plain",
+      },
+      body: content,
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to save harness default file: ${response.statusText}`);
+  }
 }
 
 // AI Provider types and functions are now exported from ./api/providers

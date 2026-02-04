@@ -534,6 +534,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             axum::routing::put(opencode_api::update_opencode_settings),
         )
         .route(
+            "/api/opencode/config",
+            get(opencode_api::get_opencode_config),
+        )
+        .route(
+            "/api/opencode/config",
+            axum::routing::put(opencode_api::update_opencode_config),
+        )
+        .route(
             "/api/opencode/restart",
             post(opencode_api::restart_opencode_service),
         )

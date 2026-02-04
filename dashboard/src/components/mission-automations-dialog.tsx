@@ -347,7 +347,15 @@ export function MissionAutomationsDialog({
                       value={commandName}
                       onChange={(e) => setCommandName(e.target.value)}
                       placeholder={commandsLoading ? 'Loading commands…' : 'Select or type a command'}
-                      className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50"
+                      className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-sm text-white placeholder:text-white/30 focus:outline-none focus:border-indigo-500/50 appearance-none"
+                      style={{
+                        backgroundImage:
+                          "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                        backgroundPosition: 'right 0.5rem center',
+                        backgroundRepeat: 'no-repeat',
+                        backgroundSize: '1.5em 1.5em',
+                        paddingRight: '2.5rem',
+                      }}
                     />
                     <datalist id="automation-command-list">
                       {commands.map((command) => (

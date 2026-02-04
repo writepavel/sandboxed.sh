@@ -51,6 +51,83 @@ fn resolve_oh_my_opencode_path() -> std::path::PathBuf {
         .join("oh-my-opencode.json")
 }
 
+/// Resolve the path to opencode.json configuration file.
+fn resolve_opencode_config_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("OPENCODE_CONFIG") {
+        if !path.trim().is_empty() {
+            return std::path::PathBuf::from(path);
+        }
+    }
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir).join("opencode.json");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("opencode")
+        .join("opencode.json")
+}
+
+fn strip_jsonc_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+
+        if c == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    chars.next();
+                    while let Some(n) = chars.next() {
+                        if n == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    while let Some(n) = chars.next() {
+                        if prev == '*' && n == '/' {
+                            break;
+                        }
+                        prev = n;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        out.push(c);
+    }
+
+    out
+}
+
 /// GET /api/opencode/settings - Read oh-my-opencode settings.
 pub async fn get_opencode_settings() -> Result<Json<Value>, (StatusCode, String)> {
     let config_path = resolve_oh_my_opencode_path();
@@ -73,6 +150,47 @@ pub async fn get_opencode_settings() -> Result<Json<Value>, (StatusCode, String)
             format!("Invalid JSON in oh-my-opencode.json: {}", e),
         )
     })?;
+
+    Ok(Json(config))
+}
+
+/// GET /api/opencode/config - Read opencode.json settings.
+pub async fn get_opencode_config() -> Result<Json<Value>, (StatusCode, String)> {
+    let config_path = resolve_opencode_config_path();
+
+    let mut read_path = config_path.clone();
+    if !read_path.exists() {
+        // Try opencode.jsonc in the same directory
+        let jsonc_path = if let Some(parent) = config_path.parent() {
+            parent.join("opencode.jsonc")
+        } else {
+            config_path.with_extension("jsonc")
+        };
+        if jsonc_path.exists() {
+            read_path = jsonc_path;
+        } else {
+            return Ok(Json(serde_json::json!({})));
+        }
+    }
+
+    let contents = tokio::fs::read_to_string(&read_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read opencode config: {}", e),
+        )
+    })?;
+
+    let config: Value = serde_json::from_str(&contents)
+        .or_else(|_| {
+            let stripped = strip_jsonc_comments(&contents);
+            serde_json::from_str(&stripped)
+        })
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid JSON in opencode config: {}", e),
+            )
+        })?;
 
     Ok(Json(config))
 }
@@ -107,6 +225,38 @@ pub async fn update_opencode_settings(
         })?;
 
     tracing::info!(path = %config_path.display(), "Updated oh-my-opencode settings");
+
+    Ok(Json(config))
+}
+
+/// PUT /api/opencode/config - Write opencode.json settings.
+pub async fn update_opencode_config(
+    Json(config): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let config_path = resolve_opencode_config_path();
+
+    if let Some(parent) = config_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create config directory: {}", e),
+            )
+        })?;
+    }
+
+    let contents = serde_json::to_string_pretty(&config)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid JSON: {}", e)))?;
+
+    tokio::fs::write(&config_path, contents)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to write opencode.json: {}", e),
+            )
+        })?;
+
+    tracing::info!(path = %config_path.display(), "Updated opencode config");
 
     Ok(Json(config))
 }
