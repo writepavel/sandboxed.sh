@@ -4916,7 +4916,7 @@ async fn run_single_control_turn(
     convo.push_str("User:\n");
     convo.push_str(&user_message);
     convo.push_str("\n\nInstructions:\n- Continue the conversation helpfully.\n- Use available tools as needed.\n- For large data processing tasks (>10KB), prefer executing scripts rather than inline processing.\n");
-    let mut task = match crate::task::Task::new(convo, Some(1000)) {
+    let mut task = match crate::task::Task::new(convo.clone(), Some(1000)) {
         Ok(t) => t,
         Err(e) => {
             let r = crate::agents::AgentResult::failure(format!("Failed to create task: {}", e), 0);
@@ -5034,7 +5034,7 @@ async fn run_single_control_turn(
             super::mission_runner::run_codex_turn(
                 exec_workspace,
                 &ctx.working_dir,
-                &user_message,
+                &convo,
                 config.default_model.as_deref(),
                 config.opencode_agent.as_deref(),
                 mid,

@@ -1236,7 +1236,7 @@ async fn run_mission_turn(
             run_codex_turn(
                 &workspace,
                 &mission_work_dir,
-                &user_message,
+                &convo,
                 config.default_model.as_deref(),
                 effective_agent.as_deref(),
                 mission_id,
