@@ -4982,6 +4982,8 @@ pub async fn run_opencode_turn(
         }
     }
 
+    let needs_google = matches!(provider_hint.as_deref(), Some("google" | "gemini"));
+
     let fallback_provider = if has_openai {
         Some("openai")
     } else if has_google {
@@ -5089,7 +5091,7 @@ pub async fn run_opencode_turn(
         runner_is_direct,
         has_openai,
         has_anthropic,
-        has_google,
+        needs_google,
     )
     .await;
     sync_opencode_agent_config(
@@ -5107,7 +5109,7 @@ pub async fn run_opencode_turn(
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
-    if has_google {
+    if needs_google {
         if let Some(project_id) = detect_google_project_id() {
             ensure_opencode_google_project_id(&opencode_config_dir_host, &project_id);
         }
