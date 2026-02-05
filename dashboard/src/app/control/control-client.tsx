@@ -2041,7 +2041,14 @@ export default function ControlClient() {
   }, []);
 
   const HISTORY_EVENT_TYPES = useMemo(
-    () => ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta"],
+    () => [
+      "user_message",
+      "assistant_message",
+      "tool_call",
+      "tool_result",
+      "text_delta",
+      "thinking",
+    ],
     []
   );
   const loadHistoryEvents = useCallback(
@@ -2808,21 +2815,45 @@ export default function ControlClient() {
           const content = event.content || "";
 
           if (currentThinkingIdx !== null) {
-            // Update existing thinking item with latest/longer content
             const existing = items[currentThinkingIdx] as Extract<ChatItem, { kind: "thinking" }>;
-            // Keep the longer content (backend may send cumulative or final)
-            const newContent = content.length > existing.content.length ? content : existing.content;
-            items[currentThinkingIdx] = {
-              ...existing,
-              content: newContent,
-              done: isDone,
-              endTime: isDone ? timestamp : existing.endTime,
-            };
-            if (isDone) {
-              currentThinkingIdx = null; // Reset for next thinking session
+            const existingContent = existing.content || "";
+            const isContinuation =
+              !content ||
+              !existingContent ||
+              content.startsWith(existingContent) ||
+              existingContent.startsWith(content);
+
+            if (!isContinuation) {
+              // Treat as a new thought session: finalize previous and start a new item.
+              items[currentThinkingIdx] = {
+                ...existing,
+                done: true,
+                endTime: timestamp,
+              };
+              const newIdx = items.length;
+              items.push({
+                kind: "thinking" as const,
+                id: `event-${event.id}`,
+                content,
+                done: isDone,
+                startTime: timestamp,
+                endTime: isDone ? timestamp : undefined,
+              });
+              currentThinkingIdx = isDone ? null : newIdx;
+            } else {
+              // Continuation of the same thought: keep the longer content.
+              const newContent = content.length > existingContent.length ? content : existingContent;
+              items[currentThinkingIdx] = {
+                ...existing,
+                content: newContent,
+                done: isDone,
+                endTime: isDone ? timestamp : existing.endTime,
+              };
+              if (isDone) {
+                currentThinkingIdx = null; // Reset for next thinking session
+              }
             }
           } else {
-            // Create new thinking item
             const newIdx = items.length;
             items.push({
               kind: "thinking" as const,
@@ -3933,6 +3964,7 @@ export default function ControlClient() {
       }
 
       if (event.type === "assistant_message" && isRecord(data)) {
+        const now = Date.now();
         // Parse shared_files if present
         let sharedFiles: SharedFile[] | undefined;
         if (Array.isArray(data["shared_files"])) {
@@ -3950,9 +3982,23 @@ export default function ControlClient() {
         // undefined means no explicit status, only false means actual failure
         const isFailure = data["success"] === false;
         const incomingId = String(data["id"] ?? Date.now());
+
+        // Finalize any pending thinking session when an assistant message arrives.
+        if (thinkingFlushTimeoutRef.current) {
+          clearTimeout(thinkingFlushTimeoutRef.current);
+          thinkingFlushTimeoutRef.current = null;
+        }
+        pendingThinkingRef.current = null;
+
         setItems((prev) => {
-          // Filter out incomplete thinking
-          let filtered = prev.filter((it) => it.kind !== "thinking" || it.done);
+          // Mark any in-progress thinking as done instead of dropping it,
+          // so the Thinking panel can show a scrollable history.
+          let filtered = prev.map((it) => {
+            if (it.kind === "thinking" && !it.done) {
+              return { ...it, done: true, endTime: now };
+            }
+            return it;
+          });
 
           // When mission fails, mark all pending tool calls as failed
           // This ensures subagent headers don't stay stuck showing "Running for X"
@@ -3985,7 +4031,7 @@ export default function ControlClient() {
               success: !isFailure,
               costCents: Number(data["cost_cents"] ?? existing.costCents ?? 0),
               model: data["model"] ? String(data["model"]) : existing.model ?? null,
-              timestamp: Date.now(),
+              timestamp: now,
               sharedFiles: sharedFiles ?? existing.sharedFiles,
               resumable,
             };
@@ -4001,7 +4047,7 @@ export default function ControlClient() {
               success: !isFailure,
               costCents: Number(data["cost_cents"] ?? 0),
               model: data["model"] ? String(data["model"]) : null,
-              timestamp: Date.now(),
+              timestamp: now,
               sharedFiles,
               resumable,
             },
@@ -4095,8 +4141,29 @@ export default function ControlClient() {
 
         // Get or create stable ID for current thinking session
         const existingPending = pendingThinkingRef.current;
-        const thinkingId = existingPending?.id ?? `thinking-${thinkingIdCounterRef.current++}`;
-        const startTime = existingPending?.startTime ?? now;
+        const existingContent = existingPending?.content ?? "";
+        const isContinuation =
+          !content ||
+          !existingContent ||
+          content.startsWith(existingContent) ||
+          existingContent.startsWith(content);
+        const shouldStartNew = Boolean(existingPending && !isContinuation && existingContent.trim());
+
+        if (shouldStartNew) {
+          // Finalize the previous thought before starting a new one.
+          pendingThinkingRef.current = {
+            content: existingContent,
+            done: true,
+            id: existingPending?.id ?? `thinking-${thinkingIdCounterRef.current++}`,
+            startTime: existingPending?.startTime ?? now,
+          };
+          flushThinking();
+        }
+
+        const thinkingId = shouldStartNew
+          ? `thinking-${thinkingIdCounterRef.current++}`
+          : existingPending?.id ?? `thinking-${thinkingIdCounterRef.current++}`;
+        const startTime = shouldStartNew ? now : existingPending?.startTime ?? now;
 
         // Buffer the content update
         pendingThinkingRef.current = {
