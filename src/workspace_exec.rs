@@ -556,6 +556,7 @@ impl WorkspaceExec {
                             tailscale_mode = %tailscale_mode.as_str(),
                             "WorkspaceExec: Tailscale networking enabled"
                         );
+                        bind_resolv_conf(&mut cmd);
                         for a in tailscale_args {
                             cmd.arg(a);
                         }
