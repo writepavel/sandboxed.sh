@@ -1736,13 +1736,18 @@ pub fn run_claudecode_turn<'a>(
         // to allow --dangerously-skip-permissions even when running as root.
         args.push("--dangerously-skip-permissions".to_string());
 
-        // Ensure per-workspace MCP config is loaded (Claude CLI may not auto-load .claude in --print mode).
+        // Ensure per-workspace Claude settings are loaded (Claude CLI may not auto-load .claude in --print mode).
+        //
+        // Important: `--mcp-config` expects MCP server definitions, but Claude Code 2.1+ treats raw
+        // paths (e.g. "/root/work...") as JSON strings and can hang after a parse error. `--settings`
+        // reliably loads our `.claude/settings.local.json` file (which includes mcpServers + permissions).
+        //
         // For container workspaces, we must translate the path to be relative to the container filesystem.
-        let mcp_config_path = work_dir.join(".claude").join("settings.local.json");
-        if mcp_config_path.exists() {
-            args.push("--mcp-config".to_string());
+        let settings_path = work_dir.join(".claude").join("settings.local.json");
+        if settings_path.exists() {
+            args.push("--settings".to_string());
             // Translate the path for container execution (host path -> container-relative path)
-            let translated_path = workspace_exec.translate_path_for_container(&mcp_config_path);
+            let translated_path = workspace_exec.translate_path_for_container(&settings_path);
             args.push(translated_path);
         }
 

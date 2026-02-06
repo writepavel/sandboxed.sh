@@ -731,8 +731,26 @@ fn find_host_codex_auth_json() -> Option<std::path::PathBuf> {
             .join("auth.json"),
         std::path::PathBuf::from("/var/lib/opencode/.codex/auth.json"),
     ];
+
+    fn looks_like_json_file(path: &std::path::Path) -> bool {
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if metadata.len() == 0 {
+            return false;
+        }
+
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let first = contents.chars().find(|c| !c.is_whitespace());
+        matches!(first, Some('{') | Some('['))
+    }
+
     for candidate in &candidates {
-        if candidate.exists() {
+        if looks_like_json_file(candidate) {
             return Some(candidate.clone());
         }
     }
@@ -767,11 +785,56 @@ fn write_codex_config_from_entry(
     // Write auth.json (the format the Codex CLI actually reads for authentication).
     // The Codex CLI requires fields like id_token and account_id that are only
     // obtained during the interactive OAuth login flow. We try to copy the host's
-    // existing auth.json first. If that's not available, generate a minimal one
-    // (which may not work for chatgpt auth mode but works for API key mode).
+    // existing auth.json verbatim. If we cannot find a valid host auth.json, we
+    // return an error with instructions to run `codex login --device-auth`.
     let auth_path = config_dir.join("auth.json");
+
+    fn looks_like_json_file(path: &std::path::Path) -> bool {
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        if metadata.len() == 0 {
+            return false;
+        }
+
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let first = contents.chars().find(|c| !c.is_whitespace());
+        matches!(first, Some('{') | Some('['))
+    }
+
+    // If auth.json already exists and is non-empty, do not overwrite it. This
+    // avoids clobbering the host's own Codex auth when HOME points at the same
+    // directory as config_dir (e.g. HOME=/var/lib/opencode in production).
+    if looks_like_json_file(&auth_path) {
+        tracing::debug!(
+            "Codex auth.json already present at {}, leaving as-is",
+            auth_path.display()
+        );
+        return Ok(());
+    }
+
     if let Some(host_auth) = find_host_codex_auth_json() {
-        // Copy the host's auth.json verbatim - it has all required fields
+        // Guard against copying a file onto itself, which can truncate to 0 bytes.
+        let same_file = host_auth == auth_path
+            || match (host_auth.canonicalize(), auth_path.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            };
+
+        if same_file {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            return Err(format!(
+                "Codex auth.json is missing or empty at {}. Run `HOME={} codex login --device-auth` on the backend host to (re)create ~/.codex/auth.json.",
+                auth_path.display(),
+                home,
+            ));
+        }
+
+        // Copy the host's auth.json verbatim - it has all required fields.
         std::fs::copy(&host_auth, &auth_path).map_err(|e| {
             format!(
                 "Failed to copy host Codex auth.json from {}: {}",
@@ -784,32 +847,25 @@ fn write_codex_config_from_entry(
             host_auth.display(),
             auth_path.display()
         );
-    } else {
-        // Fallback: generate a minimal auth.json from credential store tokens
-        tracing::warn!(
-            "No host Codex auth.json found, generating minimal auth.json (may lack id_token)"
-        );
-        let auth_json = serde_json::json!({
-            "auth_mode": "chatgpt",
-            "OPENAI_API_KEY": null,
-            "tokens": {
-                "id_token": "",
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-            }
-        });
-        let auth_contents = serde_json::to_string_pretty(&auth_json)
-            .map_err(|e| format!("Failed to serialize Codex auth.json: {}", e))?;
 
-        let mut auth_file = std::fs::File::create(&auth_path)
-            .map_err(|e| format!("Failed to create Codex auth.json: {}", e))?;
-        auth_file
-            .write_all(auth_contents.as_bytes())
-            .map_err(|e| format!("Failed to write Codex auth.json: {}", e))?;
+        if !looks_like_json_file(&auth_path) {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            return Err(format!(
+                "Copied Codex auth.json to {} but it is still empty/invalid. Run `HOME={} codex login --device-auth` on the backend host.",
+                auth_path.display(),
+                home,
+            ));
+        }
+
+        tracing::debug!("Wrote Codex auth.json to {}", auth_path.display());
+        return Ok(());
     }
 
-    tracing::debug!("Wrote Codex auth.json to {}", auth_path.display());
-    Ok(())
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    Err(format!(
+        "No valid host Codex auth.json found. The Codex CLI requires an interactive login to generate ~/.codex/auth.json (with id_token/account_id). Run `HOME={} codex login --device-auth` on the backend host, then retry.",
+        home,
+    ))
 }
 
 /// Read the OpenAI OAuth access token from the credential store.
