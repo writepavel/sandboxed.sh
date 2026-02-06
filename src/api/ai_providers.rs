@@ -37,6 +37,50 @@ const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 const OPENAI_SCOPE: &str = "openid profile email offline_access";
+const OPENAI_TOKEN_EXCHANGE_GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const OPENAI_ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+
+async fn exchange_openai_id_token_for_api_key(
+    client: &reqwest::Client,
+    id_token: &str,
+) -> Result<String, String> {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", OPENAI_TOKEN_EXCHANGE_GRANT)
+        .append_pair("client_id", OPENAI_CLIENT_ID)
+        .append_pair("requested_token", "openai-api-key")
+        .append_pair("subject_token", id_token)
+        .append_pair("subject_token_type", OPENAI_ID_TOKEN_TYPE)
+        .finish();
+
+    let resp = client
+        .post(OPENAI_TOKEN_URL)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to exchange id_token for API key: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "OpenAI API key exchange failed ({}): {}",
+            status, text
+        ));
+    }
+
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse API key exchange response: {}", e))?;
+
+    let api_key = data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "No access_token in API key exchange response".to_string())?;
+
+    Ok(api_key.to_string())
+}
 
 /// Google/Gemini OAuth constants (from opencode-gemini-auth plugin / Gemini CLI)
 const GOOGLE_CLIENT_ID: &str =
@@ -761,6 +805,49 @@ fn get_openai_api_key_from_ai_providers(working_dir: &Path) -> Option<String> {
     }
 
     None
+}
+
+fn upsert_openai_api_key_in_ai_providers(working_dir: &Path, api_key: &str) -> Result<(), String> {
+    use crate::ai_providers::{AIProvider, ProviderType};
+
+    if api_key.trim().is_empty() {
+        return Err("OpenAI API key is empty".to_string());
+    }
+
+    let dir = working_dir.join(".sandboxed-sh");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create .sandboxed-sh directory: {}", e))?;
+
+    let path = dir.join("ai_providers.json");
+    let mut providers: Vec<AIProvider> = if path.exists() {
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read ai_providers.json: {}", e))?;
+        serde_json::from_str(&contents).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let now = chrono::Utc::now();
+    if let Some(existing) = providers
+        .iter_mut()
+        .find(|p| p.provider_type == ProviderType::OpenAI)
+    {
+        existing.api_key = Some(api_key.to_string());
+        existing.updated_at = now;
+    } else {
+        let mut p = AIProvider::new(ProviderType::OpenAI, "OpenAI".to_string());
+        p.api_key = Some(api_key.to_string());
+        p.enabled = true;
+        p.updated_at = now;
+        providers.push(p);
+    }
+
+    let contents = serde_json::to_string_pretty(&providers)
+        .map_err(|e| format!("Failed to serialize ai_providers.json: {}", e))?;
+    std::fs::write(&path, contents)
+        .map_err(|e| format!("Failed to write ai_providers.json: {}", e))?;
+
+    Ok(())
 }
 
 fn get_openai_api_key_for_codex(working_dir: &Path) -> Option<String> {
@@ -4076,6 +4163,39 @@ async fn oauth_callback_inner(
                 backends.clone(),
             ) {
                 tracing::error!("Failed to save provider backends: {}", e);
+            }
+
+            // If the user wants to use Codex, Codex CLI requires an API key. In the Codex CLI
+            // flow, this is minted by exchanging the id_token for an OpenAI API key.
+            if backends.iter().any(|b| b == "codex") {
+                let id_token = token_data.get("id_token").and_then(|v| v.as_str());
+                let id_token = id_token.ok_or_else(|| {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        "OpenAI OAuth token response did not include id_token; cannot mint API key for Codex. Try reconnecting."
+                            .to_string(),
+                    )
+                })?;
+
+                match exchange_openai_id_token_for_api_key(&client, id_token).await {
+                    Ok(api_key) => {
+                        if let Err(e) = upsert_openai_api_key_in_ai_providers(
+                            &state.config.working_dir,
+                            &api_key,
+                        ) {
+                            tracing::error!("Failed to save OpenAI API key for Codex: {}", e);
+                            return Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Failed to save OpenAI API key for Codex".to_string(),
+                            ));
+                        }
+                        tracing::info!("Minted and stored OpenAI API key for Codex via OAuth");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to mint OpenAI API key for Codex: {}", e);
+                        return Err((StatusCode::BAD_GATEWAY, e));
+                    }
+                }
             }
 
             let config_path = get_opencode_config_path(&state.config.working_dir);

@@ -49,14 +49,14 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
   if (providerType === 'openai') {
     return [
       {
-        label: 'ChatGPT Plus/Pro (OAuth, OpenCode only)',
+        label: 'ChatGPT Plus/Pro (OAuth)',
         type: 'oauth',
-        description: 'Use your ChatGPT subscription via OAuth (does not work for Codex)',
+        description: 'Use your ChatGPT subscription via official OAuth',
       },
       {
-        label: 'ChatGPT Plus/Pro (OAuth manual paste, OpenCode only)',
+        label: 'ChatGPT Plus/Pro (OAuth manual paste)',
         type: 'oauth',
-        description: 'Paste the full redirect URL if the callback fails (does not work for Codex)',
+        description: 'Paste the full redirect URL if the callback fails',
       },
       { label: 'Enter API Key', type: 'api', description: 'Use an existing API key' },
     ];
@@ -171,9 +171,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     if (providerType === 'anthropic') {
       setSelectedBackends(['opencode']);
     } else if (providerType === 'openai') {
-      // OAuth via ChatGPT usually cannot be used for Codex; we default to OpenCode
-      // and allow selecting Codex when using an API key.
-      setSelectedBackends(['opencode']);
+      setSelectedBackends(['opencode', 'codex']);
     } else {
       setSelectedBackends(['opencode']);
     }
@@ -195,11 +193,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
     if (selectedProvider === 'anthropic' || selectedProvider === 'openai') {
       // For OpenAI, default backends depend on auth method.
       if (selectedProvider === 'openai') {
-        if (method.type === 'api') {
-          setSelectedBackends(['opencode', 'codex']);
-        } else {
-          setSelectedBackends(['opencode']);
-        }
+        setSelectedBackends(['opencode', 'codex']);
       }
       setStep('select-backends');
       return;
@@ -516,7 +510,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                   if (!isOAuth) return null;
                   return (
                     <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/80">
-                      Codex requires an OpenAI API key. Go back and choose <span className="font-medium">Enter API Key</span> to enable Codex.
+                      If you enable Codex, we will mint an OpenAI API key during connect (this is what the Codex CLI does after OAuth).
                     </div>
                   );
                 })()}
@@ -567,14 +561,14 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
 
                     {(() => {
                       const method = selectedMethodIndex !== null ? authMethods[selectedMethodIndex] : null;
-                      const disableCodex = method?.type === 'oauth';
+                      const disableCodex = false;
                       return (
                         <label
                           className={cn(
                             "flex items-center gap-3 p-3 rounded-xl border border-white/[0.06] transition-colors",
                             disableCodex ? "opacity-50 cursor-not-allowed" : "hover:bg-white/[0.02] cursor-pointer"
                           )}
-                          title={disableCodex ? "Codex requires an OpenAI API key (not ChatGPT OAuth)." : undefined}
+                          title={disableCodex ? "Codex is disabled." : undefined}
                         >
                           <input
                             type="checkbox"
@@ -586,7 +580,7 @@ export function AddProviderModal({ open, onClose, onSuccess, providerTypes }: Ad
                           <div className="flex-1">
                             <div className="text-sm text-white">Codex</div>
                             <div className="text-xs text-white/40">
-                              Use for Codex CLI missions (requires OpenAI API key)
+                              Use for Codex CLI missions
                             </div>
                           </div>
                         </label>
