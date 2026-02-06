@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::Context;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::process::{Child, Command};
 
 use crate::nspawn;
@@ -69,9 +70,28 @@ fn bind_resolv_conf(cmd: &mut Command) {
     }
 }
 
+fn bind_resolv_conf_cmd_builder(cmd: &mut CommandBuilder) {
+    if let Some(path) = select_container_resolv_conf() {
+        if path == Path::new("/etc/resolv.conf") {
+            cmd.arg("--bind-ro=/etc/resolv.conf");
+        } else {
+            cmd.arg(format!(
+                "--bind-ro={}:{}",
+                path.display(),
+                "/etc/resolv.conf"
+            ));
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceExec {
     pub workspace: Workspace,
+}
+
+pub struct PtyChild {
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 impl WorkspaceExec {
@@ -671,5 +691,213 @@ impl WorkspaceExec {
 
         let child = cmd.spawn().context("Failed to spawn workspace command")?;
         Ok(child)
+    }
+
+    pub async fn spawn_streaming_pty(
+        &self,
+        cwd: &Path,
+        program: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+    ) -> anyhow::Result<PtyChild> {
+        let mut env = self.build_env(env);
+        // A number of CLIs (notably Claude Code) behave differently without TERM.
+        env.entry("TERM".to_string())
+            .or_insert_with(|| "xterm-256color".to_string());
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("Failed to open PTY")?;
+
+        let mut cmd = match self.workspace.workspace_type {
+            WorkspaceType::Host => {
+                let mut cmd = CommandBuilder::new(program);
+                cmd.cwd(cwd);
+                if !args.is_empty() {
+                    cmd.args(args);
+                }
+                for (k, v) in &env {
+                    if k.trim().is_empty() {
+                        continue;
+                    }
+                    cmd.env(k, v);
+                }
+                cmd
+            }
+            WorkspaceType::Container => {
+                if !use_nspawn_for_workspace(&self.workspace) {
+                    let mut cmd = CommandBuilder::new(program);
+                    cmd.cwd(cwd);
+                    if !args.is_empty() {
+                        cmd.args(args);
+                    }
+                    for (k, v) in &env {
+                        if k.trim().is_empty() {
+                            continue;
+                        }
+                        cmd.env(k, v);
+                    }
+                    cmd
+                } else {
+                    if !env.contains_key("HOME") {
+                        env.insert("HOME".to_string(), "/root".to_string());
+                    }
+
+                    // Determine if Tailscale bootstrap is needed before the nsenter check.
+                    let tailscale_enabled_check = nspawn::tailscale_enabled(&env);
+                    let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
+                    let needs_tailscale_bootstrap =
+                        tailscale_enabled_check && !tailscale_args.is_empty();
+                    let nsenter_tailnet_only = needs_tailscale_bootstrap
+                        && self
+                            .workspace
+                            .tailscale_mode
+                            .unwrap_or(TailscaleMode::ExitNode)
+                            == TailscaleMode::TailnetOnly;
+
+                    if let Some(leader) = self.running_container_leader().await {
+                        let nsenter = if Path::new("/usr/bin/nsenter").exists() {
+                            "/usr/bin/nsenter"
+                        } else {
+                            "nsenter"
+                        };
+                        let rel_cwd = self.rel_path_in_container(cwd);
+                        let shell_cmd = if needs_tailscale_bootstrap {
+                            Self::build_tailscale_bootstrap_command(
+                                &rel_cwd,
+                                program,
+                                args,
+                                &env,
+                                true,
+                                nsenter_tailnet_only,
+                            )
+                        } else {
+                            let env_ref = if env.is_empty() { None } else { Some(&env) };
+                            Self::build_shell_command_with_env(&rel_cwd, program, args, env_ref)
+                        };
+
+                        let mut cmd = CommandBuilder::new(nsenter);
+                        cmd.arg("--target");
+                        cmd.arg(leader);
+                        cmd.args(["--mount", "--uts", "--ipc", "--net", "--pid"]);
+                        cmd.args(["/bin/sh", "-lc"]);
+                        cmd.arg(shell_cmd);
+                        cmd
+                    } else {
+                        // Spawn a one-shot command inside the container with systemd-nspawn.
+                        let root = self.workspace.path.clone();
+                        let rel_cwd = self.rel_path_in_container(cwd);
+
+                        let mut cmd = CommandBuilder::new("systemd-nspawn");
+                        cmd.arg("-D");
+                        cmd.arg(root.to_string_lossy().to_string());
+                        cmd.arg("--quiet");
+                        cmd.arg("--timezone=off");
+                        cmd.arg("--chdir");
+                        cmd.arg(rel_cwd.clone());
+
+                        // Ensure /root/context is available if Open Agent configured it.
+                        let context_dir_name = std::env::var("SANDBOXED_SH_CONTEXT_DIR_NAME")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| "context".to_string());
+                        let global_context_root = std::env::var("SANDBOXED_SH_CONTEXT_ROOT")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from("/root").join(&context_dir_name));
+                        if global_context_root.exists() {
+                            cmd.arg(format!(
+                                "--bind={}:/root/context",
+                                global_context_root.display()
+                            ));
+                            cmd.arg("--setenv=SANDBOXED_SH_CONTEXT_ROOT=/root/context");
+                            cmd.arg(format!(
+                                "--setenv=SANDBOXED_SH_CONTEXT_DIR_NAME={}",
+                                context_dir_name
+                            ));
+                        }
+
+                        // Bind X11 socket for GUI applications when available.
+                        let x11_socket_path = Path::new("/tmp/.X11-unix");
+                        if x11_socket_path.exists() {
+                            cmd.arg("--bind=/tmp/.X11-unix");
+                        }
+
+                        // Network configuration (same behavior as spawn_streaming/output).
+                        let use_shared_network = self.workspace.shared_network.unwrap_or(true);
+                        let tailscale_mode = self
+                            .workspace
+                            .tailscale_mode
+                            .unwrap_or(TailscaleMode::ExitNode);
+
+                        let tailscale_enabled = if use_shared_network {
+                            bind_resolv_conf_cmd_builder(&mut cmd);
+                            false
+                        } else {
+                            let tailscale_args = nspawn::tailscale_nspawn_extra_args(&env);
+                            if tailscale_args.is_empty() {
+                                bind_resolv_conf_cmd_builder(&mut cmd);
+                                false
+                            } else {
+                                bind_resolv_conf_cmd_builder(&mut cmd);
+                                for a in tailscale_args {
+                                    cmd.arg(a);
+                                }
+                                true
+                            }
+                        };
+
+                        // For tailnet_only mode, tell the bootstrap script to route internet via host gateway.
+                        let tailnet_only =
+                            tailscale_enabled && tailscale_mode == TailscaleMode::TailnetOnly;
+
+                        // Set env vars inside the container.
+                        for (k, v) in &env {
+                            if k.trim().is_empty() {
+                                continue;
+                            }
+                            cmd.arg(format!("--setenv={}={}", k, v));
+                        }
+
+                        if tailscale_enabled {
+                            // When Tailscale is configured, run the bootstrap script then exec the program.
+                            let shell_cmd = Self::build_tailscale_bootstrap_command(
+                                &rel_cwd,
+                                program,
+                                args,
+                                &env,
+                                false,
+                                tailnet_only,
+                            );
+                            cmd.args(["/bin/sh", "-c"]);
+                            cmd.arg(shell_cmd);
+                        } else {
+                            cmd.arg(program);
+                            cmd.args(args);
+                        }
+                        cmd
+                    }
+                }
+            }
+        };
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .context("Failed to spawn PTY command")?;
+        // Drop the slave so the child owns the TTY; we only keep the master side.
+        drop(pair.slave);
+
+        Ok(PtyChild {
+            child,
+            master: pair.master,
+        })
     }
 }

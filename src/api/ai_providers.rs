@@ -1248,25 +1248,11 @@ fn sync_to_opencode_auth(
         tracing::warn!("Failed to write Open Agent credentials: {}", e);
     }
 
-    // For Anthropic, also sync to Claude Code's .credentials.json
-    if matches!(provider_type, ProviderType::Anthropic) {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let claude_dir = PathBuf::from(home).join(".claude");
-        if let Err(e) = write_claudecode_credentials_from_entry(
-            &claude_dir,
-            access_token,
-            refresh_token,
-            expires_at,
-        ) {
-            tracing::warn!("Failed to sync Claude Code credentials: {}", e);
-        }
-    }
-
     Ok(())
 }
 
 /// Write Claude Code credentials from explicit values (avoids re-reading from auth.json).
-fn write_claudecode_credentials_from_entry(
+pub(crate) fn write_claudecode_credentials_from_entry(
     credentials_dir: &std::path::Path,
     access_token: &str,
     refresh_token: &str,
@@ -1991,6 +1977,17 @@ pub fn write_claudecode_credentials_for_workspace(
 ) -> Result<(), String> {
     use crate::workspace::WorkspaceType;
 
+    // Avoid clobbering the host's global Claude CLI credentials (used by `claude /login`).
+    // For host workspaces, Claude Code missions should instead run with a per-mission HOME
+    // so credentials live inside the mission directory.
+    if workspace.workspace_type == WorkspaceType::Host {
+        tracing::info!(
+            workspace_path = %workspace.path.display(),
+            "Skipping Claude Code credentials sync for host workspace"
+        );
+        return Ok(());
+    }
+
     let entry = read_oauth_token_entry(ProviderType::Anthropic)
         .or_else(|| {
             if workspace.workspace_type == WorkspaceType::Container {
@@ -2014,11 +2011,7 @@ pub fn write_claudecode_credentials_for_workspace(
             // Container workspaces: write to /root/.claude inside the container
             workspace.path.join("root").join(".claude")
         }
-        WorkspaceType::Host => {
-            // Host workspaces: write to $HOME/.claude
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            std::path::PathBuf::from(home).join(".claude")
-        }
+        WorkspaceType::Host => unreachable!("host handled above"),
     };
 
     write_claudecode_credentials_from_entry(

@@ -1428,11 +1428,10 @@ pub fn run_claudecode_turn<'a>(
         use super::ai_providers::{
             ensure_anthropic_oauth_token_valid, get_anthropic_auth_for_claudecode,
             get_anthropic_auth_from_host_with_expiry, get_anthropic_auth_from_workspace,
-            get_workspace_auth_path, refresh_workspace_anthropic_auth,
-            write_claudecode_credentials_for_workspace, ClaudeCodeAuth,
+            get_workspace_auth_path, refresh_workspace_anthropic_auth, ClaudeCodeAuth,
         };
         use std::collections::HashMap;
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::time::{Duration, Instant};
 
         fn classify_claudecode_secret(value: String) -> ClaudeCodeAuth {
             if value.starts_with("sk-ant-oat") {
@@ -1442,8 +1441,81 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // Ensure OAuth tokens are fresh before resolving credentials.
-        let oauth_refresh_result = ensure_anthropic_oauth_token_valid().await;
+        fn looks_like_claude_cli_credentials(path: &std::path::Path) -> bool {
+            let metadata = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            if metadata.len() == 0 {
+                return false;
+            }
+            let contents = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            let creds: serde_json::Value = match serde_json::from_str(&contents) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            creds
+                .get("claudeAiOauth")
+                .and_then(|o| o.get("accessToken"))
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        }
+
+        fn find_host_claude_cli_credentials() -> Option<std::path::PathBuf> {
+            let mut candidates = vec![
+                std::path::PathBuf::from("/var/lib/opencode/.claude/.credentials.json"),
+                std::path::PathBuf::from("/root/.claude/.credentials.json"),
+            ];
+            if let Ok(home) = std::env::var("HOME") {
+                candidates.push(std::path::PathBuf::from(home).join(".claude/.credentials.json"));
+            }
+
+            candidates
+                .into_iter()
+                .find(|p| looks_like_claude_cli_credentials(p))
+        }
+
+        // Prefer the user's Claude CLI login if present, but avoid mutating the global
+        // credentials file. We run each mission with a per-mission HOME, and copy the
+        // host credentials into the mission directory if needed.
+        let mission_creds_path = work_dir.join(".claude").join(".credentials.json");
+        if !looks_like_claude_cli_credentials(&mission_creds_path) {
+            if let Some(host_creds) = find_host_claude_cli_credentials() {
+                if let Some(parent) = mission_creds_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::copy(&host_creds, &mission_creds_path) {
+                    Ok(_) => {
+                        tracing::info!(
+                            from = %host_creds.display(),
+                            to = %mission_creds_path.display(),
+                            "Copied Claude CLI credentials into mission directory"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            from = %host_creds.display(),
+                            to = %mission_creds_path.display(),
+                            error = %e,
+                            "Failed to copy Claude CLI credentials into mission directory"
+                        );
+                    }
+                }
+            }
+        }
+        let has_cli_creds = looks_like_claude_cli_credentials(&mission_creds_path);
+
+        // Only refresh OpenCode/Anthropic OAuth tokens if we plan to inject them.
+        let oauth_refresh_result = if has_cli_creds {
+            Ok(())
+        } else {
+            // Ensure OAuth tokens are fresh before resolving credentials.
+            ensure_anthropic_oauth_token_valid().await
+        };
         if let Err(e) = &oauth_refresh_result {
             tracing::warn!("Failed to refresh Anthropic OAuth token: {}", e);
         }
@@ -1451,7 +1523,9 @@ pub fn run_claudecode_turn<'a>(
         // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
         // For container workspaces, compare workspace auth vs host auth and use the fresher one.
         // If workspace auth is expired, try to refresh it using the refresh token.
-        let api_auth = {
+        let api_auth = if has_cli_creds {
+            None
+        } else {
             // For container workspaces, get both workspace and host auth with expiry info
             let mut workspace_auth = if workspace.workspace_type == WorkspaceType::Container {
                 get_anthropic_auth_from_workspace(&workspace.path)
@@ -1612,44 +1686,14 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // Fail fast if no auth is available
-        if api_auth.is_none() {
-            let err_msg = "No Anthropic credentials detected; please authenticate in Settings → AI Providers or set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
+        // Fail fast only if neither:
+        // - Claude CLI credentials are available (copied into the mission directory), nor
+        // - We have explicit API auth to inject via env vars.
+        if api_auth.is_none() && !has_cli_creds {
+            let err_msg = "No Claude Code credentials detected. Either run `claude /login` on the host, or authenticate in Settings → AI Providers / set CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY.";
             tracing::warn!(mission_id = %mission_id, "{}", err_msg);
             return AgentResult::failure(err_msg.to_string(), 0)
                 .with_terminal_reason(TerminalReason::LlmError);
-        }
-
-        // Write Claude Code credentials file with refresh token for long-running missions.
-        // This allows Claude Code to refresh tokens automatically during execution.
-        let is_oauth = matches!(api_auth, Some(ClaudeCodeAuth::OAuthToken(_)));
-        let mut wrote_claude_credentials = false;
-        tracing::debug!(
-            mission_id = %mission_id,
-            is_oauth = is_oauth,
-            workspace_path = %workspace.path.display(),
-            workspace_type = ?workspace.workspace_type,
-            "Checking if should write Claude Code credentials"
-        );
-        if is_oauth {
-            match write_claudecode_credentials_for_workspace(&workspace) {
-                Ok(()) => {
-                    wrote_claude_credentials = true;
-                    tracing::info!(
-                        mission_id = %mission_id,
-                        workspace_type = ?workspace.workspace_type,
-                        "Wrote Claude Code credentials with refresh token for automatic token refresh"
-                    );
-                }
-                Err(e) => {
-                    // Non-fatal: we still have the access token in env var as fallback
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        error = %e,
-                        "Failed to write Claude Code credentials file (token refresh during mission may fail)"
-                    );
-                }
-            }
         }
 
         // Determine CLI path: prefer backend config, then env var, then default
@@ -1821,21 +1865,58 @@ pub fn run_claudecode_turn<'a>(
         let mut env: HashMap<String, String> = HashMap::new();
         // Allow --dangerously-skip-permissions when running as root inside containers.
         env.insert("IS_SANDBOX".to_string(), "1".to_string());
+
+        // Run Claude Code with a per-mission HOME to avoid:
+        // - clobbering global `~/.claude/.credentials.json`
+        // - cross-mission config lock contention inside the shared home dir
+        let mission_home = workspace_exec.translate_path_for_container(work_dir);
+        let xdg_config_home = work_dir.join(".config");
+        let xdg_data_home = work_dir.join(".local").join("share");
+        let xdg_state_home = work_dir.join(".local").join("state");
+        let xdg_cache_home = work_dir.join(".cache");
+
+        for dir in [
+            &xdg_config_home,
+            &xdg_data_home,
+            &xdg_state_home,
+            &xdg_cache_home,
+        ] {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    mission_id = %mission_id,
+                    path = %dir.display(),
+                    error = %e,
+                    "Failed to create per-mission XDG directory"
+                );
+            }
+        }
+
+        env.insert("HOME".to_string(), mission_home);
+        env.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_config_home),
+        );
+        env.insert(
+            "XDG_DATA_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_data_home),
+        );
+        env.insert(
+            "XDG_STATE_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_state_home),
+        );
+        env.insert(
+            "XDG_CACHE_HOME".to_string(),
+            workspace_exec.translate_path_for_container(&xdg_cache_home),
+        );
+
         if let Some(ref auth) = api_auth {
             match auth {
                 ClaudeCodeAuth::OAuthToken(token) => {
                     env.insert("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.clone());
-                    if wrote_claude_credentials {
-                        tracing::debug!(
-                            "Claude credentials file also written for token refresh (token_len={})",
-                            token.len()
-                        );
-                    } else {
-                        tracing::debug!(
-                            "Using OAuth token for Claude CLI authentication (token_len={})",
-                            token.len()
-                        );
-                    }
+                    tracing::debug!(
+                        "Injecting OAuth token for Claude CLI authentication (token_len={})",
+                        token.len()
+                    );
                 }
                 ClaudeCodeAuth::ApiKey(key) => {
                     env.insert("ANTHROPIC_API_KEY".to_string(), key.clone());
@@ -1843,7 +1924,11 @@ pub fn run_claudecode_turn<'a>(
                 }
             }
         } else {
-            tracing::warn!("No authentication available for Claude Code!");
+            if has_cli_creds {
+                tracing::debug!("Using Claude CLI credentials from mission directory");
+            } else {
+                tracing::warn!("No authentication available for Claude Code!");
+            }
         }
 
         // Handle case where cli_path might be a wrapper command like "bun /path/to/claude"
@@ -1888,9 +1973,13 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // Use WorkspaceExec to spawn the CLI in the correct workspace context
-        let mut child = match workspace_exec
-            .spawn_streaming(work_dir, &program, &full_args, env)
+        // Use WorkspaceExec to spawn the CLI in the correct workspace context.
+        //
+        // Claude Code 2.1.x can hang indefinitely when stdout is a pipe (non-tty),
+        // even in `--print --output-format stream-json` mode. Running it under a PTY
+        // fixes this and restores streaming.
+        let mut pty = match workspace_exec
+            .spawn_streaming_pty(work_dir, &program, &full_args, env)
             .await
         {
             Ok(child) => child,
@@ -1903,43 +1992,40 @@ pub fn run_claudecode_turn<'a>(
         };
 
         // Close stdin since we pass the prompt via argv.
-        drop(child.stdin.take());
+        let _ = pty.master.take_writer();
 
-        // Get stdout for reading events
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                let err_msg = "Failed to capture Claude stdout";
+        let reader = match pty.master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = pty.child.kill();
+                let err_msg = format!("Failed to capture Claude PTY output: {}", e);
                 tracing::error!("{}", err_msg);
-                return AgentResult::failure(err_msg.to_string(), 0)
+                return AgentResult::failure(err_msg, 0)
                     .with_terminal_reason(TerminalReason::LlmError);
             }
         };
 
-        // Capture stderr for debugging
-        let stderr = child.stderr.take();
-        let stderr_capture = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
-        let stderr_capture_clone = stderr_capture.clone();
-        let mission_id_for_stderr = mission_id;
-        let mut stderr_handle = if let Some(stderr) = stderr {
-            Some(tokio::spawn(async move {
-                let stderr_reader = BufReader::new(stderr);
-                let mut stderr_lines = stderr_reader.lines();
-                while let Ok(Some(line)) = stderr_lines.next_line().await {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        tracing::debug!(mission_id = %mission_id_for_stderr, stderr = %trimmed, "Claude Code stderr");
-                        let mut captured = stderr_capture_clone.lock().await;
-                        if !captured.is_empty() {
-                            captured.push('\n');
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let reader_handle = tokio::task::spawn_blocking(move || {
+            use std::io::BufRead;
+            let mut buf_reader = std::io::BufReader::new(reader);
+            let mut buf: Vec<u8> = Vec::with_capacity(8192);
+            loop {
+                buf.clear();
+                match buf_reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let s = String::from_utf8_lossy(&buf).to_string();
+                        if line_tx.send(s).is_err() {
+                            break;
                         }
-                        captured.push_str(trimmed);
                     }
+                    Err(_) => break,
                 }
-            }))
-        } else {
-            None
-        };
+            }
+        });
+
+        let mut non_json_output: Vec<String> = Vec::new();
 
         // Track tool calls for result mapping
         let mut pending_tools: HashMap<String, String> = HashMap::new();
@@ -1956,11 +2042,21 @@ pub fn run_claudecode_turn<'a>(
         let mut last_text_len: usize = 0; // Track last emitted text length for streaming text deltas
         let mut thinking_emitted = false;
 
-        let mut received_any_event = false;
-
-        // Create a buffered reader for stdout
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
+        let mut saw_non_init_event = false;
+        let startup_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_STARTUP_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(20),
+        );
+        let idle_timeout = Duration::from_secs(
+            std::env::var("SANDBOXED_SH_CLAUDECODE_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(600),
+        );
+        let startup_deadline = Instant::now() + startup_timeout;
+        let mut idle_deadline = Instant::now() + idle_timeout;
 
         // Process events until completion or cancellation
         loop {
@@ -1968,40 +2064,78 @@ pub fn run_claudecode_turn<'a>(
                 _ = cancel.cancelled() => {
                     tracing::info!(mission_id = %mission_id, "Claude Code execution cancelled, killing process");
                     // Kill the process to stop consuming API resources
-                    let _ = child.kill().await;
-                    if let Some(handle) = stderr_handle.take() {
-                        handle.abort();
-                    }
+                    let _ = pty.child.kill();
+                    reader_handle.abort();
                     return AgentResult::failure("Cancelled".to_string(), 0)
                         .with_terminal_reason(TerminalReason::Cancelled);
                 }
-                line_result = lines.next_line() => {
-                    match line_result {
-                        Ok(Some(line)) => {
-                            if line.is_empty() {
-                                continue;
-                            }
+                _ = tokio::time::sleep_until(startup_deadline), if !saw_non_init_event => {
+                    let _ = pty.child.kill();
+                    reader_handle.abort();
+                    return AgentResult::failure(
+                        "Claude Code produced no stream events after startup timeout. This is typically caused by the Claude CLI hanging when run without a TTY.".to_string(),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::LlmError);
+                }
+                _ = tokio::time::sleep_until(idle_deadline), if saw_non_init_event => {
+                    let _ = pty.child.kill();
+                    reader_handle.abort();
+                    return AgentResult::failure(
+                        "Claude Code produced no output for an extended period and was terminated (idle timeout).".to_string(),
+                        0,
+                    )
+                    .with_terminal_reason(TerminalReason::LlmError);
+                }
+                line_opt = line_rx.recv() => {
+                    let Some(raw_line) = line_opt else {
+                        // EOF - PTY closed
+                        break;
+                    };
 
-                            let claude_event: ClaudeEvent = match serde_json::from_str(&line) {
-                                Ok(event) => event,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        mission_id = %mission_id,
-                                        "Failed to parse Claude event: {} - line: {}",
-                                        e,
-                                        if line.len() > 200 {
-                                            let end = safe_truncate_index(&line, 200);
-                                            format!("{}...", &line[..end])
-                                        } else {
-                                            line.clone()
-                                        }
-                                    );
-                                    continue;
+                    idle_deadline = Instant::now() + idle_timeout;
+
+                    let raw_line = raw_line.trim_end_matches(&['\r', '\n'][..]);
+                    let cleaned = strip_ansi_codes(raw_line);
+                    let line = cleaned.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    if !line.starts_with('{') {
+                        // Preserve a small excerpt for diagnostics on "no output" failures.
+                        if non_json_output.len() < 20 {
+                            non_json_output.push(if line.len() > 200 {
+                                let end = safe_truncate_index(line, 200);
+                                format!("{}...", &line[..end])
+                            } else {
+                                line.to_string()
+                            });
+                        }
+                        continue;
+                    }
+
+                    let claude_event: ClaudeEvent = match serde_json::from_str(line) {
+                        Ok(event) => event,
+                        Err(e) => {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                "Failed to parse Claude event: {} - line: {}",
+                                e,
+                                if line.len() > 200 {
+                                    let end = safe_truncate_index(line, 200);
+                                    format!("{}...", &line[..end])
+                                } else {
+                                    line.to_string()
                                 }
-                            };
+                            );
+                            continue;
+                        }
+                    };
 
-                            // Track whether we received any output
-                            received_any_event = true;
+                    if !matches!(claude_event, ClaudeEvent::System(_)) {
+                        saw_non_init_event = true;
+                    }
 
                             match claude_event {
                                 ClaudeEvent::System(sys) => {
@@ -2137,10 +2271,8 @@ pub fn run_claudecode_turn<'a>(
                                                         let hub = Arc::clone(hub);
                                                         let rx = hub.register(id.clone()).await;
 
-                                                        let _ = child.kill().await;
-                                                        if let Some(handle) = stderr_handle.take() {
-                                                            handle.abort();
-                                                        }
+                                                        let _ = pty.child.kill();
+                                                        reader_handle.abort();
 
                                                         let answer = tokio::select! {
                                                             _ = cancel.cancelled() => {
@@ -2271,36 +2403,29 @@ pub fn run_claudecode_turn<'a>(
                                     break;
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            // EOF - process finished
-                            tracing::debug!(
-                                mission_id = %mission_id,
-                                received_any_event = received_any_event,
-                                final_result_len = final_result.len(),
-                                had_error = had_error,
-                                "Claude stdout EOF reached"
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(mission_id = %mission_id, "Error reading from Claude CLI: {}", e);
-                            break;
-                        }
-                    }
                 }
             }
         }
 
-        // Wait for child process to finish and clean up
-        tracing::debug!(mission_id = %mission_id, "Event loop completed, waiting for child process");
-        let exit_status = child.wait().await;
-        tracing::debug!(mission_id = %mission_id, exit_status = ?exit_status, "Child process exited");
+        // Wait for child process to finish and clean up.
+        tracing::debug!(
+            mission_id = %mission_id,
+            "Event loop completed, waiting for Claude Code process"
+        );
+        let child = pty.child;
+        let exit_status = tokio::task::spawn_blocking(move || {
+            let mut child = child;
+            child.wait()
+        })
+        .await;
+        tracing::debug!(
+            mission_id = %mission_id,
+            exit_status = ?exit_status,
+            "Claude Code process exited"
+        );
 
-        // Wait for stderr capture to complete
-        if let Some(handle) = stderr_handle {
-            let _ = handle.await;
-        }
+        // Ensure the PTY reader task stops (it should naturally end after process exit).
+        let _ = reader_handle.await;
 
         // Convert cost from USD to cents
         let cost_cents = (total_cost_usd * 100.0) as u64;
@@ -2325,28 +2450,21 @@ pub fn run_claudecode_turn<'a>(
 
         if final_result.trim().is_empty() && !had_error {
             had_error = true;
-            // Include stderr in error message if available
-            let stderr_content = stderr_capture.lock().await;
-            if !stderr_content.is_empty() {
+            if !non_json_output.is_empty() {
                 tracing::warn!(
                     mission_id = %mission_id,
-                    stderr = %stderr_content,
                     exit_status = ?exit_status,
-                    "Claude Code produced no output but had stderr"
+                    "Claude Code produced no parseable JSON output"
                 );
                 final_result = format!(
-                    "Claude Code error: {}",
-                    stderr_content
-                        .lines()
-                        .take(5)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
+                    "Claude Code produced no parseable output. Last output: {}",
+                    non_json_output.join(" | ")
                 );
             } else {
                 tracing::warn!(
                     mission_id = %mission_id,
                     exit_status = ?exit_status,
-                    "Claude Code produced no output and no stderr"
+                    "Claude Code produced no output"
                 );
                 final_result =
                     "Claude Code produced no output. Check CLI installation or authentication."
@@ -2354,24 +2472,15 @@ pub fn run_claudecode_turn<'a>(
             }
         }
 
-        // If Claude reported an error but didn't provide a useful message, fall back to stderr.
+        // If Claude reported an error but didn't provide a useful message, fall back to raw output.
         if had_error && (final_result.trim().is_empty() || final_result.trim() == "Unknown error") {
-            let stderr_content = stderr_capture.lock().await;
-            if !stderr_content.is_empty() {
+            if !non_json_output.is_empty() {
                 tracing::warn!(
                     mission_id = %mission_id,
-                    stderr = %stderr_content,
                     exit_status = ?exit_status,
-                    "Claude Code failed with empty/generic error; using stderr excerpt"
+                    "Claude Code failed with empty/generic error; using raw output excerpt"
                 );
-                final_result = format!(
-                    "Claude Code error: {}",
-                    stderr_content
-                        .lines()
-                        .take(5)
-                        .collect::<Vec<_>>()
-                        .join(" | ")
-                );
+                final_result = format!("Claude Code error: {}", non_json_output.join(" | "));
             }
         }
 
@@ -6796,6 +6905,15 @@ pub async fn run_codex_turn(
             done: true,
             mission_id: Some(mission_id),
         });
+    }
+
+    let no_output = assistant_message.trim().is_empty() && last_summary.is_none();
+    if no_output && error_message.is_none() {
+        success = false;
+        error_message = Some(
+            "Codex produced no output. This usually means the Codex CLI failed before emitting JSON (often authentication). Check that the host has a valid `~/.codex/auth.json` and that the backend can access it."
+                .to_string(),
+        );
     }
 
     let final_message = if let Some(err) = error_message {

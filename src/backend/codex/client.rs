@@ -152,13 +152,33 @@ impl CodexClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to capture Codex stderr"))?;
 
+        let stderr_capture = Arc::new(Mutex::new(String::new()));
+        let stderr_capture_clone = Arc::clone(&stderr_capture);
         tokio::spawn(async move {
             use tokio::io::AsyncBufReadExt;
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if !line.is_empty() {
-                    debug!("Codex stderr: {}", line);
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                debug!("Codex stderr: {}", trimmed);
+
+                // Keep a small excerpt to surface in "No response" cases.
+                let mut captured = stderr_capture_clone.lock().await;
+                if captured.len() > 4096 {
+                    continue;
+                }
+                if !captured.is_empty() {
+                    captured.push('\n');
+                }
+                // Avoid exploding logs from very long lines.
+                if trimmed.len() > 400 {
+                    captured.push_str(&trimmed[..400]);
+                    captured.push_str("...");
+                } else {
+                    captured.push_str(trimmed);
                 }
             }
         });
@@ -170,6 +190,7 @@ impl CodexClient {
         let task_handle = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
+            let mut saw_any_event = false;
 
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.is_empty() {
@@ -184,6 +205,7 @@ impl CodexClient {
 
                 match serde_json::from_str::<CodexEvent>(&line) {
                     Ok(event) => {
+                        saw_any_event = true;
                         debug!("Codex event: {:?}", event);
                         if tx.send(event).await.is_err() {
                             debug!("Receiver dropped, stopping Codex event stream");
@@ -202,6 +224,25 @@ impl CodexClient {
                             }
                         );
                     }
+                }
+            }
+
+            // If the CLI exited without emitting any JSON events, surface stderr as an error.
+            if !saw_any_event {
+                let stderr_content = stderr_capture.lock().await;
+                if !stderr_content.trim().is_empty() {
+                    let _ = tx
+                        .send(CodexEvent::Error {
+                            message: format!(
+                                "Codex CLI produced no JSON output. Stderr: {}",
+                                stderr_content
+                                    .lines()
+                                    .take(10)
+                                    .collect::<Vec<_>>()
+                                    .join(" | ")
+                            ),
+                        })
+                        .await;
                 }
             }
 
