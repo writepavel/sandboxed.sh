@@ -53,11 +53,6 @@ const getProviderAuthMethods = (providerType: AIProviderType): AIProviderAuthMet
         type: 'oauth',
         description: 'Use your ChatGPT subscription via official OAuth',
       },
-      {
-        label: 'ChatGPT Plus/Pro (OAuth manual paste)',
-        type: 'oauth',
-        description: 'Paste the full redirect URL if the callback fails',
-      },
       { label: 'Enter API Key', type: 'api', description: 'Use an existing API key' },
     ];
   }
