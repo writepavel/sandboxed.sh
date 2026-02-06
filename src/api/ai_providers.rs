@@ -726,7 +726,9 @@ pub type CodexAuth = ClaudeCodeAuth;
 fn find_host_codex_auth_json() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let candidates = [
-        std::path::PathBuf::from(&home).join(".codex").join("auth.json"),
+        std::path::PathBuf::from(&home)
+            .join(".codex")
+            .join("auth.json"),
         std::path::PathBuf::from("/var/lib/opencode/.codex/auth.json"),
     ];
     for candidate in &candidates {
@@ -801,7 +803,8 @@ fn write_codex_config_from_entry(
 
         let mut auth_file = std::fs::File::create(&auth_path)
             .map_err(|e| format!("Failed to create Codex auth.json: {}", e))?;
-        auth_file.write_all(auth_contents.as_bytes())
+        auth_file
+            .write_all(auth_contents.as_bytes())
             .map_err(|e| format!("Failed to write Codex auth.json: {}", e))?;
     }
 

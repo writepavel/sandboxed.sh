@@ -2536,9 +2536,11 @@ pub async fn prepare_mission_workspace(
 pub async fn prepare_mission_workspace_in(
     workspace: &Workspace,
     mcp: &McpRegistry,
-    _mission_id: Uuid,
+    mission_id: Uuid,
 ) -> anyhow::Result<PathBuf> {
-    let dir = workspace.path.clone();
+    // Use a mission-specific directory under the workspace root so multiple missions
+    // can run concurrently without clobbering per-workspace config files.
+    let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
     let mcp_configs = filter_mcp_configs_for_workspace(mcp.list_configs().await, &workspace.mcps);
     let skill_allowlist = if workspace.skills.is_empty() {
@@ -2619,7 +2621,9 @@ pub async fn prepare_mission_workspace_with_skills_backend(
     custom_providers: Option<&[AIProvider]>,
     config_profile: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
-    let dir = workspace.path.clone();
+    // Mission workspace directory lives under the selected workspace root.
+    // This keeps filesystem and config effects scoped to the mission.
+    let dir = mission_workspace_dir_for_root(&workspace.path, mission_id);
     prepare_workspace_dir(&dir).await?;
 
     // Get custom providers: use provided list or read from file

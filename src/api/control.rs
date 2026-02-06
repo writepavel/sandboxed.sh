@@ -2182,7 +2182,7 @@ fn spawn_control_session(
         tokio::spawn(stale_mission_cleanup_loop(
             Arc::clone(&state.mission_store),
             config.stale_mission_hours,
-            Arc::clone(&running_missions),
+            state.cmd_tx.clone(),
             events_tx.clone(),
         ));
     }
@@ -2238,7 +2238,7 @@ fn spawn_control_session(
 async fn stale_mission_cleanup_loop(
     mission_store: Arc<dyn MissionStore>,
     stale_hours: u64,
-    running_missions: Arc<RwLock<Vec<super::mission_runner::RunningMissionInfo>>>,
+    cmd_tx: mpsc::Sender<ControlCommand>,
     events_tx: broadcast::Sender<AgentEvent>,
 ) {
     // Check every 5 minutes (fast enough to catch orphans promptly).
@@ -2255,38 +2255,62 @@ async fn stale_mission_cleanup_loop(
         // --- Orphan detection: active in DB but not running in-process ---
         match mission_store.get_all_active_missions().await {
             Ok(active_missions) if !active_missions.is_empty() => {
-                let running = running_missions.read().await;
-                let running_ids: std::collections::HashSet<Uuid> =
-                    running.iter().map(|r| r.mission_id).collect();
-                drop(running);
-
-                for mission in &active_missions {
-                    if !running_ids.contains(&mission.id) {
-                        tracing::info!(
-                            "Orphan detected: mission {} '{}' is active in DB but has no running process (last update: {})",
-                            mission.id,
-                            mission.title.as_deref().unwrap_or("Untitled"),
-                            mission.updated_at
-                        );
-                        if let Err(e) = mission_store
-                            .update_mission_status(mission.id, MissionStatus::Interrupted)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to mark orphaned mission {} as interrupted: {}",
-                                mission.id,
-                                e
-                            );
-                        } else {
-                            let _ = events_tx.send(AgentEvent::MissionStatusChanged {
-                                mission_id: mission.id,
-                                status: MissionStatus::Interrupted,
-                                summary: Some(
-                                    "Interrupted: harness process is no longer running".to_string(),
-                                ),
-                            });
+                let running_ids: Option<std::collections::HashSet<Uuid>> = {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    if cmd_tx
+                        .send(ControlCommand::ListRunning { respond: tx })
+                        .await
+                        .is_err()
+                    {
+                        None
+                    } else {
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+                            Ok(Ok(running)) => Some(
+                                running
+                                    .into_iter()
+                                    .map(|r| r.mission_id)
+                                    .collect::<std::collections::HashSet<_>>(),
+                            ),
+                            Ok(Err(_)) => None,
+                            Err(_) => None,
                         }
                     }
+                };
+
+                if let Some(running_ids) = running_ids {
+                    for mission in &active_missions {
+                        if !running_ids.contains(&mission.id) {
+                            tracing::info!(
+                                "Orphan detected: mission {} '{}' is active in DB but has no running process (last update: {})",
+                                mission.id,
+                                mission.title.as_deref().unwrap_or("Untitled"),
+                                mission.updated_at
+                            );
+                            if let Err(e) = mission_store
+                                .update_mission_status(mission.id, MissionStatus::Interrupted)
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to mark orphaned mission {} as interrupted: {}",
+                                    mission.id,
+                                    e
+                                );
+                            } else {
+                                let _ = events_tx.send(AgentEvent::MissionStatusChanged {
+                                    mission_id: mission.id,
+                                    status: MissionStatus::Interrupted,
+                                    summary: Some(
+                                        "Interrupted: harness process is no longer running"
+                                            .to_string(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "Mission cleanup: failed to list running missions; skipping orphan check tick"
+                    );
                 }
             }
             Ok(_) => {}
@@ -5480,11 +5504,7 @@ pub async fn webhook_receiver(
             }
             Ok(None) => continue,
             Err(e) => {
-                tracing::warn!(
-                    "Error searching webhook {} in session: {}",
-                    webhook_id,
-                    e
-                );
+                tracing::warn!("Error searching webhook {} in session: {}", webhook_id, e);
                 continue;
             }
         }
