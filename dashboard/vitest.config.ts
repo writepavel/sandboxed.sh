@@ -6,7 +6,10 @@ export default defineConfig({
   plugins: [react()],
   test: {
     environment: "jsdom",
-    include: ["**/*.test.ts", "**/*.test.tsx"],
+    // Only run unit tests for the dashboard itself. The `context/` subtree
+    // vendors other projects with their own (often Bun-specific) test setups.
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+    exclude: ["context/**"],
     setupFiles: ["./src/test/setup.ts"],
   },
   resolve: {

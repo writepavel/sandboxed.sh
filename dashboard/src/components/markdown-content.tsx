@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useEffect, useMemo, memo } from "react";
 import { createRoot } from "react-dom/client";
-import Markdown, { Components } from "react-markdown";
+import Markdown, { Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -10,6 +10,7 @@ import { Copy, Check, Download, Image, X, FileText, File, FileCode, FileArchive 
 import { cn } from "@/lib/utils";
 import { getRuntimeApiBase } from "@/lib/settings";
 import { authHeader } from "@/lib/auth";
+import { transformRichTags } from "@/lib/rich-tags";
 
 interface MarkdownContentProps {
   content: string;
@@ -382,6 +383,195 @@ function CopyCodeButton({ code }: { code: string }) {
   );
 }
 
+/** Inline image preview rendered for `<image path="..." />` tags. */
+function InlineImagePreview({
+  path,
+  alt,
+  basePath,
+  workspaceId,
+  missionId,
+}: {
+  path: string;
+  alt: string;
+  basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
+}) {
+  const resolvedPath = resolvePath(path, basePath);
+  const [imageUrl, setImageUrl] = useState<string | null>(imageUrlCache.get(resolvedPath) || null);
+  const [loading, setLoading] = useState(!imageUrl);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (imageUrl) return;
+    let cancelled = false;
+    const fetchImage = async () => {
+      const API_BASE = getRuntimeApiBase();
+      const params = new URLSearchParams({ path: resolvedPath });
+      if (workspaceId) params.set("workspace_id", workspaceId);
+      if (missionId) params.set("mission_id", missionId);
+      try {
+        const res = await fetch(`${API_BASE}/api/fs/download?${params.toString()}`, {
+          headers: { ...authHeader() },
+        });
+        if (!res.ok) {
+          if (!cancelled) setError(`File not found (${res.status})`);
+          if (!cancelled) setLoading(false);
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        cacheImageUrl(resolvedPath, url);
+        if (!cancelled) setImageUrl(url);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    fetchImage();
+    return () => { cancelled = true; };
+  }, [imageUrl, resolvedPath, workspaceId, missionId]);
+
+  if (error) {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-500/10 text-red-400 text-xs">
+        <Image className="h-3.5 w-3.5" />
+        {error}
+      </span>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="my-2 rounded-xl overflow-hidden bg-white/[0.03] animate-pulse" style={{ maxWidth: 400, height: 200 }} />
+    );
+  }
+
+  return (
+    <div className="my-2">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={imageUrl!}
+        alt={alt}
+        className="max-h-[300px] rounded-xl border border-white/[0.06] cursor-pointer hover:border-white/[0.12] transition-colors"
+        onClick={() => showFilePreviewModal(path, resolvedPath, workspaceId, missionId)}
+      />
+    </div>
+  );
+}
+
+/** Inline file download card rendered for `<file path="..." />` tags. */
+function InlineFileCard({
+  path,
+  displayName,
+  basePath,
+  workspaceId,
+  missionId,
+}: {
+  path: string;
+  displayName: string;
+  basePath?: string;
+  workspaceId?: string;
+  missionId?: string;
+}) {
+  const resolvedPath = resolvePath(path, basePath);
+  const FileIcon = getFileIcon(path);
+  const ext = path.split(".").pop()?.toUpperCase() || "";
+  const [metadata, setMetadata] = useState<{ size?: number; exists: boolean } | null>(null);
+  const [downloading, setDownloading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchMeta = async () => {
+      const API_BASE = getRuntimeApiBase();
+      const params = new URLSearchParams({ path: resolvedPath });
+      if (workspaceId) params.set("workspace_id", workspaceId);
+      if (missionId) params.set("mission_id", missionId);
+      try {
+        const res = await fetch(`${API_BASE}/api/fs/validate?${params.toString()}`, {
+          headers: { ...authHeader() },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (!cancelled) setMetadata({ exists: data.exists, size: data.size });
+        } else {
+          if (!cancelled) setMetadata({ exists: false });
+        }
+      } catch {
+        if (!cancelled) setMetadata({ exists: false });
+      }
+    };
+    fetchMeta();
+    return () => { cancelled = true; };
+  }, [resolvedPath, workspaceId, missionId]);
+
+  const handleDownload = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setDownloading(true);
+    try {
+      const API_BASE = getRuntimeApiBase();
+      const params = new URLSearchParams({ path: resolvedPath });
+      if (workspaceId) params.set("workspace_id", workspaceId);
+      if (missionId) params.set("mission_id", missionId);
+      const res = await fetch(`${API_BASE}/api/fs/download?${params.toString()}`, {
+        headers: { ...authHeader() },
+      });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = displayName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  if (metadata && !metadata.exists) {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-500/10 text-red-400 text-xs">
+        <File className="h-3.5 w-3.5" />
+        File not found: {displayName}
+      </span>
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        "my-2 inline-flex items-center gap-3 px-4 py-3 rounded-xl",
+        "bg-white/[0.04] border border-white/[0.06] hover:bg-white/[0.06] hover:border-white/[0.1]",
+        "cursor-pointer transition-colors max-w-sm"
+      )}
+      onClick={() => showFilePreviewModal(path, resolvedPath, workspaceId, missionId)}
+    >
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10">
+        <FileIcon className="h-4 w-4 text-indigo-400" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium text-white/80 truncate">{displayName}</div>
+        <div className="text-xs text-white/40">
+          {ext && <span className="mr-2">{ext}</span>}
+          {metadata?.size != null && <span>{formatFileSize(metadata.size)}</span>}
+        </div>
+      </div>
+      <button
+        onClick={handleDownload}
+        disabled={downloading}
+        className="p-1.5 rounded-lg text-white/40 hover:text-white/70 hover:bg-white/[0.08] transition-colors shrink-0"
+        title="Download"
+      >
+        <Download className={cn("h-4 w-4", downloading && "animate-pulse")} />
+      </button>
+    </div>
+  );
+}
+
 // Memoized to prevent re-renders when parent re-renders with same props
 export const MarkdownContent = memo(function MarkdownContent({
   content,
@@ -390,9 +580,46 @@ export const MarkdownContent = memo(function MarkdownContent({
   workspaceId,
   missionId,
 }: MarkdownContentProps) {
+  // Pre-process content: transform <image> and <file> tags into markdown syntax
+  const processedContent = useMemo(() => transformRichTags(content), [content]);
+
   // Memoize components object to prevent react-markdown from re-creating DOM on every render
   const components: Components = useMemo(() => ({
+    img({ src, alt, ...props }) {
+      // Handle sandboxed-image:// protocol for rich image tags
+      const srcStr = typeof src === "string" ? src : undefined;
+      if (srcStr?.startsWith("sandboxed-image://")) {
+        const path = decodeURIComponent(srcStr.replace("sandboxed-image://", ""));
+        return (
+          <InlineImagePreview
+            path={path}
+            alt={alt || path}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+          />
+        );
+      }
+      // Default img rendering
+      // eslint-disable-next-line @next/next/no-img-element, jsx-a11y/alt-text
+      return <img src={srcStr} alt={alt} {...props} className="max-w-full rounded" />;
+    },
     a({ href, children, ...props }) {
+      // Handle sandboxed-file:// protocol for rich file tags
+      if (href?.startsWith("sandboxed-file://")) {
+        const path = decodeURIComponent(href.replace("sandboxed-file://", ""));
+        const childText = Array.isArray(children) ? children.join("") : String(children || "");
+        const displayName = childText || path.split("/").pop() || "file";
+        return (
+          <InlineFileCard
+            path={path}
+            displayName={displayName}
+            basePath={basePath}
+            workspaceId={workspaceId}
+            missionId={missionId}
+          />
+        );
+      }
       return (
         <a
           href={href}
@@ -473,10 +700,19 @@ export const MarkdownContent = memo(function MarkdownContent({
   // Memoize remarkPlugins array to prevent recreation
   const plugins = useMemo(() => [remarkGfm], []);
 
+  // Allow our placeholder protocols through react-markdown's URL sanitizer.
+  // Everything else should continue to use the default sanitizer behavior.
+  const urlTransform = useCallback((url: string) => {
+    if (url.startsWith("sandboxed-image://") || url.startsWith("sandboxed-file://")) {
+      return url;
+    }
+    return defaultUrlTransform(url);
+  }, []);
+
   return (
     <div className={cn("prose-glass text-sm [&_p]:my-2", className)}>
-      <Markdown remarkPlugins={plugins} components={components}>
-        {content}
+      <Markdown remarkPlugins={plugins} components={components} urlTransform={urlTransform}>
+        {processedContent}
       </Markdown>
     </div>
   );

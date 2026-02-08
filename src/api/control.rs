@@ -405,6 +405,141 @@ impl SharedFile {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rich tag parsing: extract <image path="..." /> and <file path="..." /> from
+// agent output so we can validate referenced files and populate shared_files.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum RichTagType {
+    Image,
+    File,
+}
+
+#[derive(Debug, Clone)]
+struct RichTagRef {
+    tag_type: RichTagType,
+    path: String,
+    alt: Option<String>,
+    name: Option<String>,
+}
+
+/// Parse `<image path="..." />` and `<file path="..." />` tags from content.
+fn parse_rich_tags(content: &str) -> Vec<RichTagRef> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static TAG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"<(image|file)\s+([^>]*?)\s*/>"#).unwrap());
+    static ATTR_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(\w+)\s*=\s*"([^"]*)""#).unwrap());
+
+    let mut tags = Vec::new();
+    for cap in TAG_RE.captures_iter(content) {
+        let tag_type = match cap[1].to_ascii_lowercase().as_str() {
+            "image" => RichTagType::Image,
+            "file" => RichTagType::File,
+            _ => continue,
+        };
+        let attr_str = &cap[2];
+        let mut path = None;
+        let mut alt = None;
+        let mut name = None;
+        for attr_cap in ATTR_RE.captures_iter(attr_str) {
+            match &attr_cap[1] {
+                "path" => path = Some(attr_cap[2].to_string()),
+                "alt" => alt = Some(attr_cap[2].to_string()),
+                "name" => name = Some(attr_cap[2].to_string()),
+                _ => {}
+            }
+        }
+        if let Some(p) = path {
+            tags.push(RichTagRef {
+                tag_type,
+                path: p,
+                alt,
+                name,
+            });
+        }
+    }
+    tags
+}
+
+/// Validate rich tag paths against the filesystem and return SharedFile entries.
+/// `working_dir` is used to resolve relative paths.
+/// `workspace_id` and `mission_id` are included in download URLs for the frontend.
+async fn validate_rich_tags(
+    tags: &[RichTagRef],
+    working_dir: &std::path::Path,
+    workspace_id: Option<Uuid>,
+    mission_id: Option<Uuid>,
+) -> Vec<SharedFile> {
+    // Only allow files that resolve within the mission working directory. This keeps the
+    // "shared files" surface area consistent with what the agent produced in its workspace,
+    // and avoids emitting links that would be rejected by the download endpoint anyway.
+    let canonical_working_dir = working_dir.canonicalize().ok();
+
+    let mut files = Vec::new();
+    for tag in tags {
+        // Resolve the path relative to working_dir
+        let p = std::path::Path::new(&tag.path);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            working_dir.join(&tag.path)
+        };
+
+        // Check existence and metadata
+        let meta = match tokio::fs::metadata(&resolved).await {
+            Ok(m) => m,
+            Err(_) => continue, // skip non-existent files
+        };
+
+        let canon_resolved = match resolved.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        if let Some(work_root) = canonical_working_dir.as_ref() {
+            if !canon_resolved.starts_with(work_root) {
+                continue;
+            }
+        }
+
+        let size = Some(meta.len());
+        let content_type = super::fs::content_type_for_path(&canon_resolved).to_string();
+
+        let display_name = match &tag.tag_type {
+            RichTagType::Image => tag
+                .alt
+                .clone()
+                .or_else(|| tag.path.rsplit('/').next().map(|s| s.to_string()))
+                .unwrap_or_else(|| tag.path.clone()),
+            RichTagType::File => tag
+                .name
+                .clone()
+                .or_else(|| tag.path.rsplit('/').next().map(|s| s.to_string()))
+                .unwrap_or_else(|| tag.path.clone()),
+        };
+
+        // Build a download URL for the file
+        let canon_str = canon_resolved.to_string_lossy();
+        let mut url = format!(
+            "/api/fs/download?path={}",
+            urlencoding::encode(canon_str.as_ref())
+        );
+        if let Some(ws_id) = workspace_id {
+            url.push_str(&format!("&workspace_id={}", ws_id));
+        }
+        if let Some(mid) = mission_id {
+            url.push_str(&format!("&mission_id={}", mid));
+        }
+
+        files.push(SharedFile::new(display_name, url, content_type, size));
+    }
+    files
+}
+
 /// A structured event emitted by the control session.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -4323,6 +4458,46 @@ async fn control_actor_loop(
                                 }
                             }
 
+                            // Parse rich tags and validate referenced files
+                            let rich_tags = parse_rich_tags(&agent_result.output);
+                            let shared_files = if rich_tags.is_empty() {
+                                None
+                            } else {
+                                // Get workspace_id from mission for download URLs
+                                let ws_id = if let Some(mid) = completed_mission_id {
+                                    mission_store
+                                        .get_mission(mid)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .map(|m| m.workspace_id)
+                                } else {
+                                    None
+                                };
+                                // Validate against the per-mission workspace directory, not the global
+                                // server working_dir. Agent-relative paths (./foo.png) should resolve
+                                // to the mission workspace.
+                                let validate_root = if let (Some(mid), Some(wsid)) =
+                                    (completed_mission_id, ws_id)
+                                {
+                                    workspaces
+                                        .get(wsid)
+                                        .await
+                                        .map(|w| crate::workspace::mission_workspace_dir_for_root(&w.path, mid))
+                                        .unwrap_or_else(|| config.working_dir.clone())
+                                } else {
+                                    config.working_dir.clone()
+                                };
+                                let files = validate_rich_tags(
+                                    &rich_tags,
+                                    &validate_root,
+                                    ws_id,
+                                    completed_mission_id,
+                                )
+                                .await;
+                                if files.is_empty() { None } else { Some(files) }
+                            };
+
                             // Mark failures as resumable so UI can show a resume button
                             let resumable = !agent_result.success && completed_mission_id.is_some();
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
@@ -4332,7 +4507,7 @@ async fn control_actor_loop(
                                 cost_cents: agent_result.cost_cents,
                                 model: agent_result.model_used,
                                 mission_id: completed_mission_id,
-                                shared_files: None,
+                                shared_files,
                                 resumable,
                             });
                             if let Some(mission_id) = completed_mission_id {
@@ -4478,6 +4653,36 @@ async fn control_actor_loop(
                                 mission_id, result.success, result.cost_cents
                             );
 
+                            // Parse rich tags and validate referenced files
+                            let rich_tags = parse_rich_tags(&result.output);
+                            let shared_files = if rich_tags.is_empty() {
+                                None
+                            } else {
+                                let ws_id = mission_store
+                                    .get_mission(*mission_id)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|m| m.workspace_id);
+                                let validate_root = if let Some(wsid) = ws_id {
+                                    workspaces
+                                        .get(wsid)
+                                        .await
+                                        .map(|w| crate::workspace::mission_workspace_dir_for_root(&w.path, *mission_id))
+                                        .unwrap_or_else(|| config.working_dir.clone())
+                                } else {
+                                    config.working_dir.clone()
+                                };
+                                let files = validate_rich_tags(
+                                    &rich_tags,
+                                    &validate_root,
+                                    ws_id,
+                                    Some(*mission_id),
+                                )
+                                .await;
+                                if files.is_empty() { None } else { Some(files) }
+                            };
+
                             // Emit completion event with mission_id
                             // Mark failures as resumable
                             let resumable = !result.success;
@@ -4490,7 +4695,7 @@ async fn control_actor_loop(
                                 cost_cents: result.cost_cents,
                                 model: result.model_used.clone(),
                                 mission_id: Some(*mission_id),
-                                shared_files: None,
+                                shared_files,
                                 resumable,
                             });
 
@@ -5806,5 +6011,92 @@ pub async fn webhook_receiver(
                 format!("Failed to trigger automation: {}", e),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_image_tag() {
+        let tags = parse_rich_tags(r#"<image path="./chart.png" alt="My Chart" />"#);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].tag_type, RichTagType::Image);
+        assert_eq!(tags[0].path, "./chart.png");
+        assert_eq!(tags[0].alt.as_deref(), Some("My Chart"));
+    }
+
+    #[test]
+    fn test_parse_file_tag() {
+        let tags = parse_rich_tags(r#"<file path="./report.pdf" name="Report" />"#);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].tag_type, RichTagType::File);
+        assert_eq!(tags[0].path, "./report.pdf");
+        assert_eq!(tags[0].name.as_deref(), Some("Report"));
+    }
+
+    #[test]
+    fn test_parse_multiple_tags() {
+        let content = r#"Here is the chart:
+<image path="./a.png" alt="A" />
+And the report:
+<file path="./b.pdf" name="B" />"#;
+        let tags = parse_rich_tags(content);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].tag_type, RichTagType::Image);
+        assert_eq!(tags[0].path, "./a.png");
+        assert_eq!(tags[1].tag_type, RichTagType::File);
+        assert_eq!(tags[1].path, "./b.pdf");
+    }
+
+    #[test]
+    fn test_parse_no_tags() {
+        let tags = parse_rich_tags("Hello world, no tags here.");
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_parse_malformed_tag() {
+        // Unclosed tag should not match
+        let tags = parse_rich_tags(r#"<image path="./chart.png" "#);
+        assert!(tags.is_empty());
+        // Missing path attribute
+        let tags = parse_rich_tags(r#"<image alt="no path" />"#);
+        assert!(tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validate_rich_tags_resolves_relative_and_blocks_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        let good_path = root.join("chart.png");
+        tokio::fs::write(&good_path, b"pngbytes").await.unwrap();
+
+        // Should resolve ./chart.png within working_dir.
+        let tags = parse_rich_tags(r#"<image path="./chart.png" alt="Chart" />"#);
+        let files = validate_rich_tags(&tags, root, None, None).await;
+        assert_eq!(files.len(), 1);
+        assert!(files[0].url.contains("path="));
+
+        // Create a file outside working_dir and ensure traversal is blocked.
+        let parent = root.parent().expect("parent dir exists");
+        let evil_path = parent.join(format!("evil-{}.txt", Uuid::new_v4()));
+        tokio::fs::write(&evil_path, b"nope").await.unwrap();
+
+        let tags = parse_rich_tags(&format!(
+            r#"<file path="../{}" name="Evil" />"#,
+            evil_path.file_name().unwrap().to_string_lossy()
+        ));
+        let files = validate_rich_tags(&tags, root, None, None).await;
+        assert!(files.is_empty());
+
+        let tags = parse_rich_tags(&format!(
+            r#"<file path="{}" name="EvilAbs" />"#,
+            evil_path.to_string_lossy()
+        ));
+        let files = validate_rich_tags(&tags, root, None, None).await;
+        assert!(files.is_empty());
     }
 }

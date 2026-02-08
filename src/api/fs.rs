@@ -140,7 +140,7 @@ fn resolve_download_path(
     ))
 }
 
-fn content_type_for_path(path: &Path) -> &'static str {
+pub fn content_type_for_path(path: &Path) -> &'static str {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -164,7 +164,7 @@ fn content_type_for_path(path: &Path) -> &'static str {
 
 /// Resolve a path relative to a specific workspace.
 /// If mission_id is provided and path is a context path, resolves to mission-specific context.
-async fn resolve_path_for_workspace(
+pub async fn resolve_path_for_workspace(
     state: &Arc<AppState>,
     workspace_id: uuid::Uuid,
     path: &str,
@@ -560,6 +560,53 @@ pub async fn rm(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidateResponse {
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+pub async fn validate(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<ValidateResponse>, (StatusCode, String)> {
+    let resolved_path = if let Some(workspace_id) = q.workspace_id {
+        resolve_path_for_workspace(&state, workspace_id, &q.path, q.mission_id).await?
+    } else {
+        resolve_download_path(&q.path, Some(&state.config.working_dir))?
+    };
+
+    if !resolved_path.exists() {
+        return Ok(Json(ValidateResponse {
+            exists: false,
+            size: None,
+            content_type: None,
+            name: None,
+        }));
+    }
+
+    let metadata = tokio::fs::metadata(&resolved_path)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let name = resolved_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+
+    Ok(Json(ValidateResponse {
+        exists: true,
+        size: Some(metadata.len()),
+        content_type: Some(content_type_for_path(&resolved_path).to_string()),
+        name,
+    }))
 }
 
 pub async fn download(

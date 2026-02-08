@@ -3,6 +3,7 @@
 import { memo, useMemo, useRef, useEffect, useState } from "react";
 import { MarkdownContent } from "./markdown-content";
 import { cn } from "@/lib/utils";
+import { hasPartialRichTag } from "@/lib/rich-tags";
 
 interface StreamingMarkdownProps {
   content: string;
@@ -173,8 +174,17 @@ const StreamingBlock = memo(function StreamingBlock({
 }: {
   content: string;
 }) {
+  // Hide partial rich tags (e.g. `<image path="foo`) during streaming
+  const displayContent = useMemo(() => {
+    if (hasPartialRichTag(content)) {
+      const idx = content.lastIndexOf("<");
+      return idx > 0 ? content.slice(0, idx) : content;
+    }
+    return content;
+  }, [content]);
+
   return (
-    <p className="my-1 whitespace-pre-wrap">{content}</p>
+    <p className="my-1 whitespace-pre-wrap">{displayContent}</p>
   );
 });
 

@@ -512,6 +512,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // Remote file explorer endpoints (use Authorization header)
         .route("/api/fs/list", get(fs::list))
         .route("/api/fs/download", get(fs::download))
+        .route("/api/fs/validate", get(fs::validate))
         .merge(upload_route)
         .route("/api/fs/upload-finalize", post(fs::upload_finalize))
         .route("/api/fs/download-url", post(fs::download_from_url))

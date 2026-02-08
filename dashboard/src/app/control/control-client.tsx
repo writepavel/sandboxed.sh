@@ -2898,6 +2898,15 @@ export default function ControlClient() {
 
     if (!workspace?.path) return undefined;
     const cleanRoot = workspace.path.replace(/\/+$/, "");
+    // Per-mission workspace dir matches backend convention:
+    // `{workspace.path}/workspaces/mission-{mission_id_prefix}`.
+    //
+    // This lets rich `<image>`/`<file>` tags using relative paths (e.g. `./chart.svg`)
+    // resolve correctly even when no desktop session was started.
+    const shortId = mission.id?.slice(0, 8);
+    if (shortId) {
+      return `${cleanRoot}/workspaces/mission-${shortId}`;
+    }
     return cleanRoot;
   }, [missionForDownloads, workspaces]);
 
