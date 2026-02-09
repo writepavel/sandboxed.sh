@@ -73,14 +73,9 @@ struct ControlView: View {
             backgroundGlows
             
             VStack(spacing: 0) {
-                // Running missions bar (when there are parallel missions)
-                if showRunningMissions && (!runningMissions.isEmpty || currentMission != nil) {
-                    runningMissionsBar
-                }
-                
                 // Messages
                 messagesView
-                
+
                 // Input area
                 inputView
             }
@@ -801,6 +796,62 @@ struct ControlView: View {
         }
     }
 
+    private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
+        viewingMission = mission
+        viewingMissionId = mission.id
+
+        // Clear messages and replay events to rebuild the full history
+        messages.removeAll()
+
+        // Ensure deterministic replay order in case the backend returns unsorted results
+        let orderedEvents = events.sorted { lhs, rhs in
+            if lhs.sequence != rhs.sequence {
+                return lhs.sequence < rhs.sequence
+            }
+            if lhs.timestamp != rhs.timestamp {
+                return lhs.timestamp < rhs.timestamp
+            }
+            return lhs.id < rhs.id
+        }
+
+        // Process events in order to reconstruct the message history
+        for event in orderedEvents {
+            // Convert StoredEvent metadata to [String: Any] for handleStreamEvent
+            // Start with metadata first, then add core fields to prevent overwrites
+            var data: [String: Any] = [:]
+
+            // Add metadata first (lower priority)
+            for (key, value) in event.metadata {
+                data[key] = value.value
+            }
+
+            // Add core fields last (higher priority - these should never be overwritten)
+            data["mission_id"] = event.missionId
+            data["content"] = event.content
+
+            // Add optional fields
+            if let eventId = event.eventId {
+                data["id"] = eventId
+            }
+            if let toolCallId = event.toolCallId {
+                data["tool_call_id"] = toolCallId
+            }
+            if let toolName = event.toolName {
+                // Map toolName to "name" key for handleStreamEvent compatibility
+                data["name"] = toolName
+            }
+
+            // Process the event using the existing stream event handler
+            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
+        }
+
+        if scrollToBottom {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                shouldScrollToBottom = true
+            }
+        }
+    }
+
     private func loadCurrentMission(updateViewing: Bool) async {
         isLoading = true
         defer { isLoading = false }
@@ -823,30 +874,54 @@ struct ControlView: View {
         let previousViewingMission = viewingMission
         let previousViewingId = viewingMissionId
         viewingMissionId = id
-        
+
         isLoading = true
 
         do {
+            // Fetch mission metadata first (required)
             let mission = try await api.getMission(id: id)
-            
+
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
                 return // Another mission was requested, discard this response
             }
-            
+
             if currentMission?.id == mission.id {
                 currentMission = mission
             }
-            applyViewingMission(mission)
+
+            // Try to fetch full event history (optional - fall back to basic history if it fails)
+            do {
+                let events = try await api.getMissionEvents(id: id)
+
+                // Race condition guard after the second await
+                guard fetchingMissionId == id else {
+                    return
+                }
+
+                if events.isEmpty {
+                    applyViewingMission(mission)
+                } else {
+                    applyViewingMissionWithEvents(mission, events: events)
+                }
+            } catch {
+                print("Failed to load mission events (falling back to basic history): \(error)")
+                guard fetchingMissionId == id else {
+                    return
+                }
+                // Fallback to basic mission history if events endpoint fails
+                applyViewingMission(mission)
+            }
+
             isLoading = false
             HapticService.success()
         } catch {
             // Race condition guard
             guard fetchingMissionId == id else { return }
-            
+
             isLoading = false
             print("Failed to load mission: \(error)")
-            
+
             // Revert viewing state to avoid filtering out events
             if let fallback = previousViewingMission ?? currentMission {
                 applyViewingMission(fallback, scrollToBottom: false)
@@ -1241,7 +1316,7 @@ struct ControlView: View {
         }
     }
     
-    private func handleStreamEvent(type: String, data: [String: Any]) {
+    private func handleStreamEvent(type: String, data: [String: Any], isHistoricalReplay: Bool = false) {
         // Filter events by mission_id - only show events for the mission we're viewing
         // This prevents cross-mission contamination when parallel missions are running
         let eventMissionId = data["mission_id"] as? String
@@ -1545,8 +1620,10 @@ struct ControlView: View {
                 }
                 if let display = resultDict?["display"] as? String {
                     desktopDisplayId = display
-                    // Auto-open desktop stream when session starts
-                    showDesktopStream = true
+                    // Auto-open desktop stream when session starts (live only)
+                    if !isHistoricalReplay {
+                        showDesktopStream = true
+                    }
                 }
             }
 
@@ -1573,8 +1650,10 @@ struct ControlView: View {
                     currentMission?.status = newStatus
                 }
 
-                // Refresh running missions list
-                Task { await refreshRunningMissions() }
+                // Refresh running missions list (live only)
+                if !isHistoricalReplay {
+                    Task { await refreshRunningMissions() }
+                }
             }
 
         default:
@@ -1758,6 +1837,18 @@ private struct MessageBubble: View {
 private struct SharedFileCardView: View {
     let file: SharedFile
     @Environment(\.openURL) private var openURL
+    @State private var imageData: Data?
+    @State private var isLoadingImage = false
+    @State private var imageLoadFailed = false
+
+    private var fullURL: URL? {
+        // If URL is relative, prepend the base URL
+        if file.url.hasPrefix("/") {
+            let baseURL = APIService.shared.baseURL
+            return URL(string: baseURL + file.url)
+        }
+        return URL(string: file.url)
+    }
 
     var body: some View {
         if file.isImage {
@@ -1769,29 +1860,33 @@ private struct SharedFileCardView: View {
 
     private var imageCard: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Image preview
-            AsyncImage(url: URL(string: file.url)) { phase in
-                switch phase {
-                case .empty:
+            // Image preview with authentication support
+            Group {
+                if isLoadingImage {
                     ProgressView()
                         .frame(maxWidth: .infinity, minHeight: 120)
                         .background(Theme.backgroundSecondary)
-                case .success(let image):
-                    image
+                } else if let data = imageData, let uiImage = UIImage(data: data) {
+                    Image(uiImage: uiImage)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .frame(maxWidth: .infinity, maxHeight: 300)
-                case .failure:
+                } else if imageLoadFailed {
                     Image(systemName: "photo")
                         .font(.title)
                         .foregroundStyle(Theme.textMuted)
                         .frame(maxWidth: .infinity, minHeight: 80)
                         .background(Theme.backgroundSecondary)
-                @unknown default:
-                    EmptyView()
+                } else {
+                    ProgressView()
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                        .background(Theme.backgroundSecondary)
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .task {
+                await loadImage()
+            }
 
             // File info bar
             HStack(spacing: 6) {
@@ -1813,7 +1908,7 @@ private struct SharedFileCardView: View {
                 }
 
                 Button {
-                    if let url = URL(string: file.url) {
+                    if let url = fullURL {
                         openURL(url)
                     }
                 } label: {
@@ -1835,7 +1930,7 @@ private struct SharedFileCardView: View {
 
     private var downloadCard: some View {
         Button {
-            if let url = URL(string: file.url) {
+            if let url = fullURL {
                 openURL(url)
             }
         } label: {
@@ -1887,6 +1982,68 @@ private struct SharedFileCardView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+    private func loadImage() async {
+        guard let url = fullURL, !isLoadingImage else {
+            // If URL is nil (malformed), mark as failed to prevent infinite loading
+            if fullURL == nil {
+                await MainActor.run {
+                    self.imageLoadFailed = true
+                    self.isLoadingImage = false
+                }
+            }
+            return
+        }
+
+        isLoadingImage = true
+        imageLoadFailed = false
+
+        do {
+            var request = URLRequest(url: url)
+
+            // Add authentication token if available
+            if let token = APIService.shared.authToken {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+
+            // Check response status
+            if let httpResponse = response as? HTTPURLResponse {
+                if httpResponse.statusCode == 200 {
+                    // Validate that the data is actually parseable as an image
+                    if UIImage(data: data) != nil {
+                        await MainActor.run {
+                            self.imageData = data
+                        }
+                    } else {
+                        // Data is not a valid image
+                        await MainActor.run {
+                            self.imageLoadFailed = true
+                        }
+                    }
+                } else {
+                    await MainActor.run {
+                        self.imageLoadFailed = true
+                    }
+                }
+            } else {
+                // Non-HTTP response (or failed cast) shouldn't leave the spinner running
+                await MainActor.run {
+                    self.imageLoadFailed = true
+                }
+            }
+        } catch {
+            print("Failed to load image: \(error)")
+            await MainActor.run {
+                self.imageLoadFailed = true
+            }
+        }
+
+        await MainActor.run {
+            isLoadingImage = false
+        }
     }
 }
 
