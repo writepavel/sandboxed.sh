@@ -806,10 +806,17 @@ struct ControlView: View {
         // Process events in order to reconstruct the message history
         for event in events {
             // Convert StoredEvent metadata to [String: Any] for handleStreamEvent
-            var data: [String: Any] = [
-                "mission_id": event.missionId,
-                "content": event.content
-            ]
+            // Start with metadata first, then add core fields to prevent overwrites
+            var data: [String: Any] = [:]
+
+            // Add metadata first (lower priority)
+            for (key, value) in event.metadata {
+                data[key] = value.value
+            }
+
+            // Add core fields last (higher priority - these should never be overwritten)
+            data["mission_id"] = event.missionId
+            data["content"] = event.content
 
             // Add optional fields
             if let eventId = event.eventId {
@@ -819,12 +826,8 @@ struct ControlView: View {
                 data["tool_call_id"] = toolCallId
             }
             if let toolName = event.toolName {
-                data["tool_name"] = toolName
-            }
-
-            // Convert metadata
-            for (key, value) in event.metadata {
-                data[key] = value.value
+                // Map toolName to "name" key for handleStreamEvent compatibility
+                data["name"] = toolName
             }
 
             // Process the event using the existing stream event handler
@@ -864,12 +867,8 @@ struct ControlView: View {
         isLoading = true
 
         do {
-            // Fetch both mission metadata and full event history
-            async let missionTask = api.getMission(id: id)
-            async let eventsTask = api.getMissionEvents(id: id)
-
-            let mission = try await missionTask
-            let events = try await eventsTask
+            // Fetch mission metadata first (required)
+            let mission = try await api.getMission(id: id)
 
             // Race condition guard: only update if this is still the mission we want
             guard fetchingMissionId == id else {
@@ -880,8 +879,16 @@ struct ControlView: View {
                 currentMission = mission
             }
 
-            // Apply mission with full event history
-            applyViewingMissionWithEvents(mission, events: events)
+            // Try to fetch full event history (optional - fall back to basic history if it fails)
+            do {
+                let events = try await api.getMissionEvents(id: id)
+                applyViewingMissionWithEvents(mission, events: events)
+            } catch {
+                print("Failed to load mission events (falling back to basic history): \(error)")
+                // Fallback to basic mission history if events endpoint fails
+                applyViewingMission(mission)
+            }
+
             isLoading = false
             HapticService.success()
         } catch {
@@ -1852,27 +1859,6 @@ private struct SharedFileCardView: View {
             .task {
                 await loadImage()
             }
-                switch phase {
-                case .empty:
-                    ProgressView()
-                        .frame(maxWidth: .infinity, minHeight: 120)
-                        .background(Theme.backgroundSecondary)
-                case .success(let image):
-                    image
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity, maxHeight: 300)
-                case .failure:
-                    Image(systemName: "photo")
-                        .font(.title)
-                        .foregroundStyle(Theme.textMuted)
-                        .frame(maxWidth: .infinity, minHeight: 80)
-                        .background(Theme.backgroundSecondary)
-                @unknown default:
-                    EmptyView()
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             // File info bar
             HStack(spacing: 6) {
@@ -1989,8 +1975,16 @@ private struct SharedFileCardView: View {
             // Check response status
             if let httpResponse = response as? HTTPURLResponse {
                 if httpResponse.statusCode == 200 {
-                    await MainActor.run {
-                        self.imageData = data
+                    // Validate that the data is actually parseable as an image
+                    if UIImage(data: data) != nil {
+                        await MainActor.run {
+                            self.imageData = data
+                        }
+                    } else {
+                        // Data is not a valid image
+                        await MainActor.run {
+                            self.imageLoadFailed = true
+                        }
                     }
                 } else {
                     await MainActor.run {
