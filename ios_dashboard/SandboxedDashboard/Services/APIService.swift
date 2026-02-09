@@ -30,6 +30,10 @@ final class APIService {
         set { UserDefaults.standard.set(newValue, forKey: "jwt_token") }
     }
     
+    var authToken: String? {
+        jwtToken
+    }
+
     var isAuthenticated: Bool {
         jwtToken != nil
     }

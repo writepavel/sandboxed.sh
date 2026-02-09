@@ -831,7 +831,7 @@ struct ControlView: View {
             }
 
             // Process the event using the existing stream event handler
-            handleStreamEvent(type: event.eventType, data: data)
+            handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
         }
 
         if scrollToBottom {
@@ -882,9 +882,22 @@ struct ControlView: View {
             // Try to fetch full event history (optional - fall back to basic history if it fails)
             do {
                 let events = try await api.getMissionEvents(id: id)
-                applyViewingMissionWithEvents(mission, events: events)
+
+                // Race condition guard after the second await
+                guard fetchingMissionId == id else {
+                    return
+                }
+
+                if events.isEmpty {
+                    applyViewingMission(mission)
+                } else {
+                    applyViewingMissionWithEvents(mission, events: events)
+                }
             } catch {
                 print("Failed to load mission events (falling back to basic history): \(error)")
+                guard fetchingMissionId == id else {
+                    return
+                }
                 // Fallback to basic mission history if events endpoint fails
                 applyViewingMission(mission)
             }
@@ -1292,7 +1305,7 @@ struct ControlView: View {
         }
     }
     
-    private func handleStreamEvent(type: String, data: [String: Any]) {
+    private func handleStreamEvent(type: String, data: [String: Any], isHistoricalReplay: Bool = false) {
         // Filter events by mission_id - only show events for the mission we're viewing
         // This prevents cross-mission contamination when parallel missions are running
         let eventMissionId = data["mission_id"] as? String
@@ -1596,8 +1609,10 @@ struct ControlView: View {
                 }
                 if let display = resultDict?["display"] as? String {
                     desktopDisplayId = display
-                    // Auto-open desktop stream when session starts
-                    showDesktopStream = true
+                    // Auto-open desktop stream when session starts (live only)
+                    if !isHistoricalReplay {
+                        showDesktopStream = true
+                    }
                 }
             }
 
@@ -1624,8 +1639,10 @@ struct ControlView: View {
                     currentMission?.status = newStatus
                 }
 
-                // Refresh running missions list
-                Task { await refreshRunningMissions() }
+                // Refresh running missions list (live only)
+                if !isHistoricalReplay {
+                    Task { await refreshRunningMissions() }
+                }
             }
 
         default:
