@@ -2528,6 +2528,10 @@ async fn automation_scheduler_loop(
                     // Skip webhook automations - they're triggered via HTTP
                     continue;
                 }
+                TriggerType::AgentFinished => {
+                    // Skip agent_finished automations - they're triggered when a turn completes.
+                    continue;
+                }
             };
 
             let mission = match mission_store.get_mission(automation.mission_id).await {
@@ -2815,6 +2819,168 @@ async fn automation_scheduler_loop(
             }
         }
     }
+}
+
+async fn agent_finished_automation_messages(
+    mission_store: &Arc<dyn MissionStore>,
+    mission_id: Uuid,
+    library: &SharedLibrary,
+    workspaces: &workspace::SharedWorkspaceStore,
+) -> Vec<String> {
+    use super::automation_variables::{substitute_variables, SubstitutionContext};
+    use super::mission_store::{AutomationExecution, CommandSource, ExecutionStatus, TriggerType};
+
+    let automations = match mission_store.get_mission_automations(mission_id).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load automations for mission {} (agent_finished hook): {}",
+                mission_id,
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut active: Vec<super::mission_store::Automation> = automations
+        .into_iter()
+        .filter(|a| a.active && matches!(a.trigger, TriggerType::AgentFinished))
+        .collect();
+
+    if active.is_empty() {
+        return Vec::new();
+    }
+
+    let mission = match mission_store.get_mission(mission_id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load mission {} for agent_finished automations: {}",
+                mission_id,
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    // Stable ordering to avoid surprising changes in multi-automation setups.
+    active.sort_by_key(|a| a.created_at.clone());
+
+    let workspace = workspaces.get(mission.workspace_id).await;
+
+    let mut out = Vec::with_capacity(active.len());
+
+    for automation in active {
+        // Fetch the command content based on the command source
+        let command_content = match &automation.command_source {
+            CommandSource::Library { name } => {
+                if let Some(lib) = library.read().await.as_ref() {
+                    match lib.get_command(name).await {
+                        Ok(command) => command.content,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to fetch command '{}' for automation {}: {}",
+                                name,
+                                automation.id,
+                                e
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        "Library not initialized, skipping agent_finished automation trigger"
+                    );
+                    continue;
+                }
+            }
+            CommandSource::LocalFile { path } => {
+                let file_path = if let Some(ws) = workspace.as_ref() {
+                    ws.path.join(path)
+                } else {
+                    tracing::warn!(
+                        "Workspace {} not found for automation {}",
+                        mission.workspace_id,
+                        automation.id
+                    );
+                    continue;
+                };
+                match tokio::fs::read_to_string(&file_path).await {
+                    Ok(content) => content,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read file '{}' for automation {}: {}",
+                            file_path.display(),
+                            automation.id,
+                            e
+                        );
+                        continue;
+                    }
+                }
+            }
+            CommandSource::Inline { content } => content.clone(),
+        };
+
+        // Build substitution context for variable replacement
+        let mut context = SubstitutionContext::new(mission.id);
+        if let Some(ref title) = mission.title {
+            context = context.with_mission_name(title.clone());
+        }
+        if let Some(ws) = workspace.as_ref() {
+            context = context.with_working_directory(ws.path.to_string_lossy().to_string());
+        }
+        context = context.with_custom_variables(automation.variables.clone());
+
+        let substituted_content = substitute_variables(&command_content, &context);
+
+        // Create an execution record (treat "queued" as success)
+        let execution_id = Uuid::new_v4();
+        let execution = AutomationExecution {
+            id: execution_id,
+            automation_id: automation.id,
+            mission_id: mission.id,
+            triggered_at: mission_store::now_string(),
+            trigger_source: "agent_finished".to_string(),
+            status: ExecutionStatus::Success,
+            webhook_payload: None,
+            variables_used: automation.variables.clone(),
+            completed_at: Some(mission_store::now_string()),
+            error: None,
+            retry_count: 0,
+        };
+
+        if mission_store
+            .create_automation_execution(execution)
+            .await
+            .is_ok()
+        {
+            // Best-effort: update last_triggered_at for visibility in UI.
+            if let Err(e) = mission_store
+                .update_automation_last_triggered(automation.id)
+                .await
+            {
+                tracing::warn!("Failed to update automation last triggered time: {}", e);
+            }
+        } else {
+            // If we can't record execution, still trigger the message.
+            tracing::warn!(
+                "Failed to create execution record for agent_finished automation {}",
+                automation.id
+            );
+        }
+
+        tracing::info!(
+            "Triggering agent_finished automation {} (execution {}) for mission {}",
+            automation.id,
+            execution_id,
+            mission.id
+        );
+
+        out.push(substituted_content);
+    }
+
+    out
 }
 
 async fn control_actor_loop(
@@ -4535,6 +4701,26 @@ async fn control_actor_loop(
                             }
                         }
                     }
+
+                    // If the mission is idle now, enqueue any agent_finished automations to restart immediately.
+                    if let Some(mission_id) = completed_mission_id {
+                        let already_queued_for_mission = queue
+                            .iter()
+                            .any(|(_id, _msg, _agent, target_mid)| *target_mid == Some(mission_id));
+                        if !already_queued_for_mission {
+                            let messages = agent_finished_automation_messages(
+                                &mission_store,
+                                mission_id,
+                                &library,
+                                &workspaces,
+                            )
+                            .await;
+                            for content in messages.into_iter().rev() {
+                                // Push to front so it runs before unrelated queued items, but preserve order.
+                                queue.push_front((Uuid::new_v4(), content, None, Some(mission_id)));
+                            }
+                        }
+                    }
                 }
 
                 // Start next queued message, if any.
@@ -4720,6 +4906,35 @@ async fn control_actor_loop(
 
                             // If runner has no more queued messages, update status and mark for cleanup
                             if runner.queue.is_empty() && !runner.is_running() {
+                                // Enqueue agent_finished automations (if any) to restart immediately.
+                                if runner.queue.is_empty() {
+                                    let messages = agent_finished_automation_messages(
+                                        &mission_store,
+                                        *mission_id,
+                                        &library,
+                                        &workspaces,
+                                    )
+                                    .await;
+                                    for content in messages {
+                                        runner.queue_message(Uuid::new_v4(), content, None);
+                                    }
+                                    if !runner.is_running() {
+                                        runner.start_next(
+                                            config.clone(),
+                                            Arc::clone(&root_agent),
+                                            Arc::clone(&mcp),
+                                            Arc::clone(&workspaces),
+                                            library.clone(),
+                                            events_tx.clone(),
+                                            Arc::clone(&tool_hub),
+                                            Arc::clone(&status),
+                                            mission_cmd_tx.clone(),
+                                            Arc::new(RwLock::new(Some(*mission_id))),
+                                            secrets.clone(),
+                                        );
+                                    }
+                                }
+
                                 // Only update status if agent hasn't already set a terminal status
                                 if let Ok(Some(mission)) = mission_store.get_mission(*mission_id).await {
                                     let should_update = matches!(

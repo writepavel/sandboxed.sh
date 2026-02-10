@@ -11,6 +11,7 @@ export type CommandSource =
 
 export type TriggerType =
   | { type: "interval"; seconds: number }
+  | { type: "agent_finished" }
   | {
       type: "webhook";
       config: {
