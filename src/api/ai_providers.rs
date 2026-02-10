@@ -2068,18 +2068,14 @@ pub async fn refresh_anthropic_oauth_token() -> Result<(), String> {
     };
 
     // Double-check token is still expired (another process might have refreshed it)
-    if let Some(entry) = read_oauth_token_entry(ProviderType::Anthropic) {
-        if !oauth_token_expired(entry.expires_at) {
-            tracing::info!("Token is no longer expired, skipping refresh");
-            return Ok(());
-        }
-    } else {
-        // Token no longer exists
-        return Err("No Anthropic OAuth entry found".to_string());
+    let entry = read_oauth_token_entry(ProviderType::Anthropic)
+        .ok_or_else(|| "No Anthropic OAuth entry found".to_string())?;
+
+    if !oauth_token_expired(entry.expires_at) {
+        tracing::info!("Token is no longer expired, skipping refresh");
+        return Ok(());
     }
 
-    let entry = read_oauth_token_entry(ProviderType::Anthropic)
-        .ok_or_else(|| "No Anthropic OAuth entry".to_string())?;
     let refresh_token = entry.refresh_token.clone();
 
     tracing::info!("Refreshing Anthropic OAuth token");
@@ -2244,18 +2240,14 @@ pub async fn refresh_openai_oauth_token() -> Result<(), String> {
     };
 
     // Double-check token is still expired (another process might have refreshed it)
-    if let Some(entry) = read_oauth_token_entry(ProviderType::OpenAI) {
-        if !oauth_token_expired(entry.expires_at) {
-            tracing::info!("Token is no longer expired, skipping refresh");
-            return Ok(());
-        }
-    } else {
-        // Token no longer exists
-        return Err("No OpenAI OAuth entry found".to_string());
+    let entry = read_oauth_token_entry(ProviderType::OpenAI)
+        .ok_or_else(|| "No OpenAI OAuth entry found".to_string())?;
+
+    if !oauth_token_expired(entry.expires_at) {
+        tracing::info!("Token is no longer expired, skipping refresh");
+        return Ok(());
     }
 
-    let entry = read_oauth_token_entry(ProviderType::OpenAI)
-        .ok_or_else(|| "No OpenAI OAuth entry".to_string())?;
     let refresh_token = entry.refresh_token.clone();
 
     tracing::info!("Refreshing OpenAI OAuth token");
@@ -2394,18 +2386,14 @@ pub async fn refresh_google_oauth_token() -> Result<(), String> {
     };
 
     // Double-check token is still expired (another process might have refreshed it)
-    if let Some(entry) = read_oauth_token_entry(ProviderType::Google) {
-        if !oauth_token_expired(entry.expires_at) {
-            tracing::info!("Token is no longer expired, skipping refresh");
-            return Ok(());
-        }
-    } else {
-        // Token no longer exists
-        return Err("No Google OAuth entry found".to_string());
+    let entry = read_oauth_token_entry(ProviderType::Google)
+        .ok_or_else(|| "No Google OAuth entry found".to_string())?;
+
+    if !oauth_token_expired(entry.expires_at) {
+        tracing::info!("Token is no longer expired, skipping refresh");
+        return Ok(());
     }
 
-    let entry = read_oauth_token_entry(ProviderType::Google)
-        .ok_or_else(|| "No Google OAuth entry".to_string())?;
     let refresh_token = entry.refresh_token.clone();
 
     tracing::info!("Refreshing Google OAuth token");
