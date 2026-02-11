@@ -486,9 +486,10 @@ export function NewMissionDialog({
                 type="button"
                 onClick={handleClose}
                 className="p-1 rounded-md text-white/40 hover:text-white/70 hover:bg-white/[0.04] transition-colors"
-            >
-              <X className="h-4 w-4" />
-            </button>
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
 
           <div className="space-y-3">
