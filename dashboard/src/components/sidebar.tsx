@@ -59,7 +59,6 @@ const navigation: NavItem[] = [
     icon: Puzzle,
     children: [
       { name: 'MCP Servers', href: '/extensions/mcps', icon: Plug },
-      { name: 'Plugins', href: '/extensions/plugins', icon: Puzzle },
       { name: 'Tools', href: '/extensions/tools', icon: Wrench },
     ],
   },
