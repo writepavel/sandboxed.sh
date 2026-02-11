@@ -3593,6 +3593,10 @@ export default function ControlClient() {
           setViewingMissionId(id);
           return;
         }
+        // Skip if handleViewMission is already loading this mission (prevents double-load race)
+        if (handleViewMissionLoadingRef.current === id) {
+          return;
+        }
       const previousViewingMission = viewingMissionRef.current;
       setMissionLoading(true);
       setViewingMissionId(id); // Set viewing ID immediately to prevent "Agent is working..." flash
@@ -4060,6 +4064,7 @@ export default function ControlClient() {
   // Track the mission ID being fetched to prevent race conditions
   const fetchingMissionIdRef = useRef<string | null>(null);
   const pendingMissionNavRef = useRef<string | null>(null);
+  const handleViewMissionLoadingRef = useRef<string | null>(null);
 
   // Handle switching which mission we're viewing
   const handleViewMission = useCallback(
@@ -4081,6 +4086,7 @@ export default function ControlClient() {
 
       setViewingMissionId(missionId);
       fetchingMissionIdRef.current = missionId;
+      handleViewMissionLoadingRef.current = missionId;
 
       // Update URL immediately so it's shareable/bookmarkable
       router.replace(`/control?mission=${missionId}`, { scroll: false });
@@ -4146,8 +4152,10 @@ export default function ControlClient() {
         if (currentMissionRef.current?.id === mission.id) {
           setCurrentMission(mission);
         }
+        handleViewMissionLoadingRef.current = null;
       } catch (err) {
         console.error("Failed to load mission:", err);
+        handleViewMissionLoadingRef.current = null;
 
         // Race condition guard: only update if this is still the mission we want
         if (fetchingMissionIdRef.current !== missionId) {
@@ -4427,55 +4435,7 @@ export default function ControlClient() {
 
         // If we just reconnected, refresh the viewed mission's history to catch missed events
         if (wasReconnecting && viewingId) {
-          Promise.all([getMission(viewingId), loadHistoryEvents(viewingId), getQueue().catch(() => [])])
-            .then(([mission, events, queuedMessages]) => {
-              if (!mounted) return;
-              let historyItems = eventsToItems(events, mission);
-              if (!historyItems.some((item) => item.kind === "assistant")) {
-                const historyHasAssistant = mission.history.some(
-                  (entry) => entry.role === "assistant"
-                );
-                if (historyHasAssistant) {
-                  historyItems = missionHistoryToItems(mission);
-                }
-              }
-              // Merge queued messages that belong to this mission
-              const missionQueuedMessages = queuedMessages.filter((qm) => qm.mission_id === viewingId);
-              if (missionQueuedMessages.length > 0) {
-                const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
-                historyItems = historyItems.map((item) =>
-                  item.kind === "user" && queuedIds.has(item.id) ? { ...item, queued: true } : item
-                );
-                const existingIds = new Set(historyItems.map((item) => item.id));
-                const newQueuedItems: ChatItem[] = missionQueuedMessages
-                  .filter((qm) => !existingIds.has(qm.id))
-                  .map((qm) => ({
-                    kind: "user" as const,
-                    id: qm.id,
-                    content: qm.content,
-                    timestamp: Date.now(),
-                    agent: qm.agent ?? undefined,
-                    queued: true,
-                  }));
-                historyItems = [...historyItems, ...newQueuedItems];
-              }
-              setItems(historyItems);
-              adjustVisibleItemsLimit(historyItems);
-              updateMissionItems(viewingId, historyItems);
-              // Also check events for desktop sessions
-              applyDesktopSessionFromEvents(events);
-            })
-            .catch(() => {
-              // Fall back to basic history if events fail
-              getMission(viewingId)
-                .then((mission) => {
-                  if (!mounted) return;
-                  const historyItems = missionHistoryToItems(mission);
-                  setItems(historyItems);
-                  updateMissionItems(viewingId, historyItems);
-                })
-                .catch(() => {}); // Ignore errors - we'll get updates via stream
-            });
+          reloadMissionHistory(viewingId);
         }
 
         const st = data["state"];
@@ -5528,16 +5488,97 @@ export default function ControlClient() {
     }
   }, []);
 
-  // Re-sync queue when the tab regains visibility (e.g. user navigated away and back)
+  // Reload full mission history from API (events + queue). Used for visibility
+  // change, periodic sync, and SSE reconnect catch-up.
+  const reloadMissionHistory = useCallback(
+    async (missionId: string) => {
+      try {
+        const [mission, events, queuedMessages] = await Promise.all([
+          getMission(missionId),
+          loadHistoryEvents(missionId).catch(() => null),
+          getQueue().catch(() => []),
+        ]);
+        // Race guard: only apply if we're still viewing this mission
+        if (viewingMissionIdRef.current !== missionId) return;
+
+        let historyItems = events
+          ? eventsToItems(events, mission)
+          : missionHistoryToItems(mission);
+        if (events && !historyItems.some((item) => item.kind === "assistant")) {
+          const historyHasAssistant = mission.history.some(
+            (entry) => entry.role === "assistant"
+          );
+          if (historyHasAssistant) {
+            historyItems = missionHistoryToItems(mission);
+          }
+        }
+
+        // Merge queued messages that belong to this mission
+        const missionQueuedMessages = queuedMessages.filter(
+          (qm) => qm.mission_id === missionId
+        );
+        if (missionQueuedMessages.length > 0) {
+          const queuedIds = new Set(missionQueuedMessages.map((qm) => qm.id));
+          historyItems = historyItems.map((item) =>
+            item.kind === "user" && queuedIds.has(item.id)
+              ? { ...item, queued: true }
+              : item
+          );
+          const existingIds = new Set(historyItems.map((item) => item.id));
+          const newQueuedItems: ChatItem[] = missionQueuedMessages
+            .filter((qm) => !existingIds.has(qm.id))
+            .map((qm) => ({
+              kind: "user" as const,
+              id: qm.id,
+              content: qm.content,
+              timestamp: Date.now(),
+              agent: qm.agent ?? undefined,
+              queued: true,
+            }));
+          historyItems = [...historyItems, ...newQueuedItems];
+        }
+
+        setItems(historyItems);
+        adjustVisibleItemsLimit(historyItems);
+        updateMissionItems(missionId, historyItems);
+        if (events) {
+          applyDesktopSessionFromEvents(events);
+        }
+      } catch (err) {
+        console.warn("[control] reloadMissionHistory failed", err);
+      }
+    },
+    [
+      loadHistoryEvents,
+      eventsToItems,
+      missionHistoryToItems,
+      adjustVisibleItemsLimit,
+      updateMissionItems,
+      applyDesktopSessionFromEvents,
+    ]
+  );
+
+  // Reload full history when the tab regains visibility to catch missed SSE events
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible" && viewingMissionId) {
-        syncQueueForMission(viewingMissionId);
+        reloadMissionHistory(viewingMissionId);
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
-  }, [viewingMissionId, syncQueueForMission]);
+  }, [viewingMissionId, reloadMissionHistory]);
+
+  // Periodically sync history for running missions to catch missed SSE events
+  useEffect(() => {
+    if (!viewingMissionId || !viewingMissionIsRunning) return;
+    const interval = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        reloadMissionHistory(viewingMissionId);
+      }
+    }, 15_000);
+    return () => clearInterval(interval);
+  }, [viewingMissionId, viewingMissionIsRunning, reloadMissionHistory]);
 
   // Compute queued items for the queue strip
   const queuedItems: QueueItem[] = useMemo(() => {
