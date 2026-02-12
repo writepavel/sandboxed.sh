@@ -77,9 +77,10 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
           setIsAuthed(false);
         }
       } catch {
-        // On error, assume auth is required
-        setAuthRequired(true);
-        setIsAuthed(false);
+        // On error (e.g., unreachable URL), allow access to avoid locking the user
+        // This matches the initial mount behavior and lets users fix the URL in settings
+        setAuthRequired(false);
+        setIsAuthed(true);
       } finally {
         setReady(true);
       }
