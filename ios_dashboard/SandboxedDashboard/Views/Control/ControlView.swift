@@ -24,6 +24,8 @@ struct ControlView: View {
     @State private var progress: ExecutionProgress?
     @State private var isAtBottom = true
     @State private var copiedMessageId: String?
+    @State private var shouldScrollImmediately = false
+    @State private var isLoadingHistory = false  // Track when loading historical messages to prevent animated scroll
 
     // Connection state for SSE stream - starts as disconnected until first event received
     @State private var connectionState: ConnectionState = .disconnected
@@ -59,7 +61,8 @@ struct ControlView: View {
     @State private var showSettings = false
 
     @FocusState private var isInputFocused: Bool
-    
+    @Environment(\.scenePhase) private var scenePhase
+
     private let api = APIService.shared
     private let nav = NavigationState.shared
     private let bottomAnchorId = "bottom-anchor"
@@ -297,6 +300,18 @@ struct ControlView: View {
                 applyViewingMission(mission)
             }
         }
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            // Reload mission history when app becomes active (similar to web's visibility change handler)
+            // This ensures we catch any missed SSE events while the app was in background
+            if oldPhase != .active && newPhase == .active {
+                Task {
+                    if let missionId = viewingMissionId {
+                        await reloadMissionFromServer(id: missionId)
+                    }
+                    await refreshRunningMissions()
+                }
+            }
+        }
         .onDisappear {
             streamTask?.cancel()
             connectionState = .disconnected
@@ -505,14 +520,17 @@ struct ControlView: View {
                     isInputFocused = false
                 }
                 .onChange(of: messages.count) { _, _ in
-                    if isAtBottom {
+                    // Only auto-scroll on message count change if we're at bottom AND not loading historical messages
+                    // This prevents the jarring animated scroll when loading cached/historical conversations
+                    if isAtBottom && !isLoadingHistory {
                         scrollToBottom(proxy: proxy)
                     }
                 }
                 .onChange(of: shouldScrollToBottom) { _, shouldScroll in
                     if shouldScroll {
-                        scrollToBottom(proxy: proxy)
+                        scrollToBottom(proxy: proxy, immediate: shouldScrollImmediately)
                         shouldScrollToBottom = false
+                        shouldScrollImmediately = false
                     }
                 }
                 .overlay(alignment: .bottom) {
@@ -627,9 +645,15 @@ struct ControlView: View {
         .transition(.opacity.combined(with: .scale(scale: 0.95)))
     }
     
-    private func scrollToBottom(proxy: ScrollViewProxy) {
-        withAnimation {
+    private func scrollToBottom(proxy: ScrollViewProxy, immediate: Bool = false) {
+        if immediate {
+            // Immediate scroll without animation for loading historical conversations
             proxy.scrollTo(bottomAnchorId, anchor: .bottom)
+        } else {
+            // Animated scroll for new messages during active conversation
+            withAnimation {
+                proxy.scrollTo(bottomAnchorId, anchor: .bottom)
+            }
         }
     }
     
@@ -777,8 +801,27 @@ struct ControlView: View {
     }
     
     // MARK: - Actions
-    
+
+    // Cache mission history for faster loading on reopen
+    private func cacheMissionHistory(_ mission: Mission) {
+        let key = "cached_mission_\(mission.id)"
+        if let encoded = try? JSONEncoder().encode(mission) {
+            UserDefaults.standard.set(encoded, forKey: key)
+        }
+    }
+
+    private func loadCachedMissionHistory(_ missionId: String) -> Mission? {
+        let key = "cached_mission_\(missionId)"
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let mission = try? JSONDecoder().decode(Mission.self, from: data) else {
+            return nil
+        }
+        return mission
+    }
+
     private func applyViewingMission(_ mission: Mission, scrollToBottom: Bool = true) {
+        isLoadingHistory = true  // Prevent animated scroll during history load
+
         viewingMission = mission
         viewingMissionId = mission.id
         messages = mission.history.enumerated().map { index, entry in
@@ -789,14 +832,25 @@ struct ControlView: View {
             )
         }
 
+        // Cache the mission history for faster loading next time
+        cacheMissionHistory(mission)
+
         if scrollToBottom {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                shouldScrollToBottom = true
-            }
+            // Use immediate synchronous scroll to prevent visible scrolling from top
+            shouldScrollImmediately = true
+            shouldScrollToBottom = true
+        }
+
+        // Reset flag after SwiftUI has processed the state change
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            isLoadingHistory = false
         }
     }
 
     private func applyViewingMissionWithEvents(_ mission: Mission, events: [StoredEvent], scrollToBottom: Bool = true) {
+        isLoadingHistory = true  // Prevent animated scroll during history load
+
         viewingMission = mission
         viewingMissionId = mission.id
 
@@ -845,15 +899,36 @@ struct ControlView: View {
             handleStreamEvent(type: event.eventType, data: data, isHistoricalReplay: true)
         }
 
+        // Cache the mission history for faster loading next time
+        cacheMissionHistory(mission)
+
         if scrollToBottom {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                shouldScrollToBottom = true
-            }
+            // Use immediate synchronous scroll to prevent visible scrolling from top
+            shouldScrollImmediately = true
+            shouldScrollToBottom = true
+        }
+
+        // Reset flag after SwiftUI has processed the state change
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+            isLoadingHistory = false
         }
     }
 
     private func loadCurrentMission(updateViewing: Bool) async {
-        isLoading = true
+        // Try to load cached version first for immediate display
+        var hasCache = false
+        if updateViewing, let currentId = currentMission?.id ?? viewingMissionId,
+           let cachedMission = loadCachedMissionHistory(currentId) {
+            currentMission = cachedMission
+            applyViewingMission(cachedMission)
+            hasCache = true
+        }
+
+        // Only show loading state if we don't have cached data to display
+        if !hasCache {
+            isLoading = true
+        }
         defer { isLoading = false }
 
         do {
@@ -875,7 +950,19 @@ struct ControlView: View {
         let previousViewingId = viewingMissionId
         viewingMissionId = id
 
-        isLoading = true
+        // Try to load cached version first for immediate display
+        let hasCache: Bool
+        if let cachedMission = loadCachedMissionHistory(id) {
+            applyViewingMission(cachedMission)
+            hasCache = true
+        } else {
+            hasCache = false
+        }
+
+        // Only show loading state if we don't have cached data to display
+        if !hasCache {
+            isLoading = true
+        }
 
         do {
             // Fetch mission metadata first (required)
@@ -892,7 +979,9 @@ struct ControlView: View {
 
             // Try to fetch full event history (optional - fall back to basic history if it fails)
             do {
-                let events = try await api.getMissionEvents(id: id)
+                // Fetch all relevant event types including thinking events (matching web dashboard behavior)
+                let eventTypes = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
+                let events = try await api.getMissionEvents(id: id, types: eventTypes)
 
                 // Race condition guard after the second await
                 guard fetchingMissionId == id else {
@@ -930,7 +1019,40 @@ struct ControlView: View {
             }
         }
     }
-    
+
+    // Reload mission from server without showing loading state or cache
+    // Used when app becomes active to catch missed SSE events (like web's visibility change handler)
+    private func reloadMissionFromServer(id: String) async {
+        // Guard against race conditions - only apply if user is still viewing this mission
+        guard viewingMissionId == id else { return }
+
+        do {
+            let mission = try await api.getMission(id: id)
+
+            // Check again after async operation
+            guard viewingMissionId == id else { return }
+
+            // Update current mission if it matches
+            if currentMission?.id == mission.id {
+                currentMission = mission
+            }
+
+            // Fetch events to get the complete updated history
+            let eventTypes = ["user_message", "assistant_message", "tool_call", "tool_result", "text_delta", "thinking"]
+            if let events = try? await api.getMissionEvents(id: id, types: eventTypes), !events.isEmpty {
+                // Final check before applying
+                guard viewingMissionId == id else { return }
+                applyViewingMissionWithEvents(mission, events: events, scrollToBottom: false)
+            } else {
+                // Final check before applying
+                guard viewingMissionId == id else { return }
+                applyViewingMission(mission, scrollToBottom: false)
+            }
+        } catch {
+            print("Failed to reload mission from server: \(error)")
+        }
+    }
+
     private func createNewMission(options: NewMissionOptions? = nil) async {
         do {
             let mission = try await api.createMission(
