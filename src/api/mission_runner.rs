@@ -69,6 +69,9 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     }
 }
 
+/// Prefixes that indicate a thought/reasoning line
+const THOUGHT_PREFIXES: &[&str] = &["thought:", "thoughts:", "thinking:"];
+
 fn extract_thought_line(text: &str) -> Option<(String, String)> {
     let mut thought: Option<String> = None;
     let mut remaining: Vec<&str> = Vec::new();
@@ -76,9 +79,10 @@ fn extract_thought_line(text: &str) -> Option<(String, String)> {
     for line in text.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
-        let is_thought = lower.starts_with("thought:")
-            || lower.starts_with("thoughts:")
-            || lower.starts_with("thinking:");
+        let is_thought = THOUGHT_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix));
+
         if thought.is_none() && is_thought {
             let content = trimmed
                 .split_once(':')
@@ -125,40 +129,29 @@ async fn set_control_state_for_mission(
     });
 }
 
+/// Patterns that identify OpenCode status/debug lines to be filtered
+const OPENCODE_STATUS_PATTERNS: &[&str] = &[
+    "starting opencode server",
+    "opencode server started",
+    "sending prompt",
+    "waiting for completion",
+    "all tasks completed",
+    "session ended with error",
+    "[session.error]",
+    "session:",
+    "session: ses_",
+];
+
 fn is_opencode_status_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return true;
     }
+
     let lower = trimmed.to_lowercase();
-    if lower.starts_with("starting opencode server") {
-        return true;
-    }
-    if lower.starts_with("opencode server started") {
-        return true;
-    }
-    if lower.starts_with("sending prompt") {
-        return true;
-    }
-    if lower.starts_with("waiting for completion") {
-        return true;
-    }
-    if lower.starts_with("all tasks completed") {
-        return true;
-    }
-    if lower.starts_with("session ended with error") {
-        return true;
-    }
-    if lower.starts_with("[session.error]") {
-        return true;
-    }
-    if lower.starts_with("session:") || lower.contains("session: ses_") {
-        return true;
-    }
-    if lower.contains("starting opencode server") {
-        return true;
-    }
-    false
+    OPENCODE_STATUS_PATTERNS
+        .iter()
+        .any(|pattern| lower.starts_with(pattern) || lower.contains(pattern))
 }
 
 fn strip_opencode_status_lines(text: &str) -> String {
