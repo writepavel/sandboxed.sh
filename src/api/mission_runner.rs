@@ -3186,7 +3186,10 @@ fn opencode_output_needs_fallback(output: &str) -> bool {
             || lower.contains("all tasks completed")
             || lower.contains("completed")
             || lower.contains("session id:")
-            || lower.contains("session:");
+            || lower.contains("session:")
+            || lower.contains("event stream did not close")
+            || lower.contains("continuing shutdown")
+            || lower.starts_with("[run]");
         if !is_banner {
             return false;
         }
@@ -4204,10 +4207,7 @@ fn apply_model_override_to_oh_my_opencode(
 /// in the snapshot the session silently fails.  By injecting a custom provider
 /// definition we tell the AI-SDK adapter *how* to reach the provider and declare
 /// the model as valid.
-fn ensure_opencode_provider_for_model(
-    opencode_config_dir: &std::path::Path,
-    model_override: &str,
-) {
+fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, model_override: &str) {
     let model_override = model_override.trim();
     if model_override.is_empty() {
         return;
@@ -4337,7 +4337,12 @@ fn ensure_opencode_providers_for_omo_config(opencode_config_dir: &std::path::Pat
         Err(_) => return,
     };
 
-    let json: serde_json::Value = match serde_json::from_str(&contents) {
+    let parsed = if target_path.extension().and_then(|s| s.to_str()) == Some("jsonc") {
+        serde_json::from_str::<serde_json::Value>(&strip_jsonc_comments(&contents))
+    } else {
+        serde_json::from_str::<serde_json::Value>(&contents)
+    };
+    let json = match parsed {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -6394,7 +6399,6 @@ pub async fn run_opencode_turn(
     if model.is_some() {
         if let Some(model_override) = resolved_model.as_deref() {
             apply_model_override_to_oh_my_opencode(&opencode_config_dir_host, model_override);
-            ensure_opencode_provider_for_model(&opencode_config_dir_host, model_override);
         }
     }
     sync_opencode_agent_config(
@@ -6412,11 +6416,17 @@ pub async fn run_opencode_turn(
     if resolved_model.is_none() {
         resolved_model = agent_model.clone();
     }
-    // Ensure provider definitions exist for the resolved agent model (may differ from override)
-    if let Some(ref am) = agent_model {
-        ensure_opencode_provider_for_model(&opencode_config_dir_host, am);
+    // Inject provider definitions into opencode.json for models not in
+    // OpenCode's built-in snapshot.  We do this *after* sync_opencode_agent_config
+    // so all writes to opencode.json's model/agent sections are finished first.
+    if let Some(model_override) = resolved_model.as_deref() {
+        ensure_opencode_provider_for_model(&opencode_config_dir_host, model_override);
     }
-    // Also ensure provider definitions for any models referenced in OMO categories
+    if let Some(ref am) = agent_model {
+        if resolved_model.as_deref() != Some(am) {
+            ensure_opencode_provider_for_model(&opencode_config_dir_host, am);
+        }
+    }
     ensure_opencode_providers_for_omo_config(&opencode_config_dir_host);
     if needs_google {
         if let Some(project_id) = detect_google_project_id() {
