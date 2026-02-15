@@ -5459,7 +5459,7 @@ async fn run_single_control_turn(
         // Get library for skill syncing
         let lib_guard = library.read().await;
         let lib_ref = lib_guard.as_ref().map(|l| l.as_ref());
-        let dir = match workspace::prepare_mission_workspace_with_skills_backend(
+        let dir = match Box::pin(workspace::prepare_mission_workspace_with_skills_backend(
             &ws,
             &mcp,
             lib_ref,
@@ -5467,7 +5467,7 @@ async fn run_single_control_turn(
             backend_id.as_deref().unwrap_or("opencode"),
             None, // custom_providers: TODO integrate with provider store
             effective_config_profile.as_deref(),
-        )
+        ))
         .await
         {
             Ok(dir) => dir,
@@ -5487,13 +5487,13 @@ async fn run_single_control_turn(
     };
 
     if let Some(ws) = runtime_workspace.as_ref() {
-        if let Err(e) = workspace::write_runtime_workspace_state(
+        if let Err(e) = Box::pin(workspace::write_runtime_workspace_state(
             &config.working_dir,
             ws,
             &working_dir_path,
             mission_id,
             &config.context.context_dir_name,
-        )
+        ))
         .await
         {
             tracing::warn!("Failed to write runtime workspace state: {}", e);
@@ -5562,7 +5562,7 @@ async fn run_single_control_turn(
             // where the session exists but history may not have assistant messages yet).
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
-            let mut result = super::mission_runner::run_claudecode_turn(
+            let mut result = Box::pin(super::mission_runner::run_claudecode_turn(
                 exec_workspace,
                 &ctx.working_dir,
                 &user_message,
@@ -5577,7 +5577,7 @@ async fn run_single_control_turn(
                 is_continuation,
                 Some(tool_hub.clone()),
                 Some(status.clone()),
-            )
+            ))
             .await;
 
             // Claude Code occasionally gets stuck when resuming an old session: the CLI emits only
@@ -5642,7 +5642,7 @@ async fn run_single_control_turn(
                     )
                 };
 
-                result = super::mission_runner::run_claudecode_turn(
+                result = Box::pin(super::mission_runner::run_claudecode_turn(
                     exec_workspace,
                     &ctx.working_dir,
                     &retry_message,
@@ -5657,7 +5657,7 @@ async fn run_single_control_turn(
                     is_continuation,
                     Some(tool_hub.clone()),
                     Some(status.clone()),
-                )
+                ))
                 .await;
             }
 
@@ -5682,7 +5682,7 @@ async fn run_single_control_turn(
             let is_continuation =
                 force_session_resume || history.iter().any(|(role, _)| role == "assistant");
             let api_key = super::mission_runner::get_amp_api_key_from_config();
-            super::mission_runner::run_amp_turn(
+            Box::pin(super::mission_runner::run_amp_turn(
                 exec_workspace,
                 &ctx.working_dir,
                 &user_message,
@@ -5694,7 +5694,7 @@ async fn run_single_control_turn(
                 session_id.as_deref(),
                 is_continuation,
                 api_key.as_deref(),
-            )
+            ))
             .await
         }
         Some("codex") => {
@@ -5713,7 +5713,7 @@ async fn run_single_control_turn(
                     .with_terminal_reason(TerminalReason::LlmError);
                 }
             };
-            super::mission_runner::run_codex_turn(
+            Box::pin(super::mission_runner::run_codex_turn(
                 exec_workspace,
                 &ctx.working_dir,
                 &convo,
@@ -5726,7 +5726,7 @@ async fn run_single_control_turn(
                 cancel,
                 &config.working_dir,
                 session_id.as_deref(),
-            )
+            ))
             .await
         }
         Some(backend) if backend != "opencode" => {
@@ -5741,7 +5741,7 @@ async fn run_single_control_turn(
         _ => {
             // Default to opencode using per-workspace CLI execution
             let mid = mission_id.unwrap_or_else(Uuid::nil);
-            super::mission_runner::run_opencode_turn(
+            Box::pin(super::mission_runner::run_opencode_turn(
                 exec_workspace,
                 &ctx.working_dir,
                 &user_message,
@@ -5751,7 +5751,7 @@ async fn run_single_control_turn(
                 events_tx.clone(),
                 cancel,
                 &config.working_dir,
-            )
+            ))
             .await
         }
     };

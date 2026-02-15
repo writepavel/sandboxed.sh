@@ -43,7 +43,7 @@ const OPENAI_ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
 
 /// Get the HOME directory path, defaulting to /root if not set.
 fn home_dir() -> String {
-    home_dir()
+    std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }
 
 async fn exchange_openai_id_token_for_api_key(
@@ -113,7 +113,9 @@ async fn refresh_openai_oauth_tokens(
         .body(body)
         .send()
         .await
-        .map_err(|e| OAuthRefreshError::Other(format!("Failed to refresh OpenAI OAuth token: {}", e)))?;
+        .map_err(|e| {
+            OAuthRefreshError::Other(format!("Failed to refresh OpenAI OAuth token: {}", e))
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -133,10 +135,9 @@ async fn refresh_openai_oauth_tokens(
         )));
     }
 
-    let data: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| OAuthRefreshError::Other(format!("Failed to parse OpenAI refresh response: {}", e)))?;
+    let data: serde_json::Value = resp.json().await.map_err(|e| {
+        OAuthRefreshError::Other(format!("Failed to parse OpenAI refresh response: {}", e))
+    })?;
 
     let access_token = data
         .get("access_token")
@@ -4946,7 +4947,9 @@ pub async fn refresh_oauth_token_internal(
                 ])
                 .send()
                 .await
-                .map_err(|e| OAuthRefreshError::Other(format!("Failed to refresh Anthropic token: {}", e)))?;
+                .map_err(|e| {
+                    OAuthRefreshError::Other(format!("Failed to refresh Anthropic token: {}", e))
+                })?;
 
             if !token_response.status().is_success() {
                 let status = token_response.status();
@@ -4966,13 +4969,14 @@ pub async fn refresh_oauth_token_internal(
                 )));
             }
 
-            let token_data: serde_json::Value = token_response
-                .json()
-                .await
-                .map_err(|e| OAuthRefreshError::Other(format!("Failed to parse Anthropic token response: {}", e)))?;
+            let token_data: serde_json::Value = token_response.json().await.map_err(|e| {
+                OAuthRefreshError::Other(format!("Failed to parse Anthropic token response: {}", e))
+            })?;
 
             let new_access_token = token_data["access_token"].as_str().ok_or_else(|| {
-                OAuthRefreshError::Other("No access token in Anthropic refresh response".to_string())
+                OAuthRefreshError::Other(
+                    "No access token in Anthropic refresh response".to_string(),
+                )
             })?;
 
             // **Solution #2: Anthropic rotates refresh tokens - capture the new one**
@@ -5012,7 +5016,9 @@ pub async fn refresh_oauth_token_internal(
                 ])
                 .send()
                 .await
-                .map_err(|e| OAuthRefreshError::Other(format!("Failed to refresh Google token: {}", e)))?;
+                .map_err(|e| {
+                    OAuthRefreshError::Other(format!("Failed to refresh Google token: {}", e))
+                })?;
 
             if !token_response.status().is_success() {
                 let status = token_response.status();
@@ -5032,14 +5038,13 @@ pub async fn refresh_oauth_token_internal(
                 )));
             }
 
-            let token_data: serde_json::Value = token_response
-                .json()
-                .await
-                .map_err(|e| OAuthRefreshError::Other(format!("Failed to parse Google token response: {}", e)))?;
+            let token_data: serde_json::Value = token_response.json().await.map_err(|e| {
+                OAuthRefreshError::Other(format!("Failed to parse Google token response: {}", e))
+            })?;
 
-            let new_access_token = token_data["access_token"]
-                .as_str()
-                .ok_or_else(|| OAuthRefreshError::Other("No access token in Google refresh response".to_string()))?;
+            let new_access_token = token_data["access_token"].as_str().ok_or_else(|| {
+                OAuthRefreshError::Other("No access token in Google refresh response".to_string())
+            })?;
 
             // Google doesn't rotate refresh tokens - use the existing one
             let new_refresh_token = refresh_token.to_string();

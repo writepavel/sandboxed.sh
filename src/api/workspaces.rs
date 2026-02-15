@@ -1689,11 +1689,15 @@ async fn get_container_memory_stats(workspace: &Workspace) -> WorkspaceMemorySta
 }
 
 /// Parse systemd cgroup memory statistics from `systemctl show` output.
-type MemoryStats = (Option<u64>, Option<u64>, Option<u64>, Option<u64>, Option<String>);
+type MemoryStats = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<String>,
+);
 
-fn parse_systemd_memory_stats(
-    stdout: &str,
-) -> MemoryStats {
+fn parse_systemd_memory_stats(stdout: &str) -> MemoryStats {
     let mut memory_current = None;
     let mut memory_peak = None;
     let mut memory_max = None;

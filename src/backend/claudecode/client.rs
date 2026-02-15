@@ -90,10 +90,12 @@ impl ClaudeCodeClient {
             }
         }
 
-        // Model selection
+        // Model selection — Claude Code expects bare model IDs (e.g. "claude-opus-4-6"),
+        // not provider-prefixed ones (e.g. "anthropic/claude-opus-4-6").
         let effective_model = model.or(self.config.default_model.as_deref());
         if let Some(m) = effective_model {
-            cmd.arg("--model").arg(m);
+            let bare = m.strip_prefix("anthropic/").unwrap_or(m);
+            cmd.arg("--model").arg(bare);
         }
 
         // Session ID for continuity

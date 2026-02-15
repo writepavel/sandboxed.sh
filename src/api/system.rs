@@ -1038,7 +1038,7 @@ fn stream_sandboxed_update(
         yield sse("log", "Building Open Agent (this may take a few minutes)...", Some(20));
 
         match Command::new("bash")
-            .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh"])
+            .args(["-c", "source /root/.cargo/env && cargo build --bin sandboxed-sh --bin workspace-mcp --bin desktop-mcp"])
             .current_dir(repo_path)
             .output()
             .await
@@ -1059,28 +1059,57 @@ fn stream_sandboxed_update(
             }
         }
 
-        // Install binaries
-        yield sse("log", "Installing binaries...", Some(75));
+        // Detect the current binary path and derive the service name from it.
+        // e.g. /usr/local/bin/sandboxed-sh-prod → service sandboxed-sh-prod.service
+        let current_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                yield sse("error", format!("Failed to detect current binary path: {}", e), None);
+                return;
+            }
+        };
+        let exe_name = current_exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let service_name = format!("{}.service", exe_name);
+        let install_dest = current_exe.to_string_lossy().to_string();
 
-        let binaries = [("sandboxed_sh", "/usr/local/bin/sandboxed-sh")];
+        yield sse("log", format!("Installing binary to {} (service: {})...", install_dest, service_name), Some(75));
 
-        for (name, dest) in binaries {
-            let src = format!("{}/target/debug/{}", repo_path.display(), name);
-            match Command::new("install")
-                .args(["-m", "0755", &src, dest])
-                .output()
-                .await
-            {
-                Ok(output) if output.status.success() => {}
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    yield sse("error", format!("Failed to install {}: {}", name, stderr), None);
-                    return;
-                }
-                Err(e) => {
-                    yield sse("error", format!("Failed to install {}: {}", name, e), None);
-                    return;
-                }
+        // Stop the service before replacing the binary to avoid "Text file busy"
+        let _ = Command::new("systemctl")
+            .args(["stop", &service_name])
+            .output()
+            .await;
+
+        let src = format!("{}/target/debug/sandboxed_sh", repo_path.display());
+        match Command::new("install")
+            .args(["-m", "0755", &src, &install_dest])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                yield sse("error", format!("Failed to install binary: {}", stderr), None);
+                // Try to restart the service even if install failed
+                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                return;
+            }
+            Err(e) => {
+                yield sse("error", format!("Failed to install binary: {}", e), None);
+                let _ = Command::new("systemctl").args(["start", &service_name]).output().await;
+                return;
+            }
+        }
+
+        // Also install MCP binaries if they were built
+        for mcp_bin in ["workspace-mcp", "desktop-mcp"] {
+            let mcp_src = format!("{}/target/debug/{}", repo_path.display(), mcp_bin);
+            let mcp_dest = format!("/usr/local/bin/{}", mcp_bin);
+            if std::path::Path::new(&mcp_src).exists() {
+                let _ = Command::new("install")
+                    .args(["-m", "0755", &mcp_src, &mcp_dest])
+                    .output()
+                    .await;
             }
         }
 
@@ -1095,7 +1124,7 @@ fn stream_sandboxed_update(
         // Restart the service - this will terminate our process, so no code after this
         // will execute. The client should poll /api/health to confirm the new version.
         let _ = Command::new("systemctl")
-            .args(["restart", "sandboxed-sh.service"])
+            .args(["start", &service_name])
             .output()
             .await;
     }
@@ -1331,7 +1360,6 @@ fn stream_codex_update() -> impl Stream<Item = Result<Event, std::convert::Infal
 fn stream_codex_uninstall() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     stream_npm_package_uninstall("@openai/codex", ".codex", "Codex")
 }
-
 
 /// Stream the oh-my-opencode update process.
 fn stream_oh_my_opencode_update() -> impl Stream<Item = Result<Event, std::convert::Infallible>> {

@@ -6,8 +6,18 @@ use sandboxed_sh::{api, config::Config, library::env_crypto};
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Use a custom tokio runtime with larger worker thread stacks (16 MB instead of default 2 MB).
+    // Deep async call chains in the mission runner (workspace prep → config write → nspawn exec)
+    // can overflow the default 2 MB worker stack.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::registry()
         .with(
