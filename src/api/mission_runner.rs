@@ -4221,16 +4221,23 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
     // Only inject definitions for providers that need it.
     // OpenAI, Anthropic, Google are natively supported by OpenCode.
     let provider_def: Option<serde_json::Value> = match provider_id {
-        "zai" => Some(serde_json::json!({
-            "npm": "@ai-sdk/openai-compatible",
-            "name": "Z.AI",
-            "options": {
-                "baseURL": "https://api.z.ai/api/paas/v4"
-            },
-            "models": {
-                model_id: { "name": model_id }
-            }
-        })),
+        "zai" => {
+            // Z.AI has two billing endpoints:
+            //   - /api/paas/v4          → pay-per-use balance
+            //   - /api/coding/paas/v4   → coding subscription quota
+            // Default to the coding subscription endpoint since that is the most
+            // common paid plan.  Users can override via ZAI_BASE_URL env var.
+            let base_url = std::env::var("ZAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_string());
+            Some(serde_json::json!({
+                "models": {
+                    model_id: { "name": model_id }
+                },
+                "options": {
+                    "baseURL": base_url
+                }
+            }))
+        }
         "cerebras" => Some(serde_json::json!({
             "npm": "@ai-sdk/cerebras",
             "name": "Cerebras",

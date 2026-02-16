@@ -5344,3 +5344,93 @@ pub fn sync_oauth_to_all_tiers(
 
     Ok(())
 }
+
+/// Refresh an OAuth token with file-based locking to prevent race conditions.
+///
+/// This is the preferred entry point for the background refresh loop. It:
+/// 1. Acquires an exclusive file lock so only one refresh runs at a time.
+/// 2. Re-reads the latest credentials from disk (another process may have
+///    already refreshed with a rotated token).
+/// 3. Skips the refresh if the token is still fresh.
+/// 4. Calls `refresh_oauth_token_internal` and syncs results to all tiers.
+///
+/// Returns `(new_access_token, new_refresh_token, expires_at)` on success.
+pub async fn refresh_oauth_token_with_lock(
+    provider_type: ProviderType,
+) -> Result<(String, String, i64), OAuthRefreshError> {
+    // Acquire exclusive lock — prevents concurrent refreshes from racing on
+    // the same rotating refresh token.
+    let _lock = match acquire_oauth_refresh_lock(provider_type) {
+        Ok(lock) => lock,
+        Err(_) => {
+            // Another process is refreshing. Wait and re-check.
+            tracing::info!(
+                provider = ?provider_type,
+                "Background refresher: another process holds the lock, waiting..."
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+            // Re-read credentials — the other process likely refreshed already.
+            if let Some(entry) = read_oauth_token_entry(provider_type) {
+                if !oauth_token_expired(entry.expires_at) {
+                    tracing::info!(
+                        provider = ?provider_type,
+                        "Background refresher: token was refreshed by another process"
+                    );
+                    return Ok((entry.access_token, entry.refresh_token, entry.expires_at));
+                }
+            }
+
+            // Try once more to acquire the lock
+            acquire_oauth_refresh_lock(provider_type).map_err(|e| {
+                OAuthRefreshError::Other(format!("Could not acquire refresh lock: {}", e))
+            })?
+        }
+    };
+
+    // Re-read credentials from disk (someone else may have refreshed while we
+    // waited for the lock).
+    let entry = read_oauth_token_entry(provider_type).ok_or_else(|| {
+        OAuthRefreshError::Other(format!(
+            "No OAuth entry found for {:?} after acquiring lock",
+            provider_type
+        ))
+    })?;
+
+    if !oauth_token_expired(entry.expires_at) {
+        tracing::info!(
+            provider = ?provider_type,
+            "Background refresher: token is fresh after acquiring lock, skipping"
+        );
+        return Ok((entry.access_token, entry.refresh_token, entry.expires_at));
+    }
+
+    let refresh_token_prefix = if entry.refresh_token.len() > 12 {
+        &entry.refresh_token[..12]
+    } else {
+        &entry.refresh_token
+    };
+    tracing::info!(
+        provider = ?provider_type,
+        refresh_token_prefix = %refresh_token_prefix,
+        expires_at = entry.expires_at,
+        "Background refresher: refreshing token (holding lock)"
+    );
+
+    // Perform the actual refresh using the latest refresh token from disk.
+    let (new_access, new_refresh, expires_at) =
+        refresh_oauth_token_internal(&provider_type, &entry.refresh_token).await?;
+
+    // Sync to all storage tiers while we still hold the lock.
+    sync_oauth_to_all_tiers(provider_type, &new_refresh, &new_access, expires_at)
+        .map_err(|e| OAuthRefreshError::Other(format!("Tier sync failed: {}", e)))?;
+
+    tracing::info!(
+        provider = ?provider_type,
+        new_expires_at = expires_at,
+        "Background refresher: successfully refreshed and synced token"
+    );
+
+    Ok((new_access, new_refresh, expires_at))
+    // _lock is dropped here, releasing the file lock
+}
