@@ -99,8 +99,20 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
 /// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
 /// `<think>` tags that should not be shown in the text output.
 fn strip_think_tags(text: &str) -> String {
-    let lower = text.to_lowercase();
-    if !lower.contains("<think>") {
+    // Case-insensitive search directly on the original text to avoid
+    // byte-offset misalignment from to_lowercase() on non-ASCII input.
+    fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+        let needle_len = needle.len();
+        if haystack.len() < needle_len {
+            return None;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle_len)
+            .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    if find_ci(text, "<think>").is_none() {
         return text.to_string();
     }
 
@@ -108,16 +120,15 @@ fn strip_think_tags(text: &str) -> String {
     let mut pos = 0;
 
     while pos < text.len() {
-        if let Some(rel_start) = lower[pos..].find("<think>") {
+        if let Some(rel_start) = find_ci(&text[pos..], "<think>") {
             let abs_start = pos + rel_start;
             result.push_str(&text[pos..abs_start]);
 
             let after_open = abs_start + 7; // len("<think>")
             if after_open <= text.len() {
-                if let Some(rel_close) = lower[after_open..].find("</think>") {
+                if let Some(rel_close) = find_ci(&text[after_open..], "</think>") {
                     pos = after_open + rel_close + 8; // len("</think>")
                 } else {
-                    // Unclosed <think> — suppress remaining content until tag closes
                     break;
                 }
             } else {
