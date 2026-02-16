@@ -63,7 +63,7 @@ fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
 
 fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option<&'a str> {
     if matches!(part_type, "thinking" | "reasoning") {
-        extract_str(part, &["thinking", "text", "content"])
+        extract_str(part, &["thinking", "reasoning", "text", "content"])
     } else {
         extract_str(part, &["text", "content", "output_text"])
     }
@@ -249,6 +249,11 @@ fn handle_part_update(
     let is_text = matches!(part_type, "text" | "output_text");
 
     if !is_thinking && !is_text {
+        tracing::debug!(
+            part_type = %part_type,
+            mission_id = %mission_id,
+            "Unhandled part type in handle_part_update"
+        );
         return None;
     }
 
@@ -4229,9 +4234,24 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
             // common paid plan.  Users can override via ZAI_BASE_URL env var.
             let base_url = std::env::var("ZAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4".to_string());
+            // GLM-5 (and newer GLM models) support "Deep Thinking" mode which
+            // sends reasoning tokens via the `reasoning_content` field in
+            // streaming deltas (OpenAI-compatible format).  We must declare this
+            // capability so the AI-SDK adapter maps `reasoning_content` to
+            // `part.type = "reasoning"` in the SSE events.
+            let model_def = if model_id.starts_with("glm-5") || model_id.starts_with("glm-6") {
+                serde_json::json!({
+                    "name": model_id,
+                    "capabilities": {
+                        "interleaved": { "field": "reasoning_content" }
+                    }
+                })
+            } else {
+                serde_json::json!({ "name": model_id })
+            };
             Some(serde_json::json!({
                 "models": {
-                    model_id: { "name": model_id }
+                    model_id: model_def
                 },
                 "options": {
                     "baseURL": base_url
@@ -4286,6 +4306,20 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
         None => return,
     };
 
+    // Build the model definition — include capabilities for reasoning models.
+    let model_entry = if provider_id == "zai"
+        && (model_id.starts_with("glm-5") || model_id.starts_with("glm-6"))
+    {
+        serde_json::json!({
+            "name": model_id,
+            "capabilities": {
+                "interleaved": { "field": "reasoning_content" }
+            }
+        })
+    } else {
+        serde_json::json!({ "name": model_id })
+    };
+
     if let Some(existing) = providers_map.get_mut(provider_id) {
         // Provider already exists – make sure the model is listed.
         let obj = match existing.as_object_mut() {
@@ -4300,12 +4334,21 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
             None => return,
         };
         if models_map.contains_key(model_id) {
-            return; // already present, nothing to do
+            // Model exists — ensure capabilities are up to date for reasoning models.
+            if let Some(caps) = model_entry.get("capabilities") {
+                if let Some(existing_model) = models_map.get_mut(model_id) {
+                    if existing_model.get("capabilities").is_none() {
+                        if let Some(obj) = existing_model.as_object_mut() {
+                            obj.insert("capabilities".to_string(), caps.clone());
+                        }
+                    }
+                }
+            } else {
+                return; // already present, nothing to do
+            }
+        } else {
+            models_map.insert(model_id.to_string(), model_entry);
         }
-        models_map.insert(
-            model_id.to_string(),
-            serde_json::json!({ "name": model_id }),
-        );
     } else {
         providers_map.insert(provider_id.to_string(), provider_def);
     }
@@ -6694,7 +6737,7 @@ pub async fn run_opencode_turn(
                 if sse_cancel.is_cancelled() {
                     break;
                 }
-                if attempts > 5 {
+                if attempts > 7 {
                     break;
                 }
                 attempts += 1;
@@ -6713,10 +6756,13 @@ pub async fn run_opencode_turn(
                     .spawn_streaming(&work_dir, "curl", &args, HashMap::new())
                     .await;
 
+                // Exponential backoff: 50ms, 100ms, 200ms, 400ms, ...
+                let backoff_ms = 50u64 * (1u64 << attempts.min(6));
+
                 let mut child = match child {
                     Ok(child) => child,
                     Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
                 };
@@ -6725,7 +6771,7 @@ pub async fn run_opencode_turn(
                     Some(stdout) => stdout,
                     None => {
                         let _ = child.kill().await;
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                         continue;
                     }
                 };
@@ -6837,7 +6883,9 @@ pub async fn run_opencode_turn(
                 if saw_complete {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // Exponential backoff before reconnecting
+                let backoff_ms = 50u64 * (1u64 << attempts.min(6));
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
             }
         }))
     } else {

@@ -320,7 +320,7 @@ impl OpenCodeClient {
         let session_id_for_message = session_id.clone();
         let message_handle = tokio::spawn(async move {
             // Delay to ensure SSE subscription is ready and connection is established
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             tracing::debug!(session_id = %session_id_for_message, "Sending HTTP POST to OpenCode");
             let start = std::time::Instant::now();
@@ -832,8 +832,8 @@ fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
 }
 
 fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option<&'a str> {
-    if part_type == "thinking" {
-        extract_str(part, &["thinking", "text", "content"])
+    if matches!(part_type, "thinking" | "reasoning") {
+        extract_str(part, &["thinking", "reasoning", "text", "content"])
     } else {
         extract_str(part, &["text", "content", "output_text"])
     }
@@ -856,6 +856,10 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
     }
 
     if !matches!(part_type, "text" | "output_text" | "reasoning" | "thinking") {
+        tracing::debug!(
+            part_type = %part_type,
+            "Unhandled part type in handle_part_update"
+        );
         return None;
     }
 
