@@ -25,7 +25,6 @@ import {
   Cog,
   Key,
   Archive,
-  Activity,
   Cpu,
   Lock,
 } from 'lucide-react';
@@ -58,7 +57,6 @@ const navigation: NavItem[] = [
     href: '/inspect',
     icon: Search,
     children: [
-      { name: 'System', href: '/inspect/system', icon: Activity },
       { name: 'MCPs', href: '/inspect/mcps', icon: Plug },
       { name: 'Tools', href: '/inspect/tools', icon: Wrench },
     ],
