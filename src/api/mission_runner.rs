@@ -6316,8 +6316,13 @@ pub async fn run_opencode_turn(
 
     let opencode_config_dir_host = work_dir.join(".opencode");
 
+    // Resolve the model: explicit override > agent config > env var defaults.
+    // Agent config (oh-my-opencode.json) is checked before env vars so that
+    // config profiles with agent-specific models take precedence over global
+    // default model env vars.
     let mut resolved_model = model
         .map(|m| m.to_string())
+        .or_else(|| resolve_opencode_model_from_config(&opencode_config_dir_host, agent))
         .or_else(|| {
             std::env::var("SANDBOXED_SH_OPENCODE_DEFAULT_MODEL")
                 .ok()
@@ -6333,10 +6338,6 @@ pub async fn run_opencode_turn(
     let has_anthropic = auth_state.has_anthropic;
     let has_google = auth_state.has_google;
     let has_any_provider = has_openai || has_anthropic || has_google || auth_state.has_other;
-
-    if resolved_model.is_none() {
-        resolved_model = resolve_opencode_model_from_config(&opencode_config_dir_host, agent);
-    }
 
     let mut provider_hint = resolved_model
         .as_deref()
