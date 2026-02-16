@@ -7408,12 +7408,22 @@ pub async fn run_opencode_turn(
                 }
                 if let Some(last_text) = text_output_at {
                     if last_text.elapsed() >= std::time::Duration::from_secs(30) {
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            "OpenCode output idle timeout reached; terminating CLI process"
-                        );
-                        let _ = child.kill().await;
-                        break;
+                        // Only kill if there's also no recent SSE/stderr activity.
+                        // The model may be actively doing tool calls without
+                        // producing text output.
+                        let recent_activity = last_activity
+                            .lock()
+                            .ok()
+                            .map(|g| g.elapsed() < std::time::Duration::from_secs(30))
+                            .unwrap_or(false);
+                        if !recent_activity {
+                            tracing::info!(
+                                mission_id = %mission_id,
+                                "OpenCode output idle timeout reached; terminating CLI process"
+                            );
+                            let _ = child.kill().await;
+                            break;
+                        }
                     }
                 }
                 // Global inactivity timeout: if nothing at all has happened
