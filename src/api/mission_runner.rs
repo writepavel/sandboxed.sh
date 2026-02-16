@@ -178,6 +178,43 @@ fn strip_opencode_status_lines(text: &str) -> String {
         .to_string()
 }
 
+/// Strip `<think>...</think>` tags from text output.
+/// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
+/// `<think>` tags that should not be shown in the text output.
+fn strip_think_tags(text: &str) -> String {
+    let lower = text.to_lowercase();
+    if !lower.contains("<think>") {
+        return text.to_string();
+    }
+
+    let mut result = String::new();
+    let mut pos = 0;
+
+    while pos < text.len() {
+        if let Some(rel_start) = lower[pos..].find("<think>") {
+            let abs_start = pos + rel_start;
+            result.push_str(&text[pos..abs_start]);
+
+            let after_open = abs_start + 7; // len("<think>")
+            if after_open <= text.len() {
+                if let Some(rel_close) = lower[after_open..].find("</think>") {
+                    pos = after_open + rel_close + 8; // len("</think>")
+                } else {
+                    // Unclosed <think> — suppress remaining content until tag closes
+                    break;
+                }
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(&text[pos..]);
+            break;
+        }
+    }
+
+    result
+}
+
 fn handle_tool_part_update(
     part: &serde_json::Value,
     state: &mut OpencodeSseState,
@@ -309,6 +346,14 @@ fn handle_part_update(
         *buffer = filtered.clone();
     }
     let content = filtered;
+
+    // Strip inline <think>...</think> tags from text parts.
+    // Don't modify the buffer so incomplete tags across deltas are handled correctly.
+    let content = if !is_thinking {
+        strip_think_tags(&content)
+    } else {
+        content
+    };
 
     if content.trim().is_empty() {
         return None;
@@ -7450,7 +7495,7 @@ pub async fn run_opencode_turn(
         if opencode_output_needs_fallback(&final_result) {
             if let Some(session_id) = session_id.as_deref() {
                 if let Some(message) = stored_message.as_ref() {
-                    let text = extract_text(&message.parts);
+                    let text = strip_think_tags(&extract_text(&message.parts));
                     if !text.trim().is_empty() {
                         tracing::info!(
                             mission_id = %mission_id,
@@ -7567,6 +7612,9 @@ pub async fn run_opencode_turn(
         }
 
         // No retry needed — fall through to result processing below.
+
+        // Strip inline <think>...</think> tags from final output (Minimax, DeepSeek, etc.)
+        final_result = strip_think_tags(&final_result);
 
         let mut emitted_thinking = false;
         let sse_emitted = sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst);
