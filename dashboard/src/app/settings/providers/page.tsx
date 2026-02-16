@@ -36,6 +36,7 @@ const providerConfig: Record<string, { color: string; icon: string }> = {
   groq: { color: 'bg-pink-500/10 text-pink-400', icon: '⚡' },
   xai: { color: 'bg-slate-500/10 text-slate-400', icon: '𝕏' },
   zai: { color: 'bg-cyan-500/10 text-cyan-400', icon: 'Z' },
+  minimax: { color: 'bg-teal-500/10 text-teal-400', icon: 'M' },
   'github-copilot': { color: 'bg-gray-500/10 text-gray-400', icon: '🐙' },
   custom: { color: 'bg-white/10 text-white/60', icon: '🔧' },
 };
@@ -53,6 +54,7 @@ const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'mistral', name: 'Mistral AI', uses_oauth: false, env_var: 'MISTRAL_API_KEY' },
   { id: 'xai', name: 'xAI', uses_oauth: false, env_var: 'XAI_API_KEY' },
   { id: 'zai', name: 'Z.AI', uses_oauth: false, env_var: 'ZHIPU_API_KEY' },
+  { id: 'minimax', name: 'Minimax', uses_oauth: false, env_var: 'MINIMAX_API_KEY' },
   { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
 ];
 

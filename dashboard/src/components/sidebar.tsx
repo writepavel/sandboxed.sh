@@ -68,7 +68,6 @@ const navigation: NavItem[] = [
     href: '/settings',
     icon: Settings,
     children: [
-      { name: 'System', href: '/settings/system', icon: Server },
       { name: 'Backends', href: '/settings/backends', icon: Cpu },
       { name: 'Providers', href: '/settings/providers', icon: Key },
       { name: 'Security', href: '/settings/secrets', icon: Lock },

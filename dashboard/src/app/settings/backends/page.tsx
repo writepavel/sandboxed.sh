@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import useSWR from 'swr';
 import { toast } from '@/components/toast';
 import {
@@ -8,14 +8,51 @@ import {
   getBackendConfig,
   updateBackendConfig,
   getProviderForBackend,
+  getHealth,
   BackendProviderResponse,
 } from '@/lib/api';
 import { Server, Save, Loader, Key, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { getRuntimeApiBase, writeSavedSettings } from '@/lib/settings';
+import { ServerConnectionCard } from '@/components/server-connection-card';
 
 export default function BackendsPage() {
   const [activeBackendTab, setActiveBackendTab] = useState<'opencode' | 'claudecode' | 'amp'>('opencode');
   const [savingBackend, setSavingBackend] = useState(false);
+  const [testingConnection, setTestingConnection] = useState(false);
+
+  // Server connection state
+  const [apiUrl, setApiUrl] = useState(() => getRuntimeApiBase());
+  const [originalApiUrl, setOriginalApiUrl] = useState(() => getRuntimeApiBase());
+  const [urlError, setUrlError] = useState<string | null>(null);
+
+  const { data: health, isLoading: healthLoading, mutate: mutateHealth } = useSWR(
+    'health',
+    getHealth,
+    { revalidateOnFocus: false }
+  );
+
+  const hasUnsavedUrlChanges = apiUrl !== originalApiUrl;
+
+  const validateUrl = useCallback((url: string) => {
+    if (!url.trim()) { setUrlError('API URL is required'); return false; }
+    try { new URL(url); setUrlError(null); return true; } catch { setUrlError('Invalid URL format'); return false; }
+  }, []);
+
+  const testApiConnection = async () => {
+    if (!validateUrl(apiUrl)) return;
+    setTestingConnection(true);
+    try { await mutateHealth(); toast.success('Connection successful!'); } catch { toast.error('Failed to connect to server'); } finally { setTestingConnection(false); }
+  };
+
+  const handleSaveUrl = useCallback(() => {
+    if (!validateUrl(apiUrl)) return;
+    const prev = originalApiUrl;
+    writeSavedSettings({ apiUrl });
+    setOriginalApiUrl(apiUrl);
+    toast.success('API URL saved!');
+    if (prev !== apiUrl) window.dispatchEvent(new CustomEvent('openagent:api:url-changed'));
+  }, [apiUrl, originalApiUrl, validateUrl]);
   const [opencodeForm, setOpencodeForm] = useState({
     base_url: '',
     default_agent: '',
@@ -178,7 +215,7 @@ export default function BackendsPage() {
 
   return (
     <div className="flex-1 flex flex-col items-center p-6 overflow-auto">
-      <div className="w-full max-w-xl">
+      <div className="w-full max-w-xl space-y-6">
         {/* Header */}
         <div className="mb-8">
           <h1 className="text-xl font-semibold text-white">Backends</h1>
@@ -186,6 +223,33 @@ export default function BackendsPage() {
             Configure AI coding agent harnesses
           </p>
         </div>
+
+        {/* Server Connection */}
+        <ServerConnectionCard
+          apiUrl={apiUrl}
+          setApiUrl={setApiUrl}
+          urlError={urlError}
+          validateUrl={validateUrl}
+          health={health ?? null}
+          healthLoading={healthLoading}
+          testingConnection={testingConnection}
+          testApiConnection={testApiConnection}
+        />
+
+        {/* Save URL button */}
+        {hasUnsavedUrlChanges && (
+          <div className="flex items-center justify-end gap-3 -mt-4 mb-6">
+            <span className="text-xs text-amber-400">Unsaved changes</span>
+            <button
+              onClick={handleSaveUrl}
+              disabled={!!urlError}
+              className="flex items-center gap-2 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Save className="h-3.5 w-3.5" />
+              Save URL
+            </button>
+          </div>
+        )}
 
         {/* Backends */}
         <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5">

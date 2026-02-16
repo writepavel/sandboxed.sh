@@ -11,12 +11,27 @@
 //! - Working directory (isolated per mission)
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Per-provider concurrency semaphores.
+/// ZAI's coding subscription endpoint rate-limits concurrent requests (typically
+/// 1 at a time). The semaphore serializes missions targeting the same provider
+/// so we don't trigger 429s.
+static PROVIDER_SEMAPHORES: LazyLock<HashMap<&'static str, Semaphore>> = LazyLock::new(|| {
+    let zai_max: usize = std::env::var("ZAI_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let mut m = HashMap::new();
+    m.insert("zai", Semaphore::new(zai_max));
+    m
+});
 
 use crate::agents::{AgentRef, AgentResult, TerminalReason};
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
@@ -78,6 +93,54 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     } else {
         extract_str(part, &["text", "content", "output_text"])
     }
+}
+
+/// Strip `<think>...</think>` tags from text output.
+/// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
+/// `<think>` tags that should not be shown in the text output.
+fn strip_think_tags(text: &str) -> String {
+    // Case-insensitive search directly on the original text to avoid
+    // byte-offset misalignment from to_lowercase() on non-ASCII input.
+    fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+        let needle_len = needle.len();
+        if haystack.len() < needle_len {
+            return None;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle_len)
+            .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    if find_ci(text, "<think>").is_none() {
+        return text.to_string();
+    }
+
+    let mut result = String::new();
+    let mut pos = 0;
+
+    while pos < text.len() {
+        if let Some(rel_start) = find_ci(&text[pos..], "<think>") {
+            let abs_start = pos + rel_start;
+            result.push_str(&text[pos..abs_start]);
+
+            let after_open = abs_start + 7; // len("<think>")
+            if after_open <= text.len() {
+                if let Some(rel_close) = find_ci(&text[after_open..], "</think>") {
+                    pos = after_open + rel_close + 8; // len("</think>")
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(&text[pos..]);
+            break;
+        }
+    }
+
+    result
 }
 
 /// Prefixes that indicate a thought/reasoning line
@@ -313,6 +376,14 @@ fn handle_part_update(
         *buffer = filtered.clone();
     }
     let content = filtered;
+
+    // Strip inline <think>...</think> tags from text parts.
+    // Don't modify the buffer so incomplete tags across deltas are handled correctly.
+    let content = if !is_thinking {
+        strip_think_tags(&content)
+    } else {
+        content
+    };
 
     if content.trim().is_empty() {
         return None;
@@ -3390,6 +3461,7 @@ struct OpenCodeAuthState {
     has_openai: bool,
     has_anthropic: bool,
     has_google: bool,
+    has_zai: bool,
     has_other: bool,
     /// Tracks which specific provider IDs have been detected as configured.
     configured_providers: std::collections::HashSet<String>,
@@ -3440,6 +3512,7 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
     let mut has_openai = false;
     let mut has_anthropic = false;
     let mut has_google = false;
+    let mut has_zai = false;
     let mut has_other = false;
     let mut configured_providers = std::collections::HashSet::new();
 
@@ -3448,6 +3521,7 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
          has_openai: &mut bool,
          has_anthropic: &mut bool,
          has_google: &mut bool,
+         has_zai: &mut bool,
          has_other: &mut bool,
          configured_providers: &mut std::collections::HashSet<String>| {
             configured_providers.insert(key.to_lowercase());
@@ -3455,6 +3529,13 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
                 "openai" | "codex" => *has_openai = true,
                 "anthropic" | "claude" => *has_anthropic = true,
                 "google" | "gemini" => *has_google = true,
+                "zai" | "zhipu" => {
+                    *has_zai = true;
+                    *has_other = true;
+                }
+                "minimax" => {
+                    *has_other = true;
+                }
                 _ => *has_other = true,
             }
         };
@@ -3472,6 +3553,7 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
                             &mut has_openai,
                             &mut has_anthropic,
                             &mut has_google,
+                            &mut has_zai,
                             &mut has_other,
                             &mut configured_providers,
                         );
@@ -3497,6 +3579,7 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
                     &mut has_openai,
                     &mut has_anthropic,
                     &mut has_google,
+                    &mut has_zai,
                     &mut has_other,
                     &mut configured_providers,
                 );
@@ -3536,8 +3619,15 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
     }
     if let Ok(value) = std::env::var("ZHIPU_API_KEY") {
         if !value.trim().is_empty() {
+            has_zai = true;
             has_other = true;
             configured_providers.insert("zai".to_string());
+        }
+    }
+    if let Ok(value) = std::env::var("MINIMAX_API_KEY") {
+        if !value.trim().is_empty() {
+            has_other = true;
+            configured_providers.insert("minimax".to_string());
         }
     }
     if let Ok(value) = std::env::var("CEREBRAS_API_KEY") {
@@ -3559,6 +3649,7 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
                         &mut has_openai,
                         &mut has_anthropic,
                         &mut has_google,
+                        &mut has_zai,
                         &mut has_other,
                         &mut configured_providers,
                     );
@@ -3571,6 +3662,7 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
         has_openai,
         has_anthropic,
         has_google,
+        has_zai,
         has_other,
         configured_providers,
     }
@@ -4325,6 +4417,20 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
                 }
             }))
         }
+        "minimax" => {
+            let base_url = std::env::var("MINIMAX_BASE_URL")
+                .unwrap_or_else(|_| "https://api.minimax.io/v1".to_string());
+            Some(serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Minimax",
+                "models": {
+                    model_id: { "name": model_id }
+                },
+                "options": {
+                    "baseURL": base_url
+                }
+            }))
+        }
         "cerebras" => Some(serde_json::json!({
             "npm": "@ai-sdk/cerebras",
             "name": "Cerebras",
@@ -4845,7 +4951,15 @@ fn sync_opencode_auth_to_workspace(
         }
     }
 
-    let providers = ["openai", "anthropic", "google", "xai", "zai", "cerebras"];
+    let providers = [
+        "openai",
+        "anthropic",
+        "google",
+        "xai",
+        "zai",
+        "cerebras",
+        "minimax",
+    ];
     if let (Some(src_dir), Some(dest_dir)) = (
         host_opencode_provider_auth_dir(),
         workspace_opencode_provider_auth_dir(workspace),
@@ -4915,6 +5029,7 @@ fn sync_opencode_auth_to_workspace(
             ("google", "Google"),
             ("xai", "xAI"),
             ("zai", "Z.AI"),
+            ("minimax", "Minimax"),
             ("cerebras", "Cerebras"),
         ];
         for (key, label) in provider_entries {
@@ -5672,6 +5787,18 @@ const GOOGLE_AI_API: ApiEndpoint = ApiEndpoint {
     hostname: "generativelanguage.googleapis.com",
 };
 
+const ZAI_API: ApiEndpoint = ApiEndpoint {
+    name: "Z.AI",
+    url: "https://api.z.ai/api/coding/paas/v4/chat/completions",
+    hostname: "api.z.ai",
+};
+
+const MINIMAX_API: ApiEndpoint = ApiEndpoint {
+    name: "Minimax",
+    url: "https://api.minimax.io/v1/chat/completions",
+    hostname: "api.minimax.io",
+};
+
 /// Proactive API connectivity check for Claude Code.
 /// Tests basic internet, then DNS, then Anthropic API reachability.
 async fn check_claudecode_connectivity(
@@ -5696,12 +5823,14 @@ async fn check_opencode_connectivity(
     has_openai: bool,
     has_anthropic: bool,
     has_google: bool,
+    has_zai: bool,
+    has_minimax: bool,
 ) -> Result<(), String> {
     // First check basic internet connectivity
     check_basic_internet_connectivity(workspace_exec, cwd).await?;
 
     // Determine which API to check based on configured providers
-    // Priority: OpenAI > Anthropic > Google (most common first)
+    // Priority: OpenAI > Anthropic > Google > Z.AI > Minimax (most common first)
     // If none are explicitly configured, we already verified internet works
     let api = if has_openai {
         Some(&OPENAI_API)
@@ -5709,6 +5838,10 @@ async fn check_opencode_connectivity(
         Some(&ANTHROPIC_API)
     } else if has_google {
         Some(&GOOGLE_AI_API)
+    } else if has_zai {
+        Some(&ZAI_API)
+    } else if has_minimax {
+        Some(&MINIMAX_API)
     } else {
         // No specific provider detected - basic internet check is sufficient
         // The actual API will be determined by OpenCode's config
@@ -6432,6 +6565,63 @@ pub async fn run_opencode_turn(
         return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
     }
 
+    // Acquire provider concurrency permit (e.g. ZAI coding subscription allows ~1 concurrent request).
+    // The permit is held for the entire CLI process lifetime via RAII.
+    let _provider_permit = if let Some(semaphore) = provider_hint
+        .as_deref()
+        .and_then(|p| PROVIDER_SEMAPHORES.get(p))
+    {
+        let provider_name = provider_hint.as_deref().unwrap_or("unknown");
+        let semaphore_timeout_secs: u64 = std::env::var("ZAI_SEMAPHORE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        tracing::info!(
+            mission_id = %mission_id,
+            provider = %provider_name,
+            timeout_secs = semaphore_timeout_secs,
+            "Waiting for provider concurrency permit"
+        );
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!(mission_id = %mission_id, "Cancelled while waiting for provider permit");
+                return AgentResult::failure("Cancelled".to_string(), 0)
+                    .with_terminal_reason(TerminalReason::Cancelled);
+            }
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(semaphore_timeout_secs),
+                semaphore.acquire(),
+            ) => {
+                match result {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_closed)) => {
+                        return AgentResult::failure(
+                            "Provider semaphore closed unexpectedly".to_string(), 0
+                        ).with_terminal_reason(TerminalReason::LlmError);
+                    }
+                    Err(_timeout) => {
+                        let msg = format!(
+                            "Timed out waiting for {} provider concurrency slot after {}s. \
+                             Another mission may be holding the slot.",
+                            provider_name, semaphore_timeout_secs
+                        );
+                        tracing::warn!(mission_id = %mission_id, "{}", msg);
+                        return AgentResult::failure(msg, 0)
+                            .with_terminal_reason(TerminalReason::RateLimited);
+                    }
+                }
+            }
+        };
+        tracing::info!(
+            mission_id = %mission_id,
+            provider = %provider_name,
+            "Acquired provider concurrency permit"
+        );
+        Some(permit)
+    } else {
+        None
+    };
+
     let configured_runner = get_opencode_cli_path_from_config(app_working_dir)
         .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
 
@@ -6470,6 +6660,8 @@ pub async fn run_opencode_turn(
         has_openai,
         has_anthropic,
         has_google,
+        auth_state.has_zai,
+        auth_state.configured_providers.contains("minimax"),
     )
     .await
     {
@@ -6749,6 +6941,7 @@ pub async fn run_opencode_turn(
     let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let rate_limit_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_cancel = CancellationToken::new();
     let (sse_complete_tx, mut sse_complete_rx) = tokio::sync::watch::channel(false);
     let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
@@ -6962,6 +7155,7 @@ pub async fn run_opencode_turn(
     let stderr_text_capture = stderr_text_buffer.clone();
     let stderr_text_output_tx = text_output_tx.clone();
     let stderr_last_activity = last_activity.clone();
+    let stderr_rate_limit = rate_limit_detected.clone();
     let stderr_handle = stderr.map(|stderr| {
         tokio::spawn(async move {
             let stderr_reader = BufReader::new(stderr);
@@ -6969,6 +7163,7 @@ pub async fn run_opencode_turn(
             // Track the last message role seen in stderr so we only capture
             // assistant text parts (not user message echoes) into the buffer.
             let mut last_stderr_role = String::new();
+            let mut retry_count: u32 = 0;
             while let Ok(Some(line)) = stderr_lines.next_line().await {
                 let clean = line.trim().to_string();
                 if !clean.is_empty() {
@@ -7016,6 +7211,44 @@ pub async fn run_opencode_turn(
                                 }
                             }
                         }
+                    }
+
+                    // Detect retry loops: OpenCode emits "session.status: retry"
+                    // on stderr when the LLM API call fails and it retries.
+                    // After several consecutive retries without progress, surface
+                    // this as an error so the mission doesn't silently hang.
+                    if lower.contains("session.status: retry")
+                        || lower.contains("session.status:retry")
+                    {
+                        retry_count += 1;
+                        if retry_count >= 3 {
+                            tracing::warn!(
+                                mission_id = %mission_id_clone,
+                                retry_count = retry_count,
+                                "OpenCode stuck in retry loop — LLM API is likely returning errors (e.g. 429 rate limit)"
+                            );
+                            // Signal the main loop to kill the process early for faster recovery.
+                            stderr_rate_limit.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let mut guard = stderr_error_capture.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(format!(
+                                    "LLM API request failed after {} retries (possible rate limit or API error). \
+                                     Check your API key and provider endpoint configuration.",
+                                    retry_count
+                                ));
+                            }
+                        }
+                    } else if lower.contains("session.status: busy")
+                        || lower.contains("session.status:busy")
+                    {
+                        // busy between retries is normal, don't reset
+                    } else if lower.contains("message.updated")
+                        || lower.contains("message.completed")
+                    {
+                        // Real progress — reset retry counter and clear rate-limit flag
+                        retry_count = 0;
+                        stderr_rate_limit
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
             }
@@ -7152,6 +7385,24 @@ pub async fn run_opencode_turn(
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // Early kill when stderr reader detects a rate-limit retry loop.
+                // Only kill if there's also no real SSE activity (tool calls, thinking).
+                // If the model is doing tool calls, the retry status may be transient.
+                if rate_limit_detected.load(std::sync::atomic::Ordering::SeqCst) {
+                    let sse_idle = last_activity
+                        .lock()
+                        .ok()
+                        .map(|g| g.elapsed() >= std::time::Duration::from_secs(15))
+                        .unwrap_or(true);
+                    if sse_idle {
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            "Rate-limit retry loop detected with no SSE activity; terminating CLI process early"
+                        );
+                        let _ = child.kill().await;
+                        break;
+                    }
+                }
                 if let Some(last_text) = text_output_at {
                     if last_text.elapsed() >= std::time::Duration::from_secs(30) {
                         tracing::info!(
@@ -7415,7 +7666,7 @@ pub async fn run_opencode_turn(
     if opencode_output_needs_fallback(&final_result) {
         if let Some(session_id) = session_id.as_deref() {
             if let Some(message) = stored_message.as_ref() {
-                let text = extract_text(&message.parts);
+                let text = strip_think_tags(&extract_text(&message.parts));
                 if !text.trim().is_empty() {
                     tracing::info!(
                         mission_id = %mission_id,
@@ -7462,6 +7713,9 @@ pub async fn run_opencode_turn(
     if had_error && !final_result.trim().is_empty() && sse_error_message.lock().unwrap().is_none() {
         had_error = false;
     }
+
+    // Strip inline <think>...</think> tags from final output (Minimax, DeepSeek, etc.)
+    final_result = strip_think_tags(&final_result);
 
     let mut emitted_thinking = false;
     let sse_emitted = sse_emitted_thinking.load(std::sync::atomic::Ordering::SeqCst);
@@ -7525,7 +7779,13 @@ pub async fn run_opencode_turn(
     );
 
     let mut result = if had_error {
-        AgentResult::failure(final_result, 0).with_terminal_reason(TerminalReason::LlmError)
+        // Use RateLimited terminal reason when rate limit was detected
+        let reason = if rate_limit_detected.load(std::sync::atomic::Ordering::SeqCst) {
+            TerminalReason::RateLimited
+        } else {
+            TerminalReason::LlmError
+        };
+        AgentResult::failure(final_result, 0).with_terminal_reason(reason)
     } else {
         AgentResult::success(final_result, 0).with_terminal_reason(TerminalReason::Completed)
     };
