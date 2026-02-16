@@ -832,7 +832,10 @@ fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
 }
 
 fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option<&'a str> {
-    if matches!(part_type, "thinking" | "reasoning" | "step-start" | "step-finish") {
+    if matches!(
+        part_type,
+        "thinking" | "reasoning" | "step-start" | "step-finish"
+    ) {
         extract_str(part, &["thinking", "reasoning", "text", "content"])
     } else {
         extract_str(part, &["text", "content", "output_text"])
@@ -855,7 +858,10 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
         return handle_tool_part_update(part, state);
     }
 
-    if !matches!(part_type, "text" | "output_text" | "reasoning" | "thinking" | "step-start" | "step-finish") {
+    if !matches!(
+        part_type,
+        "text" | "output_text" | "reasoning" | "thinking" | "step-start" | "step-finish"
+    ) {
         tracing::debug!(
             part_type = %part_type,
             "Unhandled part type in handle_part_update"
@@ -902,7 +908,10 @@ fn handle_part_update(props: &serde_json::Value, state: &mut SseState) -> Option
         return None;
     }
 
-    if matches!(part_type, "reasoning" | "thinking" | "step-start" | "step-finish") {
+    if matches!(
+        part_type,
+        "reasoning" | "thinking" | "step-start" | "step-finish"
+    ) {
         // Skip if content is identical to last emitted thinking
         if state.last_emitted_thinking.as_ref() == Some(&content) {
             tracing::debug!(

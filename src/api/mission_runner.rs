@@ -62,7 +62,10 @@ fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a st
 }
 
 fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option<&'a str> {
-    if matches!(part_type, "thinking" | "reasoning" | "step-start" | "step-finish") {
+    if matches!(
+        part_type,
+        "thinking" | "reasoning" | "step-start" | "step-finish"
+    ) {
         extract_str(part, &["thinking", "reasoning", "text", "content"])
     } else {
         extract_str(part, &["text", "content", "output_text"])
@@ -245,7 +248,10 @@ fn handle_part_update(
         return handle_tool_part_update(part, state, mission_id);
     }
 
-    let is_thinking = matches!(part_type, "thinking" | "reasoning" | "step-start" | "step-finish");
+    let is_thinking = matches!(
+        part_type,
+        "thinking" | "reasoning" | "step-start" | "step-finish"
+    );
     let is_text = matches!(part_type, "text" | "output_text");
 
     if !is_thinking && !is_text {

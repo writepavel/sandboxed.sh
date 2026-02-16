@@ -4989,6 +4989,20 @@ async fn control_actor_loop(
 
                             // Always try to start next queued message (if any)
                             if !runner.is_running() {
+                                // Refresh session_id from the store in case a
+                                // SessionIdUpdate event hasn't been processed yet
+                                // (race between the events_rx and sleep poll arms).
+                                if let Ok(Some(m)) = mission_store.get_mission(*mission_id).await {
+                                    if m.session_id != runner.session_id {
+                                        tracing::debug!(
+                                            mission_id = %mission_id,
+                                            old = ?runner.session_id,
+                                            new = ?m.session_id,
+                                            "Refreshed runner session_id from store"
+                                        );
+                                        runner.session_id = m.session_id;
+                                    }
+                                }
                                 let started = runner.start_next(
                                     config.clone(),
                                     Arc::clone(&root_agent),
@@ -5392,6 +5406,11 @@ async fn control_actor_loop(
                                 session_id = %session_id,
                                 "Updated mission session ID from backend"
                             );
+                        }
+                        // Also update the parallel runner's cached session_id so the
+                        // next turn picks up the new value instead of the stale one.
+                        if let Some(runner) = parallel_runners.get_mut(mission_id) {
+                            runner.session_id = Some(session_id.clone());
                         }
                     }
                 }
