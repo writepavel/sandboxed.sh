@@ -55,6 +55,9 @@ struct OpencodeSseParseResult {
     /// processing, but not necessarily that a `response.completed` was sent
     /// (common with GLM models that emit `response.incomplete` instead).
     session_idle: bool,
+    /// The SSE stream indicated the session entered a retry state, meaning
+    /// the model API call failed and OpenCode is retrying automatically.
+    session_retry: bool,
 }
 
 fn extract_str<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
@@ -634,24 +637,28 @@ fn parse_opencode_sse_event(
     // Detect session idle signals — oh-my-opencode emits these when the
     // agent finishes all work.  This is critical for GLM models that may
     // not emit response.completed.
-    let session_idle = match event_type {
-        "session.idle" => true,
-        "session.status" => {
-            // { "type": "session.status", "properties": { "type": "idle" } }
-            props
-                .get("type")
-                .or_else(|| props.get("status"))
-                .and_then(|v| v.as_str())
-                == Some("idle")
-        }
-        _ => false,
+    let status_str = if event_type == "session.status" {
+        props
+            .get("type")
+            .or_else(|| props.get("status"))
+            .and_then(|v| v.as_str())
+    } else {
+        None
     };
+
+    let session_idle = matches!(event_type, "session.idle")
+        || (event_type == "session.status" && status_str == Some("idle"));
+
+    // Detect retry signals — OpenCode emits session.status with type "retry"
+    // when a model API call fails and it's retrying automatically.
+    let session_retry = event_type == "session.status" && status_str == Some("retry");
 
     Some(OpencodeSseParseResult {
         event,
         message_complete,
         session_id,
         session_idle,
+        session_retry,
     })
 }
 
@@ -1225,6 +1232,14 @@ async fn run_mission_turn(
         {
             config.default_model = Some(default_model);
         }
+    } else if backend_id != "claudecode"
+        && effective_config_profile.is_some()
+        && model_override.is_none()
+    {
+        // For OpenCode with a config profile but no explicit model override,
+        // clear the global default so the profile's oh-my-opencode agent
+        // models take precedence instead of being overridden.
+        config.default_model = None;
     }
     tracing::info!(
         mission_id = %mission_id,
@@ -2718,7 +2733,7 @@ pub fn run_claudecode_turn<'a>(
                                                     mission_id: Some(mission_id),
                                                 });
 
-                                                if name == "question" || name.starts_with("ui_") {
+                                                if name == "question" || name == "AskUserQuestion" || name.starts_with("ui_") {
                                                     if let Some(ref hub) = tool_hub {
                                                         tracing::info!(
                                                             mission_id = %mission_id,
@@ -6737,6 +6752,7 @@ pub async fn run_opencode_turn(
     let sse_cancel = CancellationToken::new();
     let (sse_complete_tx, mut sse_complete_rx) = tokio::sync::watch::channel(false);
     let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
+    let (sse_retry_tx, mut sse_retry_rx) = tokio::sync::watch::channel(0u32);
     let last_activity = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let (text_output_tx, mut text_output_rx) = tokio::sync::watch::channel(false);
 
@@ -6756,6 +6772,7 @@ pub async fn run_opencode_turn(
         let sse_cancel = sse_cancel.clone();
         let sse_complete_tx = sse_complete_tx.clone();
         let sse_session_idle_tx = sse_session_idle_tx.clone();
+        let sse_retry_tx = sse_retry_tx.clone();
         let last_activity = last_activity.clone();
         let text_output_tx = text_output_tx.clone();
         let events_tx = events_tx.clone();
@@ -6901,6 +6918,9 @@ pub async fn run_opencode_turn(
                                         if parsed.session_idle {
                                             let _ = sse_session_idle_tx.send(true);
                                         }
+                                        if parsed.session_retry {
+                                            let _ = sse_retry_tx.send_modify(|v| *v += 1);
+                                        }
                                     }
                                 }
 
@@ -7010,6 +7030,10 @@ pub async fn run_opencode_turn(
     let mut session_idle_seen = false;
     let mut session_idle_at: Option<std::time::Instant> = None;
     let mut had_meaningful_work = false;
+    // Track consecutive retries — if the model API keeps failing, abort early
+    // instead of waiting for the full idle timeout.
+    let mut consecutive_retries: u32 = 0;
+    let max_consecutive_retries: u32 = 5;
 
     loop {
         tokio::select! {
@@ -7045,6 +7069,34 @@ pub async fn run_opencode_turn(
                     }
                 }
             }
+            changed = sse_retry_rx.changed() => {
+                if changed.is_ok() {
+                    consecutive_retries = *sse_retry_rx.borrow();
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        consecutive_retries = consecutive_retries,
+                        "Model API retry detected"
+                    );
+                    if consecutive_retries >= max_consecutive_retries {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            retries = consecutive_retries,
+                            "Model API failed after {} consecutive retries; aborting mission",
+                            consecutive_retries
+                        );
+                        let _ = events_tx.send(AgentEvent::Error {
+                            message: format!(
+                                "Model API failed after {} consecutive retries. The model provider may be down or misconfigured.",
+                                consecutive_retries
+                            ),
+                            mission_id: Some(mission_id),
+                            resumable: true,
+                        });
+                        let _ = child.kill().await;
+                        break;
+                    }
+                }
+            }
             changed = text_output_rx.changed() => {
                 if changed.is_ok() && *text_output_rx.borrow() {
                     text_output_at = Some(std::time::Instant::now());
@@ -7053,6 +7105,8 @@ pub async fn run_opencode_turn(
                     // not truly idle yet.
                     session_idle_seen = false;
                     session_idle_at = None;
+                    // Reset retry counter — real output means the model is working.
+                    consecutive_retries = 0;
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)), if sse_complete_seen => {
@@ -7245,6 +7299,9 @@ pub async fn run_opencode_turn(
                                 }
                                 if parsed.session_idle {
                                     let _ = sse_session_idle_tx.send(true);
+                                }
+                                if parsed.session_retry {
+                                    let _ = sse_retry_tx.send_modify(|v| *v += 1);
                                 }
                             }
                         } else {
