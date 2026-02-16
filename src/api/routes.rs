@@ -1229,9 +1229,12 @@ async fn oauth_token_refresher_loop(ai_providers: Arc<crate::ai_providers::AIPro
         "OAuth token refresher task started (check every 15 min, refresh if < 1 hour until expiry)"
     );
 
-    loop {
-        tokio::time::sleep(check_interval).await;
+    // Run an initial check after a short delay (let the server finish booting).
+    // Without this, tokens expiring within the first 15 minutes would not be
+    // refreshed until the first loop iteration fires.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
+    loop {
         let providers = ai_providers.list().await;
         let oauth_providers: Vec<_> = providers.iter().filter(|p| p.has_oauth()).collect();
 
@@ -1302,15 +1305,16 @@ async fn oauth_token_refresher_loop(ai_providers: Arc<crate::ai_providers::AIPro
                 );
             }
 
-            // Attempt to refresh the token
-            match ai_providers_api::refresh_oauth_token_internal(
-                &provider.provider_type,
-                &oauth.refresh_token,
-            )
-            .await
-            {
+            // Use the lock-aware refresh function.  This acquires a file lock
+            // before refreshing, preventing race conditions with on-demand
+            // refreshes that also acquire the same lock.  Anthropic uses
+            // rotating refresh tokens — without locking, two concurrent
+            // refreshes can submit the same token and the second gets
+            // invalid_grant.
+            match ai_providers_api::refresh_oauth_token_with_lock(provider.provider_type).await {
                 Ok((new_access, new_refresh, expires_at)) => {
-                    // Update the provider in the store
+                    // Update the in-memory provider store.
+                    // (Tier sync to disk is already done inside refresh_oauth_token_with_lock.)
                     let mut updated_provider = provider.clone();
                     updated_provider.oauth = Some(crate::ai_providers::OAuthCredentials {
                         access_token: new_access.clone(),
@@ -1329,21 +1333,6 @@ async fn oauth_token_refresher_loop(ai_providers: Arc<crate::ai_providers::AIPro
                             "Failed to update provider with refreshed OAuth token (provider not found)"
                         );
                         continue;
-                    }
-
-                    // Sync to all storage tiers (Solution #3: Multi-tier token sync)
-                    if let Err(e) = ai_providers_api::sync_oauth_to_all_tiers(
-                        provider.provider_type,
-                        &new_refresh,
-                        &new_access,
-                        expires_at,
-                    ) {
-                        tracing::warn!(
-                            provider_id = %provider.id,
-                            provider_name = %provider.name,
-                            error = %e,
-                            "Failed to sync refreshed token to all storage tiers"
-                        );
                     }
 
                     tracing::info!(
@@ -1400,5 +1389,8 @@ async fn oauth_token_refresher_loop(ai_providers: Arc<crate::ai_providers::AIPro
                 }
             }
         }
+
+        // Sleep until the next check cycle.
+        tokio::time::sleep(check_interval).await;
     }
 }
