@@ -23,8 +23,15 @@ pub type ModelCatalog = Arc<RwLock<HashMap<String, Vec<ProviderModel>>>>;
 
 /// Provider IDs that are part of the default catalog and should not be duplicated
 /// from the AIProviderStore.
-pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] =
-    &["anthropic", "openai", "google", "xai", "cerebras", "zai"];
+pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
+    "anthropic",
+    "openai",
+    "google",
+    "xai",
+    "cerebras",
+    "zai",
+    "minimax",
+];
 
 /// A model available from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +340,34 @@ fn default_providers_config() -> ProvidersConfig {
                     },
                 ],
             },
+            Provider {
+                id: "minimax".to_string(),
+                name: "Minimax (API Key)".to_string(),
+                billing: "pay-per-token".to_string(),
+                description: "MiniMax models via Minimax API key".to_string(),
+                models: vec![
+                    ProviderModel {
+                        id: "MiniMax-M2.5".to_string(),
+                        name: "MiniMax M2.5".to_string(),
+                        description: Some("Most capable MiniMax model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "MiniMax-M2.5-highspeed".to_string(),
+                        name: "MiniMax M2.5 Highspeed".to_string(),
+                        description: Some("Fast variant of M2.5".to_string()),
+                    },
+                    ProviderModel {
+                        id: "MiniMax-M2.1".to_string(),
+                        name: "MiniMax M2.1".to_string(),
+                        description: Some("Balanced capability and speed".to_string()),
+                    },
+                    ProviderModel {
+                        id: "MiniMax-M2".to_string(),
+                        name: "MiniMax M2".to_string(),
+                        description: Some("Fast and economical".to_string()),
+                    },
+                ],
+            },
         ],
     }
 }
@@ -606,6 +641,12 @@ pub async fn fetch_model_catalog(
             provider_id: "zai",
             base_url: "https://open.bigmodel.cn/api/paas/v4",
             prefix_filters: vec!["glm-"],
+        },
+        FetchTarget {
+            provider_type: ProviderType::Minimax,
+            provider_id: "minimax",
+            base_url: "https://api.minimax.io/v1",
+            prefix_filters: vec!["MiniMax-"],
         },
     ];
 
@@ -1191,6 +1232,13 @@ mod tests {
                 provider_type: ProviderType::Zai,
                 base_url: "https://open.bigmodel.cn/api/paas/v4",
                 prefix_filters: vec!["glm-"],
+                is_anthropic: false,
+            },
+            TestTarget {
+                provider_id: "minimax",
+                provider_type: ProviderType::Minimax,
+                base_url: "https://api.minimax.io/v1",
+                prefix_filters: vec!["MiniMax-"],
                 is_anthropic: false,
             },
         ];

@@ -18,6 +18,7 @@ export type AIProviderType =
   | "together-ai"
   | "perplexity"
   | "zai"
+  | "minimax"
   | "custom";
 
 export interface AIProviderTypeInfo {

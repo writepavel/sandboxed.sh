@@ -3401,6 +3401,9 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
                     *has_zai = true;
                     *has_other = true;
                 }
+                "minimax" => {
+                    *has_other = true;
+                }
                 _ => *has_other = true,
             }
         };
@@ -3487,6 +3490,12 @@ fn detect_opencode_provider_auth(app_working_dir: Option<&std::path::Path>) -> O
             has_zai = true;
             has_other = true;
             configured_providers.insert("zai".to_string());
+        }
+    }
+    if let Ok(value) = std::env::var("MINIMAX_API_KEY") {
+        if !value.trim().is_empty() {
+            has_other = true;
+            configured_providers.insert("minimax".to_string());
         }
     }
     if let Ok(value) = std::env::var("CEREBRAS_API_KEY") {
@@ -4265,6 +4274,20 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
                 }
             }))
         }
+        "minimax" => {
+            let base_url = std::env::var("MINIMAX_BASE_URL")
+                .unwrap_or_else(|_| "https://api.minimax.io/v1".to_string());
+            Some(serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Minimax",
+                "models": {
+                    model_id: { "name": model_id }
+                },
+                "options": {
+                    "baseURL": base_url
+                }
+            }))
+        }
         "cerebras" => Some(serde_json::json!({
             "npm": "@ai-sdk/cerebras",
             "name": "Cerebras",
@@ -4776,7 +4799,15 @@ fn sync_opencode_auth_to_workspace(
         }
     }
 
-    let providers = ["openai", "anthropic", "google", "xai", "zai", "cerebras"];
+    let providers = [
+        "openai",
+        "anthropic",
+        "google",
+        "xai",
+        "zai",
+        "cerebras",
+        "minimax",
+    ];
     if let (Some(src_dir), Some(dest_dir)) = (
         host_opencode_provider_auth_dir(),
         workspace_opencode_provider_auth_dir(workspace),
@@ -4846,6 +4877,7 @@ fn sync_opencode_auth_to_workspace(
             ("google", "Google"),
             ("xai", "xAI"),
             ("zai", "Z.AI"),
+            ("minimax", "Minimax"),
             ("cerebras", "Cerebras"),
         ];
         for (key, label) in provider_entries {
@@ -5609,6 +5641,12 @@ const ZAI_API: ApiEndpoint = ApiEndpoint {
     hostname: "api.z.ai",
 };
 
+const MINIMAX_API: ApiEndpoint = ApiEndpoint {
+    name: "Minimax",
+    url: "https://api.minimax.io/v1/chat/completions",
+    hostname: "api.minimax.io",
+};
+
 /// Proactive API connectivity check for Claude Code.
 /// Tests basic internet, then DNS, then Anthropic API reachability.
 async fn check_claudecode_connectivity(
@@ -5634,12 +5672,13 @@ async fn check_opencode_connectivity(
     has_anthropic: bool,
     has_google: bool,
     has_zai: bool,
+    has_minimax: bool,
 ) -> Result<(), String> {
     // First check basic internet connectivity
     check_basic_internet_connectivity(workspace_exec, cwd).await?;
 
     // Determine which API to check based on configured providers
-    // Priority: OpenAI > Anthropic > Google > Z.AI (most common first)
+    // Priority: OpenAI > Anthropic > Google > Z.AI > Minimax (most common first)
     // If none are explicitly configured, we already verified internet works
     let api = if has_openai {
         Some(&OPENAI_API)
@@ -5649,6 +5688,8 @@ async fn check_opencode_connectivity(
         Some(&GOOGLE_AI_API)
     } else if has_zai {
         Some(&ZAI_API)
+    } else if has_minimax {
+        Some(&MINIMAX_API)
     } else {
         // No specific provider detected - basic internet check is sufficient
         // The actual API will be determined by OpenCode's config
@@ -6467,6 +6508,7 @@ pub async fn run_opencode_turn(
         has_anthropic,
         has_google,
         auth_state.has_zai,
+        auth_state.configured_providers.contains("minimax"),
     )
     .await
     {

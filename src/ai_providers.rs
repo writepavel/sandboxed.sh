@@ -103,6 +103,7 @@ pub enum ProviderType {
     Perplexity,
     GithubCopilot,
     Zai,
+    Minimax,
     Custom,
 }
 
@@ -125,6 +126,7 @@ impl ProviderType {
             Self::Perplexity => "Perplexity",
             Self::GithubCopilot => "GitHub Copilot",
             Self::Zai => "Z.AI",
+            Self::Minimax => "Minimax",
             Self::Custom => "Custom",
         }
     }
@@ -147,6 +149,7 @@ impl ProviderType {
             Self::Perplexity => "perplexity",
             Self::GithubCopilot => "github-copilot",
             Self::Zai => "zai",
+            Self::Minimax => "minimax",
             Self::Custom => "custom",
         }
     }
@@ -170,6 +173,7 @@ impl ProviderType {
             "perplexity" => Some(Self::Perplexity),
             "github-copilot" => Some(Self::GithubCopilot),
             "zai" => Some(Self::Zai),
+            "minimax" => Some(Self::Minimax),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -193,6 +197,7 @@ impl ProviderType {
             Self::Perplexity => Some("PERPLEXITY_API_KEY"),
             Self::GithubCopilot => None, // Uses OAuth
             Self::Zai => Some("ZHIPU_API_KEY"),
+            Self::Minimax => Some("MINIMAX_API_KEY"),
             Self::Custom => None,
         }
     }

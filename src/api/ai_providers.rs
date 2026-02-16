@@ -3517,6 +3517,12 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
             env_var: Some("ZHIPU_API_KEY".to_string()),
         },
         ProviderTypeInfo {
+            id: "minimax".to_string(),
+            name: "Minimax".to_string(),
+            uses_oauth: false,
+            env_var: Some("MINIMAX_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
             id: "github-copilot".to_string(),
             name: "GitHub Copilot".to_string(),
             uses_oauth: true,
@@ -3874,6 +3880,20 @@ async fn check_provider_health(
                 "https://open.bigmodel.cn/api/paas/v4/chat/completions",
                 serde_json::json!({
                     "model": "glm-4-flash",
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 1
+                }),
+                format!("Bearer {}", key),
+            )
+        }
+        ProviderType::Minimax => {
+            let key = api_key_opt
+                .as_ref()
+                .ok_or((StatusCode::BAD_REQUEST, "No API key".to_string()))?;
+            (
+                "https://api.minimax.io/v1/chat/completions",
+                serde_json::json!({
+                    "model": "MiniMax-M2",
                     "messages": [{"role": "user", "content": "test"}],
                     "max_tokens": 1
                 }),

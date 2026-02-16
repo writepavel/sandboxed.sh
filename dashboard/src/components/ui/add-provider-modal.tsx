@@ -26,6 +26,7 @@ const providerIcons: Record<string, string> = {
   'together-ai': '🤝',
   perplexity: '🔍',
   zai: '⚡',
+  minimax: 'M',
   custom: '🔧',
 };
 
