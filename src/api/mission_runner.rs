@@ -7190,9 +7190,12 @@ pub async fn run_opencode_turn(
                         // skip user message echoes
                         if last_stderr_role != "user" {
                             if let Ok(mut buffer) = stderr_text_capture.lock() {
-                                if !buffer.ends_with(&text_part) {
-                                    buffer.push_str(&text_part);
-                                }
+                                // Replace the buffer with the latest text.
+                                // Each message.part (text) line contains the full
+                                // accumulated text of the part, not just the delta.
+                                // Using push_str would concatenate snapshots and
+                                // produce stuttered output like "LetLet meLet me get...".
+                                *buffer = text_part;
                             }
                             let _ = stderr_text_output_tx.send(true);
                         }
