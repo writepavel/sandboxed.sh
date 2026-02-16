@@ -7112,26 +7112,62 @@ pub async fn run_opencode_turn(
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                     // Early kill when stderr reader detects a rate-limit retry loop.
-                    // Don't wait the full 30s idle timeout — kill after ~15s for faster recovery.
+                    // Only kill if there's also no real SSE activity (tool calls, thinking).
+                    // If the model is doing tool calls, the retry status may be transient.
                     if rate_limit_detected.load(std::sync::atomic::Ordering::SeqCst) {
-                        let elapsed = text_output_at
-                            .map(|t| t.elapsed())
-                            .unwrap_or_else(|| std::time::Duration::from_secs(15));
-                        if elapsed >= std::time::Duration::from_secs(15) {
+                        let sse_idle = last_activity
+                            .lock()
+                            .ok()
+                            .map(|g| g.elapsed() >= std::time::Duration::from_secs(15))
+                            .unwrap_or(true);
+                        if sse_idle {
                             tracing::info!(
                                 mission_id = %mission_id,
-                                "Rate-limit retry loop detected; terminating CLI process early"
+                                "Rate-limit retry loop detected with no SSE activity; terminating CLI process early"
                             );
                             killed_by_idle_timeout = true;
                             let _ = child.kill().await;
                             break;
                         }
                     }
+                    // Check idle timeout using last_activity (updated by SSE events
+                    // including tool calls, thinking, text) rather than just text_output_at.
+                    // This prevents killing a working model that's doing long tool calls.
+                    let activity_elapsed = last_activity
+                        .lock()
+                        .ok()
+                        .map(|g| g.elapsed())
+                        .unwrap_or_default();
+                    let idle_secs: u64 = std::env::var("OPENCODE_IDLE_TIMEOUT_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30);
+                    if activity_elapsed >= std::time::Duration::from_secs(idle_secs) {
+                        // No SSE events at all for idle_secs — truly idle
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            idle_secs = idle_secs,
+                            activity_elapsed_secs = activity_elapsed.as_secs(),
+                            "OpenCode fully idle (no SSE activity); terminating CLI process"
+                        );
+                        killed_by_idle_timeout = true;
+                        let _ = child.kill().await;
+                        break;
+                    }
+                    // Also check for extended periods with SSE activity but no text output.
+                    // This catches cases where the model is stuck in a tool loop without
+                    // producing any text response (e.g., infinite tool retry cycles).
                     if let Some(last_text) = text_output_at {
-                        if last_text.elapsed() >= std::time::Duration::from_secs(30) {
+                        let no_text_secs: u64 = std::env::var("OPENCODE_NO_TEXT_TIMEOUT_SECS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(180);
+                        if last_text.elapsed() >= std::time::Duration::from_secs(no_text_secs) {
                             tracing::info!(
                                 mission_id = %mission_id,
-                                "OpenCode output idle timeout reached; terminating CLI process"
+                                no_text_secs = no_text_secs,
+                                "OpenCode has SSE activity but no text output for {}s; terminating",
+                                no_text_secs
                             );
                             killed_by_idle_timeout = true;
                             let _ = child.kill().await;
