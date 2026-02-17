@@ -12,11 +12,13 @@ import {
   listAccountHealth,
   clearAccountCooldown,
   listFallbackEvents,
+  getRtkStats,
   type ModelChain,
   type ChainEntry,
   type ResolvedEntry,
   type AccountHealthSnapshot,
   type FallbackEvent,
+  type RtkStats,
 } from '@/lib/api/model-routing';
 import {
   listProxyApiKeys,
@@ -48,6 +50,8 @@ import {
   Key,
   Copy,
   Check,
+  Pencil,
+  Zap,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -76,9 +80,7 @@ function EntryEditor({
     const updated = entries.map((e, i) => {
       if (i !== index) return e;
       if (field === 'provider_id' && value !== e.provider_id) {
-        // Reset model only when provider actually changes to a different known provider
-        const isKnownProvider = providers.some((p) => p.id === value);
-        return { ...e, provider_id: value, model_id: isKnownProvider ? '' : e.model_id };
+        return { ...e, provider_id: value, model_id: '' };
       }
       return { ...e, [field]: value };
     });
@@ -114,9 +116,6 @@ function EntryEditor({
       </div>
       {entries.map((entry, i) => {
         const models = getModelsForProvider(entry.provider_id);
-        const providerListId = `provider-list-${i}`;
-        const modelListId = `model-list-${i}`;
-
         return (
           <div
             key={i}
@@ -125,33 +124,42 @@ function EntryEditor({
             <span className="text-[10px] text-white/30 w-4 flex-shrink-0">
               {i + 1}.
             </span>
-            <input
-              type="text"
-              list={providerListId}
+            <select
               value={entry.provider_id}
               onChange={(e) => updateEntry(i, 'provider_id', e.target.value)}
-              placeholder="provider (e.g. zai)"
-              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50"
-            />
-            <datalist id={providerListId}>
+              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer"
+              style={{
+                backgroundImage: "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                backgroundPosition: 'right 0.25rem center',
+                backgroundRepeat: 'no-repeat',
+                backgroundSize: '1.2em 1.2em',
+                paddingRight: '1.5rem',
+              }}
+            >
+              <option value="" className="bg-[#1a1a1a]">Select provider</option>
               {providers.map((p) => (
-                <option key={p.id} value={p.id}>{p.name}</option>
+                <option key={p.id} value={p.id} className="bg-[#1a1a1a]">{p.name}</option>
               ))}
-            </datalist>
+            </select>
             <span className="text-white/20">/</span>
-            <input
-              type="text"
-              list={modelListId}
+            <select
               value={entry.model_id}
               onChange={(e) => updateEntry(i, 'model_id', e.target.value)}
-              placeholder={entry.provider_id ? 'model id' : 'select provider first'}
-              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50"
-            />
-            <datalist id={modelListId}>
+              disabled={!entry.provider_id}
+              className="flex-1 min-w-0 rounded border border-white/[0.06] bg-white/[0.02] px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500/50 appearance-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{
+                backgroundImage: "url(\"data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e\")",
+                backgroundPosition: 'right 0.25rem center',
+                backgroundRepeat: 'no-repeat',
+                backgroundSize: '1.2em 1.2em',
+                paddingRight: '1.5rem',
+              }}
+            >
+              <option value="" className="bg-[#1a1a1a]">{entry.provider_id ? 'Select model' : 'Select provider first'}</option>
               {models.map((m) => (
-                <option key={m.id} value={m.id}>{m.name || m.id}</option>
+                <option key={m.id} value={m.id} className="bg-[#1a1a1a]">{m.name || m.id}</option>
               ))}
-            </datalist>
+            </select>
             <div className="flex items-center gap-0.5 flex-shrink-0">
               <button
                 onClick={() => moveEntry(i, 'up')}
@@ -285,7 +293,7 @@ function ChainCard({
             className="p-1.5 rounded-md text-white/20 hover:text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer"
             title="Edit"
           >
-            <GitBranch className="h-3.5 w-3.5" />
+            <Pencil className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={() => onDelete(chain.id)}
@@ -554,6 +562,14 @@ export default function ModelRoutingPage() {
   } = useSWR('fallback-events', listFallbackEvents, {
     revalidateOnFocus: false,
     refreshInterval: 10000, // Poll events every 10s
+  });
+
+  const {
+    data: rtkStats,
+    isLoading: rtkStatsLoading,
+  } = useSWR('rtk-stats', getRtkStats, {
+    revalidateOnFocus: false,
+    refreshInterval: 10000, // Poll RTK stats every 10s
   });
 
   const handleCreate = async () => {
@@ -853,6 +869,59 @@ export default function ModelRoutingPage() {
           />
         </div>
 
+        {/* ── RTK Token Savings Section ── */}
+        <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 mt-6">
+          <div className="flex items-center gap-3 mb-4">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-purple-500/10">
+              <Zap className="h-5 w-5 text-purple-400" />
+            </div>
+            <div>
+              <h2 className="text-sm font-medium text-white">RTK Token Savings</h2>
+              <p className="text-xs text-white/40">
+                CLI output compression reduces LLM token consumption
+              </p>
+            </div>
+            {rtkStats && rtkStats.commands_processed > 0 && (
+              <span className="ml-auto text-xs text-emerald-400">
+                {rtkStats.savings_percent.toFixed(1)}% saved
+              </span>
+            )}
+          </div>
+
+          {rtkStatsLoading ? (
+            <div className="flex items-center justify-center py-6">
+              <Loader className="h-4 w-4 animate-spin text-white/30" />
+            </div>
+          ) : !rtkStats || rtkStats.commands_processed === 0 ? (
+            <div className="text-center py-4">
+              <p className="text-xs text-white/30">
+                No RTK data yet. Enable with <code className="text-white/50">SANDBOXED_SH_RTK_ENABLED=1</code>
+              </p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-4 gap-3">
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2">
+                <div className="text-[10px] text-white/30 uppercase tracking-wider mb-1">Commands</div>
+                <div className="text-lg font-medium text-white">{rtkStats.commands_processed.toLocaleString()}</div>
+              </div>
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2">
+                <div className="text-[10px] text-white/30 uppercase tracking-wider mb-1">Original</div>
+                <div className="text-lg font-medium text-white">{formatTokenCount(rtkStats.original_chars)}</div>
+              </div>
+              <div className="rounded-lg border border-white/[0.06] bg-white/[0.01] px-3 py-2">
+                <div className="text-[10px] text-white/30 uppercase tracking-wider mb-1">Compressed</div>
+                <div className="text-lg font-medium text-white">{formatTokenCount(rtkStats.compressed_chars)}</div>
+              </div>
+              <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
+                <div className="text-[10px] text-emerald-400/60 uppercase tracking-wider mb-1">Saved</div>
+                <div className="text-lg font-medium text-emerald-400">
+                  {formatTokenCount(rtkStats.chars_saved)} ({rtkStats.savings_percent.toFixed(0)}%)
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* ── Fallback Events Section ── */}
         <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-5 mt-6">
           <div className="flex items-center gap-3 mb-4">
@@ -972,10 +1041,10 @@ export default function ModelRoutingPage() {
               </div>
               <button
                 onClick={() => handleCopyKey(proxyUrl)}
-                className="p-1.5 rounded-md text-white/20 hover:text-white/60 hover:bg-white/[0.04] transition-colors cursor-pointer"
+                className={`p-1.5 rounded-md transition-colors cursor-pointer ${copiedText === proxyUrl ? 'text-emerald-400' : 'text-white/20 hover:text-white/60 hover:bg-white/[0.04]'}`}
                 title="Copy endpoint URL"
               >
-                <Copy className="h-3.5 w-3.5" />
+                {copiedText === proxyUrl ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
               </button>
             </div>
           </div>

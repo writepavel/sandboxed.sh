@@ -197,8 +197,8 @@ const OPENCODE_STATUS_PATTERNS: &[&str] = &[
     "all tasks completed",
     "session ended with error",
     "[session.error]",
-    "session:",
     "session: ses_",
+    "session id: ses_",
 ];
 
 fn is_opencode_status_line(line: &str) -> bool {
@@ -323,10 +323,15 @@ fn handle_part_update(
     let message_id = extract_str(part, &["messageID", "messageId", "message_id"])
         .or_else(|| extract_str(props, &["messageID", "messageId", "message_id"]));
     if let Some(message_id) = message_id {
-        if let Some(role) = state.message_roles.get(message_id) {
-            if role != "assistant" {
+        match state.message_roles.get(message_id) {
+            Some(role) if role != "assistant" => return None,
+            None => {
+                // Role not yet recorded (message.updated hasn't arrived).
+                // Skip to avoid emitting user-message text as a TextDelta,
+                // which would trigger the text-idle timeout prematurely.
                 return None;
             }
+            _ => {} // assistant — continue processing
         }
     }
 
@@ -1107,10 +1112,15 @@ impl MissionRunner {
                         self.explicitly_completed = true;
                     }
 
-                    // Add to history
+                    // Add to history — only include assistant output when it's
+                    // a real model response.  Error messages (e.g. "Claude Code
+                    // produced no output", "OpenCode CLI exited with status: ...")
+                    // would contaminate context for future turns.
                     self.history.push(("user".to_string(), result.1.clone()));
-                    self.history
-                        .push(("assistant".to_string(), result.2.output.clone()));
+                    if result.2.success && !result.2.output.trim().is_empty() {
+                        self.history
+                            .push(("assistant".to_string(), result.2.output.clone()));
+                    }
 
                     // Log warning if deliverables are missing and task ended
                     if !self.explicitly_completed && !self.deliverables.deliverables.is_empty() {
@@ -1140,11 +1150,13 @@ impl MissionRunner {
     }
 
     /// Check if the running task is finished (non-blocking).
+    /// Returns false when no task handle exists (idle/unstarted runners)
+    /// to avoid unnecessary poll_completion calls every 100ms.
     pub fn check_finished(&self) -> bool {
         self.running_handle
             .as_ref()
             .map(|h| h.is_finished())
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 }
 
@@ -1233,6 +1245,8 @@ pub fn is_session_corruption_error(result: &AgentResult) -> bool {
     || out.contains("tool_use block must have a corresponding tool_result")
     || out.contains("tool_result block must have a corresponding tool_use")
     || out.contains("must have a corresponding tool_use block")
+    // Session was lost (e.g. after service restart or session expiry)
+    || out.contains("No conversation found with session ID")
 }
 
 /// Execute a single turn for a mission.
@@ -1295,6 +1309,10 @@ async fn run_mission_turn(
         // For OpenCode with a config profile but no explicit model override,
         // clear the global default so the profile's oh-my-opencode agent
         // models take precedence instead of being overridden.
+        config.default_model = None;
+    } else if backend_id == "codex" && model_override.is_none() {
+        // The global DEFAULT_MODEL (e.g. claude-opus-4-6) is not valid for
+        // Codex.  Clear it so Codex uses its own CLI default.
         config.default_model = None;
     }
     tracing::info!(
@@ -1564,7 +1582,7 @@ async fn run_mission_turn(
                     secrets.clone(),
                     &config.working_dir,
                     effective_sid.as_deref(),
-                    is_continuation,
+                    false, // Fresh session — don't pass is_continuation=true
                     Some(Arc::clone(&tool_hub)),
                     Some(Arc::clone(&status)),
                     None, // override_auth
@@ -2766,6 +2784,8 @@ pub fn run_claudecode_turn<'a>(
         let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
         let mut text_buffer: HashMap<u32, String> = HashMap::new();
         let mut active_thinking_index: Option<u32> = None; // Track which thinking block is active
+        let mut finalized_thinking_indices: std::collections::HashSet<u32> =
+            std::collections::HashSet::new(); // Blocks already sent done:true during streaming
         let mut last_text_len: usize = 0; // Track last emitted text length for streaming text deltas
         let mut thinking_emitted = false;
 
@@ -2907,12 +2927,15 @@ pub fn run_claudecode_turn<'a>(
                                                 if let Some(thinking_content) = thinking_text {
                                                     if !thinking_content.is_empty() {
                                                         // If a new thinking block started, finalize the previous one
-                                                        if active_thinking_index.is_some() && active_thinking_index != Some(index) {
-                                                            let _ = events_tx.send(AgentEvent::Thinking {
-                                                                content: String::new(),
-                                                                done: true,
-                                                                mission_id: Some(mission_id),
-                                                            });
+                                                        if let Some(prev_idx) = active_thinking_index {
+                                                            if prev_idx != index {
+                                                                let _ = events_tx.send(AgentEvent::Thinking {
+                                                                    content: String::new(),
+                                                                    done: true,
+                                                                    mission_id: Some(mission_id),
+                                                                });
+                                                                finalized_thinking_indices.insert(prev_idx);
+                                                            }
                                                         }
                                                         active_thinking_index = Some(index);
 
@@ -2968,7 +2991,8 @@ pub fn run_claudecode_turn<'a>(
                                     }
                                 }
                                 ClaudeEvent::Assistant(evt) => {
-                                    for block in evt.message.content {
+                                    for (content_idx, block) in evt.message.content.into_iter().enumerate() {
+                                        let content_idx = content_idx as u32;
                                         match block {
                                             ContentBlock::Text { text } => {
                                                 // Text content is the final assistant response
@@ -3087,13 +3111,14 @@ pub fn run_claudecode_turn<'a>(
                                                 }
                                             }
                                             ContentBlock::Thinking { thinking } => {
-                                                // Only send if this is new content not already streamed
-                                                // The streaming deltas already accumulated this, so this is
-                                                // typically the final complete thinking block
-                                                if !thinking.is_empty() {
+                                                // Only send done:true for the last active thinking block.
+                                                // Earlier blocks were already finalized during streaming
+                                                // (via the block-transition mechanism) and re-sending them
+                                                // causes duplicate items in the frontend thinking panel.
+                                                if !thinking.is_empty() && !finalized_thinking_indices.contains(&content_idx) {
                                                     let _ = events_tx.send(AgentEvent::Thinking {
                                                         content: thinking,
-                                                        done: true, // Mark as done since this is the final block
+                                                        done: true,
                                                         mission_id: Some(mission_id),
                                                     });
                                                     thinking_emitted = true;
@@ -3107,6 +3132,7 @@ pub fn run_claudecode_turn<'a>(
                                     thinking_buffer.clear();
                                     text_buffer.clear();
                                     active_thinking_index = None;
+                                    finalized_thinking_indices.clear();
                                     last_text_len = 0;
                                     block_types.clear();
                                     thinking_emitted = false;
@@ -3529,9 +3555,47 @@ fn extract_opencode_session_id(output: &str) -> Option<String> {
     None
 }
 
+/// Returns true if the line is an OpenCode runner/status banner (not model output).
+///
+/// oh-my-opencode writes a fixed set of status lines to stdout. We filter these
+/// so they don't pollute `final_result` (which should only contain model text).
+///
+/// The patterns below are deliberately tight — each matches a known runner status
+/// line prefix rather than a bare English word. Using broad substrings like
+/// `contains("completed")` would silently drop model responses that happen to
+/// contain that word (e.g. "Task completed successfully"), which is a critical
+/// correctness bug when the SSE path is unavailable and stdout is the only source.
+fn is_opencode_banner_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+
+    // Runner lifecycle banners (exact prefix matches)
+    lower.contains("starting opencode server")
+        || lower.contains("opencode server started")
+        || lower.contains("auto-selected port")
+        || lower.starts_with("using port")
+        || lower.contains("server listening")
+
+    // Prompt / completion status
+        || lower.starts_with("sending prompt")
+        || lower.starts_with("waiting for completion")
+        || lower.starts_with("all tasks completed")
+
+    // Session identification lines — match the "Session: ses_" / "Session ID: ses_"
+    // prefix, not bare "session:" which would match model text discussing sessions.
+        || lower.starts_with("session id:")
+        || lower.starts_with("session: ses_")
+
+    // Shutdown / cleanup banners
+        || lower.contains("event stream did not close")
+        || lower.contains("continuing shutdown")
+
+    // [run]-prefixed runner status lines
+        || lower.starts_with("[run]")
+}
+
 fn opencode_output_needs_fallback(output: &str) -> bool {
     let cleaned = strip_ansi_codes(output);
-    let mut lines: Vec<String> = cleaned
+    let lines: Vec<String> = cleaned
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
@@ -3541,27 +3605,66 @@ fn opencode_output_needs_fallback(output: &str) -> bool {
         return true;
     }
 
-    for line in lines.drain(..) {
-        let lower = line.to_lowercase();
-        let is_banner = lower.contains("starting opencode server")
-            || lower.contains("opencode server started")
-            || lower.contains("auto-selected port")
-            || lower.contains("server listening")
-            || lower.contains("sending prompt")
-            || lower.contains("waiting for completion")
-            || lower.contains("all tasks completed")
-            || lower.contains("completed")
-            || lower.contains("session id:")
-            || lower.contains("session:")
-            || lower.contains("event stream did not close")
-            || lower.contains("continuing shutdown")
-            || lower.starts_with("[run]");
-        if !is_banner {
+    for line in lines {
+        if !is_opencode_banner_line(&line) {
             return false;
         }
     }
 
     true
+}
+
+/// Returns true if the output looks like a raw tool-call JSON fragment rather
+/// than a genuine assistant text response. This catches the case (issue #148)
+/// where the model emitted a tool call but no final text response, and the
+/// tool-call JSON ended up in `final_result` via a TextDelta or stdout path.
+///
+/// We check each non-empty, non-banner line: if every such line parses as a
+/// JSON object containing tool-call markers (`name` + `arguments`/`input`,
+/// or `type` == `function_call`/`tool_use`/`tool-call`), the output is
+/// considered tool-call-only and should not be returned as assistant text.
+fn is_tool_call_only_output(output: &str) -> bool {
+    let cleaned = strip_ansi_codes(output);
+    let lines: Vec<String> = cleaned
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty() && !is_opencode_banner_line(line))
+        .collect();
+
+    if lines.is_empty() {
+        return false; // empty/banner-only is handled by opencode_output_needs_fallback
+    }
+
+    for line in &lines {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(obj) = json.as_object() {
+                // Check for tool-call type markers
+                let is_type_tool = obj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|t| {
+                        t == "function_call"
+                            || t == "tool_use"
+                            || t == "tool-call"
+                            || t == "tool_call"
+                    })
+                    .unwrap_or(false);
+
+                // Check for name + arguments/input pattern (common in all tool-call formats)
+                let has_name = obj.contains_key("name");
+                let has_args = obj.contains_key("arguments") || obj.contains_key("input");
+                let is_tool_shape = has_name && has_args;
+
+                if is_type_tool || is_tool_shape {
+                    continue; // this line is a tool-call fragment
+                }
+            }
+        }
+        // Line is not a tool-call JSON fragment — real text exists
+        return false;
+    }
+
+    true // every non-banner line was a tool-call JSON fragment
 }
 
 fn allocate_opencode_server_port() -> Option<u16> {
@@ -7136,6 +7239,11 @@ pub async fn run_opencode_turn(
     let mut had_error = false;
     let session_id_capture: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stderr_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    // Accumulates the latest full-text snapshot from SSE TextDelta events.
+    // Used as a fallback when stdout JSON and session storage both fail —
+    // this buffer contains exactly what was streamed to the dashboard,
+    // unlike stderr which truncates long content (fixes #158).
+    let sse_text_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let sse_emitted_thinking = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_emitted_text = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sse_done_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -7147,6 +7255,9 @@ pub async fn run_opencode_turn(
     let (sse_retry_tx, mut sse_retry_rx) = tokio::sync::watch::channel(0u32);
     let last_activity = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
     let (text_output_tx, mut text_output_rx) = tokio::sync::watch::channel(false);
+    // Track active tool call depth: incremented on ToolCall, decremented on ToolResult.
+    // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
+    let (sse_tool_depth_tx, sse_tool_depth_rx) = tokio::sync::watch::channel(0u32);
 
     // oh-my-opencode doesn't support --format json, so use SSE curl for events.
     let use_json_stdout = false;
@@ -7159,6 +7270,7 @@ pub async fn run_opencode_turn(
         let session_id_capture = session_id_capture.clone();
         let sse_emitted_thinking = sse_emitted_thinking.clone();
         let sse_emitted_text = sse_emitted_text.clone();
+        let sse_text_buffer = sse_text_buffer.clone();
         let sse_done_sent = sse_done_sent.clone();
         let sse_error_message = sse_error_message.clone();
         let sse_cancel = sse_cancel.clone();
@@ -7167,6 +7279,7 @@ pub async fn run_opencode_turn(
         let sse_retry_tx = sse_retry_tx.clone();
         let last_activity = last_activity.clone();
         let text_output_tx = text_output_tx.clone();
+        let sse_tool_depth_tx = sse_tool_depth_tx.clone();
         let events_tx = events_tx.clone();
         let opencode_port = opencode_port.clone();
         let sse_host = std::env::var("SANDBOXED_SH_OPENCODE_SERVER_HOSTNAME")
@@ -7232,6 +7345,25 @@ pub async fn run_opencode_turn(
                 let mut data_lines: Vec<String> = Vec::new();
                 let mut state = OpencodeSseState::default();
                 let mut saw_complete = false;
+                // Reset SSE state on reconnect so stale values from a lost
+                // connection don't cause incorrect behavior:
+                // - tool depth: stale counts would permanently disable the
+                //   inactivity timeout
+                // - session_idle: a stale `true` would trigger the 10s kill
+                //   timer after reconnect, prematurely terminating the mission
+                // - retry counter: stale counts from a previous connection
+                //   should not accumulate across reconnects
+                // - last_activity: reset so the 120s global and 30s text idle
+                //   timers count from the reconnect, not from the last event
+                //   on the dead connection (the depth reset to 0 disables the
+                //   tools_active guard, so last_activity is the only remaining
+                //   protection against premature timeout during reconnect)
+                sse_tool_depth_tx.send_modify(|v| *v = 0);
+                let _ = sse_session_idle_tx.send(false);
+                sse_retry_tx.send_modify(|v| *v = 0);
+                if let Ok(mut guard) = last_activity.lock() {
+                    *guard = std::time::Instant::now();
+                }
 
                 loop {
                     if sse_cancel.is_cancelled() {
@@ -7277,12 +7409,31 @@ pub async fn run_opencode_turn(
                                                     std::sync::atomic::Ordering::SeqCst,
                                                 );
                                             }
-                                            if matches!(event, AgentEvent::TextDelta { .. }) {
+                                            if let AgentEvent::TextDelta { ref content, .. } = event
+                                            {
                                                 let _ = text_output_tx.send(true);
                                                 sse_emitted_text.store(
                                                     true,
                                                     std::sync::atomic::Ordering::SeqCst,
                                                 );
+                                                // Capture the latest full-text snapshot so
+                                                // it can serve as a fallback for final_result
+                                                // when stdout JSON and storage both fail.
+                                                if let Ok(mut buf) = sse_text_buffer.lock() {
+                                                    *buf = content.clone();
+                                                }
+                                            }
+                                            // Track active tool depth for permit management.
+                                            match &event {
+                                                AgentEvent::ToolCall { .. } => {
+                                                    sse_tool_depth_tx
+                                                        .send_modify(|v| *v = v.saturating_add(1));
+                                                }
+                                                AgentEvent::ToolResult { .. } => {
+                                                    sse_tool_depth_tx
+                                                        .send_modify(|v| *v = v.saturating_sub(1));
+                                                }
+                                                _ => {}
                                             }
                                             let _ = events_tx.send(event);
                                         }
@@ -7347,14 +7498,24 @@ pub async fn run_opencode_turn(
     } else {
         None
     };
+    // Drop the original sender so the channel closes when the SSE handler exits.
+    // This prevents a stale `tools_active == true` from permanently disabling
+    // the inactivity timeout if the SSE handler dies mid-tool-execution.
+    drop(sse_tool_depth_tx);
 
     // Spawn a task to read stderr (just log in JSON mode, events come on stdout)
     let mission_id_clone = mission_id;
-    let stderr_error_capture = sse_error_message.clone();
+    // Use a separate mutex for stderr errors so that broad stderr pattern
+    // matches (e.g. log lines containing "error" with JSON) don't write into
+    // sse_error_message.  Only genuine SSE-level errors (session.error,
+    // AgentEvent::Error from the SSE stream) should block recovery guards.
+    let stderr_error_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let stderr_error_capture = stderr_error_message.clone();
     let stderr_text_capture = stderr_text_buffer.clone();
     let stderr_text_output_tx = text_output_tx.clone();
     let stderr_last_activity = last_activity.clone();
     let stderr_rate_limit = rate_limit_detected.clone();
+    let stderr_events_tx = events_tx.clone();
     let stderr_handle = stderr.map(|stderr| {
         tokio::spawn(async move {
             let stderr_reader = BufReader::new(stderr);
@@ -7366,10 +7527,17 @@ pub async fn run_opencode_turn(
             while let Ok(Some(line)) = stderr_lines.next_line().await {
                 let clean = line.trim().to_string();
                 if !clean.is_empty() {
-                    // Refresh global inactivity timer so stderr-only progress
-                    // is not mistaken for a stuck process.
-                    if let Ok(mut guard) = stderr_last_activity.lock() {
-                        *guard = std::time::Instant::now();
+                    // Refresh global inactivity timer for lines that indicate
+                    // real work progress.  Heartbeats and server-internal status
+                    // lines are excluded — they fire every ~30s and would keep a
+                    // hung LLM call alive forever.
+                    let is_server_noise = clean.contains("server.heartbeat")
+                        || clean.contains("server.connected")
+                        || clean.contains("server.listening");
+                    if !is_server_noise {
+                        if let Ok(mut guard) = stderr_last_activity.lock() {
+                            *guard = std::time::Instant::now();
+                        }
                     }
                     tracing::debug!(mission_id = %mission_id_clone, line = %clean, "OpenCode CLI stderr");
 
@@ -7400,18 +7568,84 @@ pub async fn run_opencode_turn(
                         }
                     }
 
-                    // Detect session errors from stderr
+                    // Detect session/provider errors from stderr and surface
+                    // them as AgentEvent::Error so the frontend shows the
+                    // reason a mission failed (issue #146).
                     let lower = clean.to_lowercase();
-                    if lower.contains("session.error") || lower.contains("session ended with error")
+                    let detected_error = if lower.contains("session.error")
+                        || lower.contains("session ended with error")
                     {
-                        if let Some(pos) = clean.find(": ") {
-                            let err_part = clean[pos + 2..].trim();
-                            if !err_part.is_empty() {
-                                let mut guard = stderr_error_capture.lock().unwrap();
-                                if guard.is_none() {
-                                    *guard = Some(err_part.to_string());
-                                }
+                        // Standard session error format:
+                        //   [MAIN] session.error: Requested entity was not found
+                        clean.find(": ").map(|pos| clean[pos + 2..].trim().to_string())
+                    } else if lower.contains("response.error") {
+                        // Provider response error:
+                        //   [MAIN] response.error: 404 Not Found
+                        clean.find(": ").map(|pos| clean[pos + 2..].trim().to_string())
+                    } else if (lower.contains("error") || lower.contains("failed"))
+                        && clean.contains('{')
+                    {
+                        // JSON error payload on stderr — try to extract a
+                        // meaningful message from common fields.
+                        if let Some(start) = clean.find('{') {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&clean[start..]) {
+                                let msg = // 1. Top-level "message" string
+                                    json.get("message")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                    // 2. "error" as a plain string (e.g. {"error": "Rate limited"})
+                                    .or_else(|| {
+                                        json.get("error")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    // 3. Nested error object: {"error": {"message": "...", "status": "..."}}
+                                    .or_else(|| {
+                                        json.get("error")
+                                            .and_then(|e| e.as_object())
+                                            .and_then(|obj| {
+                                                let msg = obj.get("message").and_then(|m| m.as_str())?;
+                                                let status = obj.get("status").and_then(|s| s.as_str());
+                                                Some(if let Some(st) = status {
+                                                    format!("{} ({})", msg, st)
+                                                } else {
+                                                    msg.to_string()
+                                                })
+                                            })
+                                    })
+                                    // 4. Last resort: stringify the raw "error" value
+                                    .or_else(|| {
+                                        json.get("error").map(|v| v.to_string())
+                                    });
+                                msg
+                            } else {
+                                None
                             }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(err_msg) = detected_error {
+                        if !err_msg.is_empty() {
+                            tracing::warn!(
+                                mission_id = %mission_id_clone,
+                                error = %err_msg,
+                                "OpenCode provider error detected on stderr"
+                            );
+                            let mut guard = stderr_error_capture.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(err_msg.clone());
+                            }
+                            // Emit a real-time error event so the frontend
+                            // shows the error immediately, not just at the end.
+                            let _ = stderr_events_tx.send(AgentEvent::Error {
+                                message: err_msg,
+                                mission_id: Some(mission_id_clone),
+                                resumable: true,
+                            });
                         }
                     }
 
@@ -7484,12 +7718,21 @@ pub async fn run_opencode_turn(
             _ = cancel.cancelled() => {
                 tracing::info!(mission_id = %mission_id, "OpenCode execution cancelled, killing process");
                 let _ = child.kill().await;
-                if let Some(handle) = stderr_handle {
-                    handle.abort();
+                // Await background tasks so in-flight mutex writes complete
+                // before we return.  Use the same teardown discipline as the
+                // normal exit path to avoid data races on shared state.
+                if let Some(mut handle) = stderr_handle {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                            handle.abort();
+                        }
+                        _ = &mut handle => {}
+                    }
                 }
                 sse_cancel.cancel();
                 if let Some(handle) = sse_handle {
                     handle.abort();
+                    let _ = handle.await;
                 }
                 return AgentResult::failure("Cancelled".to_string(), 0)
                     .with_terminal_reason(TerminalReason::Cancelled);
@@ -7501,22 +7744,39 @@ pub async fn run_opencode_turn(
                 }
             }
             changed = sse_session_idle_rx.changed() => {
-                if changed.is_ok()
-                    && *sse_session_idle_rx.borrow()
-                    && !session_idle_seen
-                {
-                    session_idle_seen = true;
-                    session_idle_at = Some(std::time::Instant::now());
-                    tracing::debug!(
-                        mission_id = %mission_id,
-                        had_meaningful_work = had_meaningful_work,
-                        "Session idle signal received from SSE"
-                    );
+                if changed.is_ok() {
+                    if *sse_session_idle_rx.borrow() && !session_idle_seen {
+                        session_idle_seen = true;
+                        session_idle_at = Some(std::time::Instant::now());
+                        tracing::debug!(
+                            mission_id = %mission_id,
+                            had_meaningful_work = had_meaningful_work,
+                            "Session idle signal received from SSE"
+                        );
+                    } else if !*sse_session_idle_rx.borrow() && session_idle_seen {
+                        // SSE reconnected — the sender reset to false.  Clear
+                        // the stale idle state so the 10s kill timer doesn't
+                        // fire based on a pre-reconnect timestamp.
+                        session_idle_seen = false;
+                        session_idle_at = None;
+                        tracing::debug!(
+                            mission_id = %mission_id,
+                            "Session idle state reset (SSE reconnect)"
+                        );
+                    }
                 }
             }
             changed = sse_retry_rx.changed() => {
                 if changed.is_ok() {
                     let new_total = *sse_retry_rx.borrow();
+                    // On SSE reconnect the sender resets to 0; clear local
+                    // tracking so stale counts don't accumulate across
+                    // connections.
+                    if new_total == 0 && last_seen_total_retries > 0 {
+                        last_seen_total_retries = 0;
+                        consecutive_retries = 0;
+                        continue;
+                    }
                     let delta = new_total.saturating_sub(last_seen_total_retries);
                     last_seen_total_retries = new_total;
                     consecutive_retries += delta;
@@ -7578,12 +7838,25 @@ pub async fn run_opencode_turn(
                 || sse_emitted_text.load(std::sync::atomic::Ordering::SeqCst)) => {
                 if let Some(idle_since) = session_idle_at {
                     if idle_since.elapsed() >= std::time::Duration::from_secs(10) {
-                        tracing::info!(
-                            mission_id = %mission_id,
-                            "Session idle for 10s after meaningful work; treating as completion"
-                        );
-                        let _ = child.kill().await;
-                        break;
+                        // Don't kill while tools are actively running — the model
+                        // may have sent session.idle prematurely before a long
+                        // tool execution (build, test) produces more output.
+                        let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
+                        let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
+                        if tools_active {
+                            tracing::debug!(
+                                mission_id = %mission_id,
+                                tool_depth = *sse_tool_depth_rx.borrow(),
+                                "Session idle but tools still active; deferring kill"
+                            );
+                        } else {
+                            tracing::info!(
+                                mission_id = %mission_id,
+                                "Session idle for 10s after meaningful work; treating as completion"
+                            );
+                            let _ = child.kill().await;
+                            break;
+                        }
                     }
                 }
             }
@@ -7608,15 +7881,20 @@ pub async fn run_opencode_turn(
                 }
                 if let Some(last_text) = text_output_at {
                     if last_text.elapsed() >= std::time::Duration::from_secs(30) {
-                        // Only kill if there's also no recent SSE/stderr activity.
-                        // The model may be actively doing tool calls without
-                        // producing text output.
+                        // Only kill if there's also no recent SSE/stderr activity
+                        // AND no tools are actively running.  A long tool execution
+                        // (build, test, sleep) may produce no text output for >30s;
+                        // killing the process mid-tool would be wrong.
+                        // If the SSE handler has exited, the depth value may be
+                        // stale (stuck > 0), so treat that as "no tools active".
+                        let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
+                        let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
                         let recent_activity = last_activity
                             .lock()
                             .ok()
                             .map(|g| g.elapsed() < std::time::Duration::from_secs(30))
                             .unwrap_or(false);
-                        if !recent_activity {
+                        if !recent_activity && !tools_active {
                             tracing::info!(
                                 mission_id = %mission_id,
                                 "OpenCode output idle timeout reached; terminating CLI process"
@@ -7630,10 +7908,18 @@ pub async fn run_opencode_turn(
                 // for 120s (no SSE events, no stdout, no stderr), the process
                 // is likely stuck.  Kill it and let the fallback recovery
                 // logic read the result from OpenCode storage.
-                let inactive_too_long = last_activity
-                    .lock()
-                    .map(|g| g.elapsed() >= std::time::Duration::from_secs(120))
-                    .unwrap_or(false);
+                // Skip this check while tools are actively running — long
+                // commands (builds, tests) may produce no SSE events for
+                // extended periods and heartbeats are intentionally filtered.
+                // If the SSE handler has exited, the depth value may be stale,
+                // so treat that as "no tools active".
+                let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
+                let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
+                let inactive_too_long = !tools_active
+                    && last_activity
+                        .lock()
+                        .map(|g| g.elapsed() >= std::time::Duration::from_secs(120))
+                        .unwrap_or(false);
                 if inactive_too_long {
                     tracing::warn!(
                         mission_id = %mission_id,
@@ -7681,11 +7967,24 @@ pub async fn run_opencode_turn(
                                                 .or_else(|| props.get("messageId"))
                                                 .or_else(|| props.get("message_id"))
                                                 .and_then(|v| v.as_str());
-                                            let is_user = msg_id
-                                                .and_then(|id| state.message_roles.get(id))
-                                                .map(|role| role == "user")
-                                                .unwrap_or(false);
-                                            if !is_user {
+                                            // Skip non-assistant and unknown-role messages,
+                                            // consistent with the SSE path in handle_part_update
+                                            // (lines 325-336). Three cases when msg_id is present:
+                                            //   - role is known non-assistant → skip
+                                            //   - role is not yet recorded   → skip (avoids
+                                            //     emitting user-message echoes as model text,
+                                            //     which would set text_output_at and trigger
+                                            //     the premature 30s text-idle timeout)
+                                            //   - role is "assistant"        → process text
+                                            // When msg_id is None (no ID in the event), allow
+                                            // text through — same as the SSE path.
+                                            let is_confirmed_assistant = match msg_id {
+                                                Some(id) => state.message_roles.get(id)
+                                                    .map(|role| role == "assistant")
+                                                    .unwrap_or(false), // unknown role → skip
+                                                None => true, // no msg_id → allow through
+                                            };
+                                            if is_confirmed_assistant {
                                                 if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                     final_result = text.to_string();
                                                     let _ = text_output_tx.send(true);
@@ -7801,6 +8100,13 @@ pub async fn run_opencode_turn(
                                 }
                             }
 
+                            // Skip runner banner/status lines so they don't
+                            // pollute the model response (issues #147, #151).
+                            if is_opencode_banner_line(trimmed) {
+                                tracing::debug!(mission_id = %mission_id, line = %trimmed, "Skipping OpenCode banner line");
+                                continue;
+                            }
+
                             final_result.push_str(trimmed);
                             final_result.push('\n');
                             let _ = text_output_tx.send(true);
@@ -7849,6 +8155,9 @@ pub async fn run_opencode_turn(
     sse_cancel.cancel();
     if let Some(handle) = sse_handle {
         handle.abort();
+        // Await the abort so the SSE task finishes any in-flight writes to
+        // sse_text_buffer before we read it in the fallback chain below.
+        let _ = handle.await;
     }
 
     // Check exit status
@@ -7861,11 +8170,26 @@ pub async fn run_opencode_turn(
         }
     }
 
-    // Surface SSE error messages (e.g. session.error) that were captured during streaming
+    // Surface SSE error messages (e.g. session.error) that were captured during streaming.
+    // These are high-confidence errors from the SSE stream and should block recovery.
     if let Some(err_msg) = sse_error_message.lock().unwrap().clone() {
         had_error = true;
         if opencode_output_needs_fallback(&final_result) {
             final_result = err_msg;
+        }
+    }
+
+    // Surface stderr-detected errors (e.g. JSON error payloads from provider).
+    // These are lower-confidence than SSE errors because the stderr detection
+    // uses broad pattern matching and can produce false positives.  They set
+    // had_error but do NOT write into sse_error_message, so recovery guards
+    // below can still clear had_error when valid content is recovered.
+    if sse_error_message.lock().unwrap().is_none() {
+        if let Some(err_msg) = stderr_error_message.lock().unwrap().clone() {
+            had_error = true;
+            if opencode_output_needs_fallback(&final_result) {
+                final_result = err_msg;
+            }
         }
     }
 
@@ -7910,6 +8234,25 @@ pub async fn run_opencode_turn(
         }
     }
 
+    // SSE text buffer fallback: use the accumulated text from SSE TextDelta
+    // events. This is the most reliable source after stdout JSON and session
+    // storage because it contains exactly what was streamed to the dashboard,
+    // unlike stderr which truncates long content with "..." (fixes #158).
+    let mut recovered_from_sse = false;
+    if opencode_output_needs_fallback(&final_result) {
+        if let Ok(buffer) = sse_text_buffer.lock() {
+            if !buffer.trim().is_empty() {
+                tracing::info!(
+                    mission_id = %mission_id,
+                    text_len = buffer.len(),
+                    "Recovered OpenCode assistant output from SSE text buffer"
+                );
+                final_result = buffer.clone();
+                recovered_from_sse = true;
+            }
+        }
+    }
+
     if opencode_output_needs_fallback(&final_result) {
         if let Ok(buffer) = stderr_text_buffer.lock() {
             if !buffer.trim().is_empty() {
@@ -7919,11 +8262,20 @@ pub async fn run_opencode_turn(
         }
     }
 
-    if recovered_from_stderr {
+    // Only clear had_error from recovery if there is no real SSE error.
+    // Without this guard, a session.error followed by partial text in the
+    // SSE buffer would clear the error and return a truncated response.
+    if (recovered_from_sse || recovered_from_stderr) && sse_error_message.lock().unwrap().is_none()
+    {
         had_error = false;
     }
 
-    if had_error && !final_result.trim().is_empty() && sse_error_message.lock().unwrap().is_none() {
+    // Clear had_error when we have real (non-banner) content and no SSE error.
+    // This avoids false failures when the CLI exited non-zero but produced real output.
+    if had_error
+        && !opencode_output_needs_fallback(&final_result)
+        && sse_error_message.lock().unwrap().is_none()
+    {
         had_error = false;
     }
 
@@ -7978,10 +8330,24 @@ pub async fn run_opencode_turn(
         });
     }
 
-    if final_result.trim().is_empty() && !had_error {
+    if !had_error && opencode_output_needs_fallback(&final_result) {
         had_error = true;
         final_result =
-            "OpenCode produced no output. Check CLI installation or authentication.".to_string();
+            "OpenCode produced no assistant output (only runner status lines or empty). The model may not have responded.".to_string();
+    }
+
+    // Detect tool-call-only output: the model emitted tool calls but never
+    // produced a final text response. The JSON fragment should not be returned
+    // as assistant text — surface a clear error instead (fixes #148).
+    if !had_error && is_tool_call_only_output(&final_result) {
+        tracing::warn!(
+            mission_id = %mission_id,
+            result_preview = %final_result.chars().take(200).collect::<String>(),
+            "OpenCode output contains only tool-call JSON fragments with no assistant text"
+        );
+        had_error = true;
+        final_result =
+            "The model attempted tool calls but produced no final text response. This can happen when the model routing chain doesn't support tool execution.".to_string();
     }
 
     tracing::info!(
@@ -8310,6 +8676,8 @@ pub async fn run_amp_turn(
     let mut thinking_buffer: HashMap<u32, String> = HashMap::new();
     let mut text_buffer: HashMap<u32, String> = HashMap::new();
     let mut active_thinking_index: Option<u32> = None;
+    let mut finalized_thinking_indices: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
     let mut last_text_len: usize = 0;
     let mut thinking_streamed = false; // Track if thinking was already streamed
 
@@ -8382,12 +8750,15 @@ pub async fn run_amp_turn(
                                             if let Some(thinking_text) = thinking_text {
                                                 if !thinking_text.is_empty() {
                                                     // If a new thinking block started, finalize the previous one
-                                                    if active_thinking_index.is_some() && active_thinking_index != Some(index) {
-                                                        let _ = events_tx.send(AgentEvent::Thinking {
-                                                            content: String::new(),
-                                                            done: true,
-                                                            mission_id: Some(mission_id),
-                                                        });
+                                                    if let Some(prev_idx) = active_thinking_index {
+                                                        if prev_idx != index {
+                                                            let _ = events_tx.send(AgentEvent::Thinking {
+                                                                content: String::new(),
+                                                                done: true,
+                                                                mission_id: Some(mission_id),
+                                                            });
+                                                            finalized_thinking_indices.insert(prev_idx);
+                                                        }
                                                     }
                                                     active_thinking_index = Some(index);
 
@@ -8449,7 +8820,8 @@ pub async fn run_amp_turn(
                                     total_cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
                                 }
 
-                                for block in evt.message.content {
+                                for (content_idx, block) in evt.message.content.into_iter().enumerate() {
+                                    let content_idx = content_idx as u32;
                                     match block {
                                         ContentBlock::Text { text } => {
                                             if !text.is_empty() {
@@ -8484,8 +8856,10 @@ pub async fn run_amp_turn(
                                             });
                                         }
                                         ContentBlock::Thinking { thinking } => {
-                                            // Only emit thinking from Assistant event if it wasn't already streamed
-                                            // via ContentBlockDelta events. This prevents duplicate thinking content.
+                                            // Skip blocks already finalized during streaming
+                                            if finalized_thinking_indices.contains(&content_idx) {
+                                                continue;
+                                            }
                                             if !thinking.is_empty() && !thinking_streamed {
                                                 let _ = events_tx.send(AgentEvent::Thinking {
                                                     content: thinking,
@@ -8509,6 +8883,7 @@ pub async fn run_amp_turn(
                                 thinking_buffer.clear();
                                 text_buffer.clear();
                                 active_thinking_index = None;
+                                finalized_thinking_indices.clear();
                                 last_text_len = 0;
                                 block_types.clear();
                                 thinking_streamed = false;
@@ -8849,6 +9224,7 @@ pub async fn run_codex_turn(
         mission_id = %mission_id,
         workspace_type = ?workspace.workspace_type,
         cli_path = %cli_path,
+        model = ?model,
         "Starting Codex execution via WorkspaceExec"
     );
 

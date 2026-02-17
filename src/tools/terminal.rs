@@ -5,11 +5,18 @@
 //! Commands run in the workspace by default:
 //! - `run_command("ls")` → lists workspace contents
 //! - `run_command("cat output/report.md")` → reads workspace file
+//!
+//! ## RTK Integration
+//!
+//! When RTK is enabled (SANDBOXED_SH_RTK_ENABLED=1), commands are wrapped with
+//! `rtk` to compress output before returning to the LLM, reducing token consumption
+//! by 60-90% on common dev commands.
 
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +26,157 @@ use tokio::process::Command;
 
 use super::{resolve_path_simple as resolve_path, Tool};
 use crate::nspawn;
+
+static RTK_COMMANDS_PROCESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Return RTK stats: (commands_processed, original_tokens, compressed_tokens).
+///
+/// Token counts come from `rtk gain -f json` which reads RTK's own SQLite
+/// database with accurate pre- and post-compression measurements.  The
+/// process-local command counter tracks how many commands we wrapped.
+pub fn rtk_stats() -> (u64, u64, u64) {
+    let commands = RTK_COMMANDS_PROCESSED.load(Ordering::Relaxed);
+    let (original, compressed) = rtk_gain_stats().unwrap_or((0, 0));
+    (commands, original, compressed)
+}
+
+/// Query RTK's builtin stats via `rtk gain -f json`.
+/// Returns (total_input_tokens, total_output_tokens) on success.
+fn rtk_gain_stats() -> Option<(u64, u64)> {
+    let rtk_path = rtk_binary_path()?;
+    let output = std::process::Command::new(rtk_path)
+        .args(["gain", "-f", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let summary = json.get("summary")?;
+    let input = summary.get("total_input")?.as_u64()?;
+    let output_tokens = summary.get("total_output")?.as_u64()?;
+    Some((input, output_tokens))
+}
+
+fn rtk_enabled() -> bool {
+    env::var("SANDBOXED_SH_RTK_ENABLED")
+        .map(|v| {
+            matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "y" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn rtk_binary_path() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from("/usr/local/bin/rtk"),
+        PathBuf::from("/usr/bin/rtk"),
+        PathBuf::from("/root/.local/bin/rtk"),
+        PathBuf::from("/home/opencode/.local/bin/rtk"),
+    ];
+    for path in candidates {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    // Fallback: search PATH
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in path_var.split(':') {
+            let candidate = PathBuf::from(dir).join("rtk");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+const RTK_WRAPPED_COMMANDS: &[&str] = &[
+    "git status",
+    "git diff",
+    "git log",
+    "git add",
+    "git commit",
+    "git push",
+    "git pull",
+    "git branch",
+    "git fetch",
+    "git stash",
+    "git show",
+    "git blame",
+    "gh pr",
+    "gh issue",
+    "gh run",
+    "gh repo",
+    "ls",
+    "ls -la",
+    "ls -lah",
+    "tree",
+    "cat",
+    "head",
+    "tail",
+    "grep",
+    "rg",
+    "ag",
+    "find",
+    "cargo test",
+    "cargo build",
+    "cargo clippy",
+    "cargo check",
+    "cargo run",
+    "npm test",
+    "npm run",
+    "pnpm test",
+    "pnpm run",
+    "yarn test",
+    "yarn run",
+    "vitest",
+    "jest",
+    "pytest",
+    "go test",
+    "go build",
+    "go vet",
+    "eslint",
+    "ruff",
+    "mypy",
+    "pylint",
+    "tsc",
+    "biome",
+    "docker ps",
+    "docker images",
+    "docker logs",
+    "kubectl get",
+    "kubectl logs",
+    "kubectl describe",
+];
+
+fn should_wrap_with_rtk(command: &str) -> bool {
+    let cmd_lower = command.trim().to_lowercase();
+    if cmd_lower.starts_with("rtk ") {
+        return false;
+    }
+    if cmd_lower.contains("&&") || cmd_lower.contains("||") || cmd_lower.contains("|") {
+        return false;
+    }
+    if cmd_lower.starts_with("cat <<") || cmd_lower.contains("<<") {
+        return false;
+    }
+    for pattern in RTK_WRAPPED_COMMANDS {
+        if cmd_lower.starts_with(pattern) || cmd_lower == *pattern {
+            return true;
+        }
+    }
+    false
+}
+
+fn wrap_with_rtk(command: &str, rtk_path: &Path) -> String {
+    format!("{} {}", rtk_path.display(), command)
+}
 
 /// Context information read from the local context file.
 /// This is re-read before each container command to handle timing issues
@@ -872,13 +1030,44 @@ impl Tool for RunCommand {
             .unwrap_or_else(|| working_dir.to_path_buf());
         let options = parse_command_options(&args);
 
-        tracing::info!("Executing command in {:?}: {}", cwd, command);
+        let (final_command, rtk_used) = if rtk_enabled() {
+            if let Some(rtk_path) = rtk_binary_path() {
+                if should_wrap_with_rtk(command) {
+                    tracing::info!(
+                        command = %command,
+                        rtk_path = %rtk_path.display(),
+                        "Wrapping command with RTK for token reduction"
+                    );
+                    (wrap_with_rtk(command, &rtk_path), true)
+                } else {
+                    tracing::debug!(
+                        command = %command,
+                        "Command not in RTK allowlist, running as-is"
+                    );
+                    (command.to_string(), false)
+                }
+            } else {
+                tracing::debug!(
+                    command = %command,
+                    "RTK binary not found, running command as-is"
+                );
+                (command.to_string(), false)
+            }
+        } else {
+            tracing::debug!(
+                command = %command,
+                "RTK is disabled, running command as-is"
+            );
+            (command.to_string(), false)
+        };
+
+        tracing::info!("Executing command in {:?}: {}", cwd, final_command);
 
         let output = match container_root {
             Some(container_root) => {
-                run_container_command(&container_root, &cwd, command, &options).await?
+                run_container_command(&container_root, &cwd, &final_command, &options).await?
             }
-            None => run_host_command(&cwd, command, &options).await?,
+            None => run_host_command(&cwd, &final_command, &options).await?,
         };
 
         let stdout = sanitize_output(&output.stdout);
@@ -891,6 +1080,14 @@ impl Tool for RunCommand {
             stdout.len(),
             stderr.len()
         );
+
+        if rtk_used {
+            RTK_COMMANDS_PROCESSED.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                compressed_stdout_len = stdout.len(),
+                "RTK-wrapped command completed"
+            );
+        }
 
         let result = if options.raw_output {
             let mut raw = String::new();

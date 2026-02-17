@@ -191,25 +191,23 @@ fn default_providers_config() -> ProvidersConfig {
                 billing: "subscription".to_string(),
                 description: "ChatGPT Plus/Pro via OAuth".to_string(),
                 models: vec![
-                    ProviderModel {
-                        id: "gpt-5.3-spark".to_string(),
-                        name: "GPT-5.3 Spark".to_string(),
-                        description: Some("Fast, lightweight GPT-5.3 variant".to_string()),
-                    },
-                    ProviderModel {
-                        id: "gpt-5.3-extra-high".to_string(),
-                        name: "GPT-5.3 Extra High".to_string(),
-                        description: Some("Highest quality GPT-5.3 tier".to_string()),
-                    },
+                    // Codex-optimized models (for Codex CLI)
                     ProviderModel {
                         id: "gpt-5.3-codex".to_string(),
                         name: "GPT-5.3 Codex".to_string(),
-                        description: Some("Latest Codex model".to_string()),
+                        description: Some(
+                            "Latest Codex model — strongest agentic coding".to_string(),
+                        ),
+                    },
+                    ProviderModel {
+                        id: "gpt-5.3-codex-spark".to_string(),
+                        name: "GPT-5.3 Codex Spark".to_string(),
+                        description: Some("Real-time coding, >1000 tok/s (Pro only)".to_string()),
                     },
                     ProviderModel {
                         id: "gpt-5.2-codex".to_string(),
                         name: "GPT-5.2 Codex".to_string(),
-                        description: Some("Optimized for coding workflows".to_string()),
+                        description: Some("Smart and precise coding agent".to_string()),
                     },
                     ProviderModel {
                         id: "gpt-5.1-codex".to_string(),
@@ -226,6 +224,17 @@ fn default_providers_config() -> ProvidersConfig {
                         name: "GPT-5.1 Codex Mini".to_string(),
                         description: Some("Fast and economical".to_string()),
                     },
+                    ProviderModel {
+                        id: "gpt-5-codex".to_string(),
+                        name: "GPT-5 Codex".to_string(),
+                        description: Some("Purpose-built for agentic coding".to_string()),
+                    },
+                    ProviderModel {
+                        id: "gpt-5-codex-mini".to_string(),
+                        name: "GPT-5 Codex Mini".to_string(),
+                        description: Some("Smaller, cost-effective variant".to_string()),
+                    },
+                    // General-purpose models (API key only)
                     ProviderModel {
                         id: "gpt-5.3".to_string(),
                         name: "GPT-5.3".to_string(),
@@ -939,7 +948,10 @@ pub async fn list_backend_model_options(
         std::collections::HashMap::new();
 
     let mut push_options =
-        |backend: &str, allowlist: Option<&[&str]>, use_provider_prefix: bool| {
+        |backend: &str,
+         allowlist: Option<&[&str]>,
+         use_provider_prefix: bool,
+         model_filter: Option<&dyn Fn(&str) -> bool>| {
             let mut options = Vec::new();
             for provider in &providers {
                 if let Some(allowed) = allowlist {
@@ -950,6 +962,11 @@ pub async fn list_backend_model_options(
                 // Determine if this is a custom provider (billing type "custom")
                 let is_custom = provider.billing == "custom";
                 for model in &provider.models {
+                    if let Some(ref filter) = model_filter {
+                        if !filter(&model.id) {
+                            continue;
+                        }
+                    }
                     let value = if use_provider_prefix {
                         format!("{}/{}", provider.id, model.id)
                     } else {
@@ -971,10 +988,36 @@ pub async fn list_backend_model_options(
             backends.insert(backend.to_string(), options);
         };
 
-    push_options("claudecode", Some(&["anthropic"]), false);
-    push_options("codex", Some(&["openai"]), false);
-    push_options("opencode", None, true);
+    push_options("claudecode", Some(&["anthropic"]), false, None);
+    // Only show Codex-optimized models (contain "codex" in the ID).
+    let codex_filter: &dyn Fn(&str) -> bool = &|id: &str| id.contains("codex");
+    push_options("codex", Some(&["openai"]), false, Some(codex_filter));
+    push_options("opencode", None, true, None);
     backends.entry("amp".to_string()).or_default();
+
+    // Prepend model routing chains to opencode options so they appear first
+    let chains = state.chain_store.list().await;
+    if !chains.is_empty() {
+        let opencode_opts = backends.entry("opencode".to_string()).or_default();
+        let mut chain_options: Vec<BackendModelOption> = chains
+            .iter()
+            .map(|c| {
+                let entries_desc: Vec<String> = c
+                    .entries
+                    .iter()
+                    .map(|e| format!("{}/{}", e.provider_id, e.model_id))
+                    .collect();
+                BackendModelOption {
+                    value: c.id.clone(),
+                    label: format!("Routing — {}", c.name),
+                    description: Some(entries_desc.join(" → ")),
+                    provider_id: None,
+                }
+            })
+            .collect();
+        chain_options.append(opencode_opts);
+        *opencode_opts = chain_options;
+    }
 
     Json(BackendModelOptionsResponse { backends })
 }
@@ -1115,13 +1158,16 @@ pub async fn validate_model_override(
             let openai = providers.iter().find(|p| p.id == "openai");
             if let Some(provider) = openai {
                 if !provider.models.iter().any(|m| m.id == model_override) {
-                    // Check if it looks like an OpenAI model (common prefixes)
-                    if model_override.starts_with("gpt-") || model_override.starts_with("o1-") {
+                    // Check if it looks like an OpenAI/Codex model (common prefixes)
+                    if model_override.starts_with("gpt-")
+                        || model_override.starts_with("o1-")
+                        || model_override.starts_with("codex-")
+                    {
                         // Allow unknown OpenAI models (escape hatch for new models)
                         Ok(())
                     } else {
                         Err(format!(
-                            "Model '{}' not found in OpenAI catalog. Available models: {}. For custom OpenAI models, use format 'gpt-*' or 'o1-*'",
+                            "Model '{}' not found in OpenAI catalog. Available models: {}. For custom OpenAI models, use format 'gpt-*', 'o1-*', or 'codex-*'",
                             model_override,
                             provider
                                 .models
@@ -1136,12 +1182,15 @@ pub async fn validate_model_override(
                     Ok(())
                 }
             } else {
-                // OpenAI not configured, but allow if it looks like an OpenAI model
-                if model_override.starts_with("gpt-") || model_override.starts_with("o1-") {
+                // OpenAI not configured, but allow if it looks like an OpenAI/Codex model
+                if model_override.starts_with("gpt-")
+                    || model_override.starts_with("o1-")
+                    || model_override.starts_with("codex-")
+                {
                     Ok(())
                 } else {
                     Err(format!(
-                        "OpenAI provider not configured. Expected an OpenAI model ID (e.g., 'gpt-4'), got '{}'",
+                        "OpenAI provider not configured. Expected an OpenAI model ID (e.g., 'gpt-4', 'o1-*', or 'codex-*'), got '{}'",
                         model_override
                     ))
                 }
