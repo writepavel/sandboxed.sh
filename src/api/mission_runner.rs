@@ -11,27 +11,12 @@
 //! - Working directory (isolated per mission)
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-
-/// Per-provider concurrency semaphores.
-/// ZAI's coding subscription endpoint rate-limits concurrent requests (typically
-/// 1 at a time). The semaphore serializes missions targeting the same provider
-/// so we don't trigger 429s.
-static PROVIDER_SEMAPHORES: LazyLock<HashMap<&'static str, Semaphore>> = LazyLock::new(|| {
-    let zai_max: usize = std::env::var("ZAI_MAX_CONCURRENT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
-        .max(1);
-    let mut m = HashMap::new();
-    m.insert("zai", Semaphore::new(zai_max));
-    m
-});
 
 use crate::agents::{AgentRef, AgentResult, TerminalReason};
 use crate::backend::claudecode::client::{ClaudeEvent, ContentBlock, StreamEvent};
@@ -1488,10 +1473,16 @@ async fn run_mission_turn(
     let is_continuation = history.iter().any(|(role, _)| role == "assistant");
     let result = match backend_id.as_str() {
         "claudecode" => {
+            // Track the effective message and session used for the most recent
+            // attempt, so account rotation uses the right context (e.g. after
+            // session corruption recovery rebuilds the message).
+            let mut effective_msg = user_message.clone();
+            let mut effective_sid = session_id.clone();
+
             let mut result = run_claudecode_turn(
                 &workspace,
                 &mission_work_dir,
-                &user_message,
+                &effective_msg,
                 config.default_model.as_deref(),
                 effective_agent.as_deref(),
                 mission_id,
@@ -1499,10 +1490,11 @@ async fn run_mission_turn(
                 cancel.clone(),
                 secrets.clone(),
                 &config.working_dir,
-                session_id.as_deref(),
+                effective_sid.as_deref(),
                 is_continuation,
                 Some(Arc::clone(&tool_hub)),
                 Some(Arc::clone(&status)),
+                None, // override_auth: use default credential resolution
             )
             .await;
 
@@ -1555,23 +1547,93 @@ async fn run_mission_turn(
                     )
                 };
 
+                // Update effective context so account rotation uses the
+                // recovery message and new session, not the stale originals.
+                effective_msg = retry_message;
+                effective_sid = Some(new_session_id);
+
                 result = run_claudecode_turn(
                     &workspace,
                     &mission_work_dir,
-                    &retry_message,
+                    &effective_msg,
                     config.default_model.as_deref(),
                     effective_agent.as_deref(),
                     mission_id,
                     events_tx.clone(),
-                    cancel,
-                    secrets,
+                    cancel.clone(),
+                    secrets.clone(),
                     &config.working_dir,
-                    Some(&new_session_id),
+                    effective_sid.as_deref(),
                     is_continuation,
                     Some(Arc::clone(&tool_hub)),
                     Some(Arc::clone(&status)),
+                    None, // override_auth
                 )
                 .await;
+            }
+
+            // Account rotation: if rate-limited, try alternate Anthropic credentials.
+            // The first entry in the list is the highest-priority credential, which
+            // is almost certainly what the initial (override_auth=None) call used.
+            // Skip it to avoid a guaranteed duplicate rate-limit failure.
+            if result.terminal_reason == Some(TerminalReason::RateLimited) {
+                let alt_accounts =
+                    super::ai_providers::get_all_anthropic_auth_for_claudecode(&config.working_dir);
+                let alt_accounts: Vec<_> = alt_accounts.into_iter().skip(1).collect();
+                if !alt_accounts.is_empty() {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        total_accounts = alt_accounts.len(),
+                        "Rate limited on primary account; trying alternate credentials"
+                    );
+                    for (idx, alt_auth) in alt_accounts.into_iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            attempt = idx + 2,
+                            auth_type = match &alt_auth {
+                                super::ai_providers::ClaudeCodeAuth::ApiKey(_) => "api_key",
+                                super::ai_providers::ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
+                            },
+                            "Rotating to alternate Anthropic account"
+                        );
+                        result = run_claudecode_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &effective_msg,
+                            config.default_model.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            secrets.clone(),
+                            &config.working_dir,
+                            effective_sid.as_deref(),
+                            is_continuation,
+                            Some(Arc::clone(&tool_hub)),
+                            Some(Arc::clone(&status)),
+                            Some(alt_auth),
+                        )
+                        .await;
+                        // Only continue rotating on rate-limit errors.
+                        // Non-rate-limit LLM errors (model errors, context
+                        // limit, etc.) would fail on every account, so stop
+                        // early to avoid masking the real failure.
+                        match result.terminal_reason {
+                            Some(TerminalReason::RateLimited) => {
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    attempt = idx + 2,
+                                    "Rate limited; rotating to next account"
+                                );
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
             }
 
             result
@@ -1594,23 +1656,81 @@ async fn run_mission_turn(
         }
         "amp" => {
             let api_key = get_amp_api_key_from_config();
-            run_amp_turn(
+            let mut result = run_amp_turn(
                 &workspace,
                 &mission_work_dir,
                 &user_message,
                 effective_agent.as_deref(), // Used as mode (smart/rush)
                 mission_id,
                 events_tx.clone(),
-                cancel,
+                cancel.clone(),
                 &config.working_dir,
                 session_id.as_deref(),
                 is_continuation,
                 api_key.as_deref(),
             )
-            .await
+            .await;
+
+            // Account rotation: if rate-limited, try alternate Amp API keys.
+            if result.terminal_reason == Some(TerminalReason::RateLimited) {
+                let alt_keys = super::ai_providers::get_all_amp_api_keys(&config.working_dir);
+                if alt_keys.len() > 1 {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        total_keys = alt_keys.len(),
+                        "Amp rate limited; trying alternate API keys"
+                    );
+                    // Skip the key we already tried (explicit config key or env var fallback)
+                    let already_tried = api_key.map(|s| s.to_string()).or_else(|| {
+                        std::env::var("AMP_API_KEY")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                    });
+                    for (idx, alt_key) in alt_keys.into_iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        if Some(&alt_key) == already_tried.as_ref() {
+                            continue;
+                        }
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            attempt = idx + 2,
+                            "Rotating to alternate Amp API key"
+                        );
+                        result = run_amp_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &user_message,
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            &config.working_dir,
+                            session_id.as_deref(),
+                            is_continuation,
+                            Some(&alt_key),
+                        )
+                        .await;
+                        match result.terminal_reason {
+                            Some(TerminalReason::RateLimited) => {
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    attempt = idx + 2,
+                                    "Amp rate limited; rotating to next key"
+                                );
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+
+            result
         }
         "codex" => {
-            run_codex_turn(
+            let mut result = run_codex_turn(
                 &workspace,
                 &mission_work_dir,
                 &convo,
@@ -1618,11 +1738,74 @@ async fn run_mission_turn(
                 effective_agent.as_deref(),
                 mission_id,
                 events_tx.clone(),
-                cancel,
+                cancel.clone(),
                 &config.working_dir,
                 session_id.as_deref(),
+                None,
             )
-            .await
+            .await;
+
+            // Account rotation: if rate-limited, try alternate OpenAI API keys.
+            // The override key is passed directly to write_codex_credentials_for_workspace
+            // to avoid mutating the process-global OPENAI_API_KEY env var (which would
+            // race with concurrent missions).
+            if result.terminal_reason == Some(TerminalReason::RateLimited) {
+                let alt_keys =
+                    super::ai_providers::get_all_openai_keys_for_codex(&config.working_dir);
+                if alt_keys.len() > 1 {
+                    tracing::info!(
+                        mission_id = %mission_id,
+                        total_keys = alt_keys.len(),
+                        "Codex rate limited; trying alternate OpenAI API keys"
+                    );
+                    // The first key in alt_keys is typically the default (from env var
+                    // or auth.json), which we already tried above.
+                    let already_tried = super::ai_providers::get_openai_api_key_for_codex_default(
+                        &config.working_dir,
+                    );
+                    for (idx, alt_key) in alt_keys.into_iter().enumerate() {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        // Skip the key we already tried
+                        if Some(&alt_key) == already_tried.as_ref() {
+                            continue;
+                        }
+                        tracing::info!(
+                            mission_id = %mission_id,
+                            attempt = idx + 2,
+                            "Rotating to alternate OpenAI API key for Codex"
+                        );
+                        result = run_codex_turn(
+                            &workspace,
+                            &mission_work_dir,
+                            &convo,
+                            config.default_model.as_deref(),
+                            effective_agent.as_deref(),
+                            mission_id,
+                            events_tx.clone(),
+                            cancel.clone(),
+                            &config.working_dir,
+                            session_id.as_deref(),
+                            Some(&alt_key),
+                        )
+                        .await;
+                        match result.terminal_reason {
+                            Some(TerminalReason::RateLimited) => {
+                                tracing::info!(
+                                    mission_id = %mission_id,
+                                    attempt = idx + 2,
+                                    "Codex rate limited; rotating to next key"
+                                );
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+
+            result
         }
         _ => {
             // Don't send Error event - the failure will be emitted as an AssistantMessage
@@ -1813,6 +1996,7 @@ pub fn run_claudecode_turn<'a>(
     is_continuation: bool,
     tool_hub: Option<Arc<FrontendToolHub>>,
     status: Option<Arc<RwLock<ControlStatus>>>,
+    override_auth: Option<super::ai_providers::ClaudeCodeAuth>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentResult> + Send + 'a>> {
     Box::pin(async move {
         use super::ai_providers::{
@@ -1953,10 +2137,26 @@ pub fn run_claudecode_turn<'a>(
             tracing::warn!("Failed to refresh Anthropic OAuth token: {}", e);
         }
 
+        // Keep a clone of the override credential so recursive continuation
+        // calls (tool-result → next turn) keep using the same rotated account.
+        let override_auth_for_continuation = override_auth.clone();
+
+        // If an override credential was provided (account rotation), use it directly.
+        let api_auth = if let Some(auth) = override_auth {
+            tracing::info!(
+                mission_id = %mission_id,
+                auth_type = match &auth {
+                    ClaudeCodeAuth::ApiKey(_) => "api_key",
+                    ClaudeCodeAuth::OAuthToken(_) => "oauth_token",
+                },
+                "Using override credential for account rotation"
+            );
+            Some(auth)
+        } else
         // Try to get API key/OAuth token from Anthropic provider configured for Claude Code backend.
         // For container workspaces, compare workspace auth vs host auth and use the fresher one.
         // If workspace auth is expired, try to refresh it using the refresh token.
-        let api_auth = if has_cli_creds {
+        if has_cli_creds {
             None
         } else {
             // For container workspaces, get both workspace and host auth with expiry info
@@ -2881,6 +3081,7 @@ pub fn run_claudecode_turn<'a>(
                                                             true,
                                                             tool_hub,
                                                             status,
+                                                            override_auth_for_continuation,
                                                         ).await;
                                                     }
                                                 }
@@ -3065,8 +3266,27 @@ pub fn run_claudecode_turn<'a>(
         }
 
         let mut result = if had_error {
-            AgentResult::failure(final_result, cost_cents)
-                .with_terminal_reason(TerminalReason::LlmError)
+            // Detect rate limit / overloaded errors for account rotation.
+            //
+            // We check for specific Anthropic error types and HTTP status codes.
+            // Using "overloaded_error" rather than bare "overloaded" to avoid
+            // false positives from tool output or user content.
+            let lower = final_result.to_lowercase();
+            let is_rate_limited = lower.contains("overloaded_error")
+                || lower.contains("rate limit")
+                || lower.contains("rate_limit")
+                || lower.contains("resource_exhausted")
+                || lower.contains("too many requests")
+                || lower.contains("error: 429")
+                || lower.contains("error: 529")
+                || lower.contains("status code: 429")
+                || lower.contains("status code: 529");
+            let reason = if is_rate_limited {
+                TerminalReason::RateLimited
+            } else {
+                TerminalReason::LlmError
+            };
+            AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
         } else {
             AgentResult::success(final_result, cost_cents)
                 .with_terminal_reason(TerminalReason::Completed)
@@ -4445,6 +4665,30 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
                 model_id: model_entry.clone()
             }
         })),
+        "builtin" => {
+            // Point at the local OpenAI-compatible proxy that handles model
+            // chain resolution and failover.  The proxy runs on the same host
+            // and is accessible from shared-network workspaces.
+            let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+            let proxy_key = std::env::var("SANDBOXED_PROXY_SECRET")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    tracing::error!("SANDBOXED_PROXY_SECRET not set; builtin proxy auth will fail");
+                    String::new()
+                });
+            Some(serde_json::json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "Builtin",
+                "models": {
+                    model_id: { "name": model_id }
+                },
+                "options": {
+                    "baseURL": format!("http://127.0.0.1:{}/v1", port),
+                    "apiKey": proxy_key
+                }
+            }))
+        }
         _ => None,
     };
 
@@ -4479,7 +4723,11 @@ fn ensure_opencode_provider_for_model(opencode_config_dir: &std::path::Path, mod
         None => return,
     };
 
-    if let Some(existing) = providers_map.get_mut(provider_id) {
+    if provider_id == "builtin" {
+        // Always overwrite the builtin provider definition — the proxy secret
+        // (options.apiKey) changes on every server restart.
+        providers_map.insert(provider_id.to_string(), provider_def);
+    } else if let Some(existing) = providers_map.get_mut(provider_id) {
         // Provider already exists – make sure the model is listed.
         let obj = match existing.as_object_mut() {
             Some(o) => o,
@@ -6565,62 +6813,13 @@ pub async fn run_opencode_turn(
         return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
     }
 
-    // Acquire provider concurrency permit (e.g. ZAI coding subscription allows ~1 concurrent request).
-    // The permit is held for the entire CLI process lifetime via RAII.
-    let _provider_permit = if let Some(semaphore) = provider_hint
-        .as_deref()
-        .and_then(|p| PROVIDER_SEMAPHORES.get(p))
-    {
-        let provider_name = provider_hint.as_deref().unwrap_or("unknown");
-        let semaphore_timeout_secs: u64 = std::env::var("ZAI_SEMAPHORE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
-        tracing::info!(
-            mission_id = %mission_id,
-            provider = %provider_name,
-            timeout_secs = semaphore_timeout_secs,
-            "Waiting for provider concurrency permit"
-        );
-        let permit = tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!(mission_id = %mission_id, "Cancelled while waiting for provider permit");
-                return AgentResult::failure("Cancelled".to_string(), 0)
-                    .with_terminal_reason(TerminalReason::Cancelled);
-            }
-            result = tokio::time::timeout(
-                std::time::Duration::from_secs(semaphore_timeout_secs),
-                semaphore.acquire(),
-            ) => {
-                match result {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_closed)) => {
-                        return AgentResult::failure(
-                            "Provider semaphore closed unexpectedly".to_string(), 0
-                        ).with_terminal_reason(TerminalReason::LlmError);
-                    }
-                    Err(_timeout) => {
-                        let msg = format!(
-                            "Timed out waiting for {} provider concurrency slot after {}s. \
-                             Another mission may be holding the slot.",
-                            provider_name, semaphore_timeout_secs
-                        );
-                        tracing::warn!(mission_id = %mission_id, "{}", msg);
-                        return AgentResult::failure(msg, 0)
-                            .with_terminal_reason(TerminalReason::RateLimited);
-                    }
-                }
-            }
-        };
-        tracing::info!(
-            mission_id = %mission_id,
-            provider = %provider_name,
-            "Acquired provider concurrency permit"
-        );
-        Some(permit)
-    } else {
-        None
-    };
+    // Note: Provider concurrency semaphores (previously used for ZAI) have been
+    // removed. For `builtin/*` models, rate limit handling is done by the proxy's
+    // waterfall failover and per-account health tracking in ProviderHealthTracker.
+    // For direct provider models (e.g. `zai/*`), OpenCode's own retry logic
+    // handles 429s. The old semaphore only serialized requests — it did not do
+    // failover — so removing it trades slightly higher 429 rates under heavy
+    // concurrency for lower latency in the common case.
 
     let configured_runner = get_opencode_cli_path_from_config(app_working_dir)
         .or_else(|| std::env::var("OPENCODE_CLI_PATH").ok());
@@ -7112,7 +7311,7 @@ pub async fn run_opencode_turn(
                                             let _ = sse_session_idle_tx.send(true);
                                         }
                                         if parsed.session_retry {
-                                            let _ = sse_retry_tx.send_modify(|v| *v += 1);
+                                            sse_retry_tx.send_modify(|v| *v += 1);
                                         }
                                     }
                                 }
@@ -7302,16 +7501,17 @@ pub async fn run_opencode_turn(
                 }
             }
             changed = sse_session_idle_rx.changed() => {
-                if changed.is_ok() && *sse_session_idle_rx.borrow() {
-                    if !session_idle_seen {
-                        session_idle_seen = true;
-                        session_idle_at = Some(std::time::Instant::now());
-                        tracing::debug!(
-                            mission_id = %mission_id,
-                            had_meaningful_work = had_meaningful_work,
-                            "Session idle signal received from SSE"
-                        );
-                    }
+                if changed.is_ok()
+                    && *sse_session_idle_rx.borrow()
+                    && !session_idle_seen
+                {
+                    session_idle_seen = true;
+                    session_idle_at = Some(std::time::Instant::now());
+                    tracing::debug!(
+                        mission_id = %mission_id,
+                        had_meaningful_work = had_meaningful_work,
+                        "Session idle signal received from SSE"
+                    );
                 }
             }
             changed = sse_retry_rx.changed() => {
@@ -7577,7 +7777,7 @@ pub async fn run_opencode_turn(
                                     let _ = sse_session_idle_tx.send(true);
                                 }
                                 if parsed.session_retry {
-                                    let _ = sse_retry_tx.send_modify(|v| *v += 1);
+                                    sse_retry_tx.send_modify(|v| *v += 1);
                                 }
                             }
                         } else {
@@ -8513,8 +8713,23 @@ pub async fn run_amp_turn(
         AgentResult::success(final_result, cost_cents)
             .with_terminal_reason(TerminalReason::Completed)
     } else {
-        AgentResult::failure(final_result, cost_cents)
-            .with_terminal_reason(TerminalReason::LlmError)
+        // Detect rate limit / overloaded errors for account rotation.
+        let lower = final_result.to_lowercase();
+        let is_rate_limited = lower.contains("overloaded_error")
+            || lower.contains("rate limit")
+            || lower.contains("rate_limit")
+            || lower.contains("resource_exhausted")
+            || lower.contains("too many requests")
+            || lower.contains("error: 429")
+            || lower.contains("error: 529")
+            || lower.contains("status code: 429")
+            || lower.contains("status code: 529");
+        let reason = if is_rate_limited {
+            TerminalReason::RateLimited
+        } else {
+            TerminalReason::LlmError
+        };
+        AgentResult::failure(final_result, cost_cents).with_terminal_reason(reason)
     };
 
     if let Some(model) = model_used {
@@ -8578,6 +8793,7 @@ pub async fn run_codex_turn(
     cancel: CancellationToken,
     app_working_dir: &std::path::Path,
     _session_id: Option<&str>,
+    override_api_key: Option<&str>,
 ) -> AgentResult {
     use crate::backend::codex::CodexBackend;
     use crate::backend::events::ExecutionEvent;
@@ -8602,9 +8818,11 @@ pub async fn run_codex_turn(
     }
 
     // Ensure Codex auth.json is present in the workspace context (host or container).
-    if let Err(e) =
-        crate::api::ai_providers::write_codex_credentials_for_workspace(workspace, app_working_dir)
-    {
+    if let Err(e) = crate::api::ai_providers::write_codex_credentials_for_workspace(
+        workspace,
+        app_working_dir,
+        override_api_key,
+    ) {
         tracing::error!("Failed to write Codex credentials: {}", e);
         return AgentResult::failure(
             format!("Failed to configure Codex authentication: {}", e),
@@ -8790,7 +9008,23 @@ pub async fn run_codex_turn(
         AgentResult::success(final_message, 0) // TODO: Calculate cost from Codex usage
             .with_terminal_reason(TerminalReason::Completed)
     } else {
-        AgentResult::failure(final_message, 0).with_terminal_reason(TerminalReason::LlmError)
+        // Detect rate limit / overloaded errors for account rotation.
+        let lower = final_message.to_lowercase();
+        let is_rate_limited = lower.contains("overloaded_error")
+            || lower.contains("rate limit")
+            || lower.contains("rate_limit")
+            || lower.contains("resource_exhausted")
+            || lower.contains("too many requests")
+            || lower.contains("error: 429")
+            || lower.contains("error: 529")
+            || lower.contains("status code: 429")
+            || lower.contains("status code: 529");
+        let reason = if is_rate_limited {
+            TerminalReason::RateLimited
+        } else {
+            TerminalReason::LlmError
+        };
+        AgentResult::failure(final_message, 0).with_terminal_reason(reason)
     };
 
     if let Some(m) = model {

@@ -185,7 +185,7 @@ async fn refresh_openai_oauth_tokens(
 /// return an error.  The caller should fall back to `auth_mode: "chatgpt"` using
 /// the OAuth access_token directly.
 pub async fn ensure_openai_api_key_for_codex(working_dir: &Path) -> Result<(), String> {
-    if get_openai_api_key_for_codex(working_dir).is_some() {
+    if get_openai_api_key_for_codex_default(working_dir).is_some() {
         return Ok(());
     }
 
@@ -311,6 +311,76 @@ fn google_authorize_url(challenge: &str, state: &str) -> Result<String, String> 
         .append_pair("prompt", "consent");
 
     Ok(url.to_string())
+}
+
+/// Build [`StandardAccount`] entries for all standard (non-custom) providers
+/// that have API-key credentials in OpenCode's `auth.json`.
+///
+/// These are used by chain resolution to include standard providers alongside
+/// custom providers from `AIProviderStore`.
+pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health::StandardAccount> {
+    let config_path = get_opencode_config_path(working_dir);
+    let opencode_config = read_opencode_config(&config_path).unwrap_or_default();
+    let auth = read_opencode_auth().unwrap_or_else(|_| serde_json::json!({}));
+    let auth_obj = auth.as_object();
+
+    let mut accounts = Vec::new();
+    let mut seen_types = std::collections::HashSet::new();
+
+    // Iterate over all keys in auth.json
+    let Some(auth_map) = auth_obj else {
+        return accounts;
+    };
+
+    for (key, value) in auth_map {
+        let Some(provider_type) = ProviderType::from_id(key.as_str()) else {
+            continue;
+        };
+        // Skip custom/amp providers — they live in AIProviderStore / backend config
+        if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
+            continue;
+        }
+        // Extract actual API key from the auth entry.
+        // Check all field name variants for consistency with get_api_key_for_provider.
+        let api_key = value
+            .get("key")
+            .or_else(|| value.get("api_key"))
+            .or_else(|| value.get("apiKey"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string());
+
+        // Only include accounts that have a non-empty API key
+        if api_key.is_none() {
+            continue;
+        }
+
+        // Skip duplicates — e.g. "openai" and "codex" both map to OpenAI.
+        // Must come after the api_key check so a keyless alias doesn't
+        // shadow a valid one.
+        if !seen_types.insert(provider_type) {
+            continue;
+        }
+
+        // Check if this provider is disabled in opencode.json
+        let config_entry = get_provider_config_entry(&opencode_config, provider_type);
+        if let Some(ref entry) = config_entry {
+            if entry.enabled == Some(false) {
+                continue;
+            }
+        }
+
+        let base_url = config_entry.and_then(|e| e.base_url);
+
+        accounts.push(crate::provider_health::StandardAccount {
+            account_id: crate::provider_health::stable_provider_uuid(provider_type.id()),
+            provider_type,
+            api_key,
+            base_url,
+        });
+    }
+
+    accounts
 }
 
 /// Create AI provider routes.
@@ -772,25 +842,49 @@ fn get_anthropic_auth_from_opencode_auth() -> Option<ClaudeCodeAuth> {
 
 /// Get Anthropic API key or OAuth access token from Open Agent's ai_providers.json.
 fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCodeAuth> {
+    get_all_anthropic_auth_from_ai_providers(working_dir)
+        .into_iter()
+        .next()
+}
+
+/// Get all Anthropic credentials from ai_providers.json, sorted by priority.
+fn get_all_anthropic_auth_from_ai_providers(working_dir: &Path) -> Vec<ClaudeCodeAuth> {
     let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
-    if !ai_providers_path.exists() {
-        return None;
-    }
+    let contents = match std::fs::read_to_string(&ai_providers_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let providers: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
 
-    let contents = std::fs::read_to_string(&ai_providers_path).ok()?;
-    let providers: Vec<serde_json::Value> = serde_json::from_str(&contents).ok()?;
+    // Collect (priority, insertion_index, auth) for deterministic sorting.
+    // The insertion index breaks ties when multiple accounts share the same priority.
+    let mut entries: Vec<(u32, usize, ClaudeCodeAuth)> = Vec::new();
 
-    // Find Anthropic provider
-    for provider in providers {
+    for (idx, provider) in providers.iter().enumerate() {
         let provider_type = provider.get("provider_type").and_then(|v| v.as_str());
         if provider_type != Some("anthropic") {
             continue;
         }
+        let enabled = provider
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        let priority = provider
+            .get("priority")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
 
         // Check for API key first
         if let Some(api_key) = provider.get("api_key").and_then(|v| v.as_str()) {
-            if !api_key.is_empty() {
-                return Some(ClaudeCodeAuth::ApiKey(api_key.to_string()));
+            if !api_key.trim().is_empty() {
+                entries.push((priority, idx, ClaudeCodeAuth::ApiKey(api_key.to_string())));
+                continue;
             }
         }
 
@@ -798,13 +892,222 @@ fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCode
         if let Some(oauth) = provider.get("oauth") {
             if let Some(access_token) = oauth.get("access_token").and_then(|v| v.as_str()) {
                 if !access_token.is_empty() {
-                    return Some(ClaudeCodeAuth::OAuthToken(access_token.to_string()));
+                    entries.push((
+                        priority,
+                        idx,
+                        ClaudeCodeAuth::OAuthToken(access_token.to_string()),
+                    ));
                 }
             }
         }
     }
 
-    None
+    entries.sort_by_key(|(p, i, _)| (*p, *i));
+    entries.into_iter().map(|(_, _, auth)| auth).collect()
+}
+
+/// Get all available Anthropic credentials for Claude Code, in priority order.
+///
+/// Collects credentials from all sources:
+/// 1. OpenCode auth.json (anthropic entry)
+/// 2. ai_providers.json (potentially multiple accounts, sorted by priority)
+/// 3. Claude CLI credentials file
+///
+/// Used for account rotation: when one account hits a rate limit, the mission
+/// runner can try the next credential in the list.
+pub fn get_all_anthropic_auth_for_claudecode(working_dir: &Path) -> Vec<ClaudeCodeAuth> {
+    let mut all_auth = Vec::new();
+    let mut seen_tokens = std::collections::HashSet::new();
+
+    // Helper to deduplicate by credential value
+    let mut push_unique = |auth: ClaudeCodeAuth| {
+        let key = match &auth {
+            ClaudeCodeAuth::ApiKey(k) => k.clone(),
+            ClaudeCodeAuth::OAuthToken(t) => t.clone(),
+        };
+        if seen_tokens.insert(key) {
+            all_auth.push(auth);
+        }
+    };
+
+    // 1. OpenCode auth.json (highest priority — it's the "default" credential)
+    if let Some(auth) = get_anthropic_auth_from_opencode_auth() {
+        push_unique(auth);
+    }
+
+    // 2. ai_providers.json (multi-account, sorted by priority)
+    for auth in get_all_anthropic_auth_from_ai_providers(working_dir) {
+        push_unique(auth);
+    }
+
+    // 3. Claude CLI credentials
+    if let Some(auth) = get_anthropic_auth_from_claude_cli_credentials() {
+        push_unique(auth);
+    }
+
+    all_auth
+}
+
+/// Get all available OpenAI API keys for Codex account rotation, in priority order.
+///
+/// Collects keys from all sources:
+/// 1. OPENAI_API_KEY environment variable
+/// 2. OpenCode auth.json (openai entry)
+/// 3. ai_providers.json (potentially multiple OpenAI accounts, sorted by priority)
+///
+/// Used for account rotation: when one account hits a rate limit, the mission
+/// runner can try the next key in the list.
+pub fn get_all_openai_keys_for_codex(working_dir: &Path) -> Vec<String> {
+    let mut all_keys = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push_unique = |key: String| {
+        if seen.insert(key.clone()) {
+            all_keys.push(key);
+        }
+    };
+
+    // 1. OPENAI_API_KEY env var (highest priority — it's the "default" credential)
+    if let Ok(value) = std::env::var("OPENAI_API_KEY") {
+        if !value.trim().is_empty() {
+            push_unique(value);
+        }
+    }
+
+    // 2. OpenCode auth.json
+    if let Some(key) = get_openai_api_key_from_opencode_auth() {
+        push_unique(key);
+    }
+
+    // 3. ai_providers.json (multi-account, sorted by priority)
+    for key in get_all_openai_keys_from_ai_providers(working_dir) {
+        push_unique(key);
+    }
+
+    all_keys
+}
+
+/// Get all OpenAI API keys from ai_providers.json, sorted by priority.
+fn get_all_openai_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
+    let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
+    let contents = match std::fs::read_to_string(&ai_providers_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let providers: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut entries: Vec<(u32, usize, String)> = Vec::new();
+
+    for (idx, provider) in providers.iter().enumerate() {
+        let provider_type = provider.get("provider_type").and_then(|v| v.as_str());
+        if provider_type != Some("openai") {
+            continue;
+        }
+        let enabled = provider
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        let priority = provider
+            .get("priority")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        if let Some(api_key) = provider.get("api_key").and_then(|v| v.as_str()) {
+            if !api_key.trim().is_empty() {
+                entries.push((priority, idx, api_key.to_string()));
+            }
+        }
+    }
+
+    entries.sort_by_key(|(p, i, _)| (*p, *i));
+    entries.into_iter().map(|(_, _, key)| key).collect()
+}
+
+/// Get all available Amp API keys for account rotation, in priority order.
+///
+/// Collects keys from all sources:
+/// 1. Backend config (backend_config.json amp.settings.api_key)
+/// 2. AMP_API_KEY environment variable
+/// 3. ai_providers.json (Amp provider entries, sorted by priority)
+///
+/// Used for account rotation: when one account hits a rate limit, the mission
+/// runner can try the next key in the list.
+pub fn get_all_amp_api_keys(working_dir: &Path) -> Vec<String> {
+    let mut all_keys = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    let mut push_unique = |key: String| {
+        if seen.insert(key.clone()) {
+            all_keys.push(key);
+        }
+    };
+
+    // 1. Backend config (highest priority — user-configured in UI)
+    if let Some(key) = super::mission_runner::get_amp_api_key_from_config() {
+        push_unique(key);
+    }
+
+    // 2. AMP_API_KEY env var
+    if let Ok(value) = std::env::var("AMP_API_KEY") {
+        if !value.trim().is_empty() {
+            push_unique(value);
+        }
+    }
+
+    // 3. ai_providers.json (Amp provider entries, sorted by priority)
+    for key in get_all_amp_keys_from_ai_providers(working_dir) {
+        push_unique(key);
+    }
+
+    all_keys
+}
+
+/// Get all Amp API keys from ai_providers.json, sorted by priority.
+fn get_all_amp_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
+    let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
+    let contents = match std::fs::read_to_string(&ai_providers_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let providers: Vec<serde_json::Value> = match serde_json::from_str(&contents) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut entries: Vec<(u32, usize, String)> = Vec::new();
+
+    for (idx, provider) in providers.iter().enumerate() {
+        let provider_type = provider.get("provider_type").and_then(|v| v.as_str());
+        if provider_type != Some("amp") {
+            continue;
+        }
+        let enabled = provider
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        let priority = provider
+            .get("priority")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        if let Some(api_key) = provider.get("api_key").and_then(|v| v.as_str()) {
+            if !api_key.trim().is_empty() {
+                entries.push((priority, idx, api_key.to_string()));
+            }
+        }
+    }
+
+    entries.sort_by_key(|(p, i, _)| (*p, *i));
+    entries.into_iter().map(|(_, _, key)| key).collect()
 }
 
 /// Get Anthropic auth from Claude CLI's own credentials file.
@@ -942,26 +1245,9 @@ fn get_openai_api_key_from_opencode_auth() -> Option<String> {
 }
 
 fn get_openai_api_key_from_ai_providers(working_dir: &Path) -> Option<String> {
-    let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
-    if !ai_providers_path.exists() {
-        return None;
-    }
-
-    let contents = std::fs::read_to_string(&ai_providers_path).ok()?;
-    let providers: Vec<serde_json::Value> = serde_json::from_str(&contents).ok()?;
-
-    for provider in providers {
-        if provider.get("provider_type").and_then(|v| v.as_str()) != Some("openai") {
-            continue;
-        }
-        let api_key = provider.get("api_key").and_then(|v| v.as_str())?;
-        if api_key.trim().is_empty() {
-            continue;
-        }
-        return Some(api_key.to_string());
-    }
-
-    None
+    get_all_openai_keys_from_ai_providers(working_dir)
+        .into_iter()
+        .next()
 }
 
 fn upsert_openai_api_key_in_ai_providers(working_dir: &Path, api_key: &str) -> Result<(), String> {
@@ -1007,7 +1293,9 @@ fn upsert_openai_api_key_in_ai_providers(working_dir: &Path, api_key: &str) -> R
     Ok(())
 }
 
-fn get_openai_api_key_for_codex(working_dir: &Path) -> Option<String> {
+/// Returns the default OpenAI API key for Codex (env var > auth.json > ai_providers.json).
+/// Public so the mission runner can determine which key was already used on the initial attempt.
+pub fn get_openai_api_key_for_codex_default(working_dir: &Path) -> Option<String> {
     if let Ok(value) = std::env::var("OPENAI_API_KEY") {
         if !value.trim().is_empty() {
             return Some(value);
@@ -1240,6 +1528,7 @@ pub fn read_openai_oauth_access_token() -> Option<String> {
 pub fn write_codex_credentials_for_workspace(
     workspace: &crate::workspace::Workspace,
     working_dir: &Path,
+    override_api_key: Option<&str>,
 ) -> Result<(), String> {
     use crate::workspace::WorkspaceType;
 
@@ -1255,8 +1544,13 @@ pub fn write_codex_credentials_for_workspace(
         }
     };
 
+    // Priority 0: Use the override key if provided (used during account rotation
+    // to avoid mutating the process-global OPENAI_API_KEY env var).
     // Priority 1: Use a minted API key if available.
-    if let Some(api_key) = get_openai_api_key_for_codex(working_dir) {
+    if let Some(api_key) = override_api_key
+        .map(|s| s.to_string())
+        .or_else(|| get_openai_api_key_for_codex_default(working_dir))
+    {
         write_codex_auth_json_apikey(&codex_dir, &api_key)?;
         tracing::info!(
             workspace_id = %workspace.id,
@@ -1304,6 +1598,12 @@ pub struct ProviderTypeInfo {
 pub struct CreateProviderRequest {
     pub provider_type: ProviderType,
     pub name: String,
+    /// Optional label to distinguish multiple accounts of the same provider type
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Priority order for fallback chains (lower = higher priority)
+    #[serde(default)]
+    pub priority: Option<u32>,
     /// Optional Google Cloud project ID (for Google provider)
     #[serde(default)]
     pub google_project_id: Option<String>,
@@ -1338,6 +1638,10 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 pub struct UpdateProviderRequest {
     pub name: Option<String>,
+    /// Optional label to distinguish multiple accounts of the same provider type
+    pub label: Option<Option<String>>,
+    /// Priority order for fallback chains (lower = higher priority)
+    pub priority: Option<u32>,
     /// Optional Google Cloud project ID update (for Google provider)
     pub google_project_id: Option<Option<String>>,
     pub api_key: Option<Option<String>>,
@@ -1353,6 +1657,12 @@ pub struct ProviderResponse {
     pub provider_type: ProviderType,
     pub provider_type_name: String,
     pub name: String,
+    /// Optional label to distinguish multiple accounts of the same provider type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Priority order for fallback chains (lower = higher priority)
+    #[serde(default)]
+    pub priority: u32,
     pub google_project_id: Option<String>,
     pub has_api_key: bool,
     pub has_oauth: bool,
@@ -1476,6 +1786,8 @@ fn build_provider_response(
         provider_type,
         provider_type_name: provider_type.display_name().to_string(),
         name,
+        label: None,
+        priority: 0,
         google_project_id,
         has_api_key: matches!(auth, Some(AuthKind::ApiKey)),
         has_oauth: matches!(auth, Some(AuthKind::OAuth)),
@@ -2923,7 +3235,7 @@ fn write_opencode_provider_auth_file(
 
 fn opencode_auth_keys(provider_type: ProviderType) -> Vec<&'static str> {
     match provider_type {
-        ProviderType::Custom => Vec::new(),
+        ProviderType::Custom | ProviderType::Amp => Vec::new(),
         ProviderType::OpenAI => vec!["openai", "codex"],
         _ => vec![provider_type.id()],
     }
@@ -3523,10 +3835,46 @@ async fn list_provider_types() -> Json<Vec<ProviderTypeInfo>> {
             env_var: Some("MINIMAX_API_KEY".to_string()),
         },
         ProviderTypeInfo {
+            id: "deep-infra".to_string(),
+            name: "DeepInfra".to_string(),
+            uses_oauth: false,
+            env_var: Some("DEEPINFRA_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
+            id: "cerebras".to_string(),
+            name: "Cerebras".to_string(),
+            uses_oauth: false,
+            env_var: Some("CEREBRAS_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
+            id: "together-ai".to_string(),
+            name: "Together AI".to_string(),
+            uses_oauth: false,
+            env_var: Some("TOGETHER_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
+            id: "perplexity".to_string(),
+            name: "Perplexity".to_string(),
+            uses_oauth: false,
+            env_var: Some("PERPLEXITY_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
+            id: "cohere".to_string(),
+            name: "Cohere".to_string(),
+            uses_oauth: false,
+            env_var: Some("COHERE_API_KEY".to_string()),
+        },
+        ProviderTypeInfo {
             id: "github-copilot".to_string(),
             name: "GitHub Copilot".to_string(),
             uses_oauth: true,
             env_var: None,
+        },
+        ProviderTypeInfo {
+            id: "amp".to_string(),
+            name: "Amp".to_string(),
+            uses_oauth: false,
+            env_var: Some("AMP_API_KEY".to_string()),
         },
     ];
     Json(types)
@@ -3574,16 +3922,24 @@ async fn list_providers(
         })
         .collect();
 
-    // Also include custom providers from AIProviderStore
-    let custom_providers = state.ai_providers.list().await;
-    for provider in custom_providers {
-        if provider.provider_type == ProviderType::Custom && provider.enabled {
+    // Also include providers from AIProviderStore (Custom and Amp)
+    let store_providers = state.ai_providers.list().await;
+    for provider in store_providers {
+        let pt = provider.provider_type;
+        if pt == ProviderType::Custom || pt == ProviderType::Amp {
             let now = chrono::Utc::now();
+            let default_backend = if pt == ProviderType::Amp {
+                "amp".to_string()
+            } else {
+                "opencode".to_string()
+            };
             providers.push(ProviderResponse {
                 id: provider.id.to_string(),
-                provider_type: ProviderType::Custom,
-                provider_type_name: "Custom".to_string(),
+                provider_type: pt,
+                provider_type_name: pt.display_name().to_string(),
                 name: provider.name.clone(),
+                label: provider.label.clone(),
+                priority: provider.priority,
                 google_project_id: None,
                 has_api_key: provider.api_key.is_some(),
                 has_oauth: false,
@@ -3595,12 +3951,12 @@ async fn list_providers(
                 is_default: provider.is_default,
                 uses_oauth: false,
                 auth_methods: vec![],
-                status: if provider.base_url.is_some() {
+                status: if provider.api_key.is_some() || provider.base_url.is_some() {
                     ProviderStatusResponse::Connected
                 } else {
                     ProviderStatusResponse::NeedsAuth { auth_url: None }
                 },
-                use_for_backends: vec!["opencode".to_string()], // Custom providers work with OpenCode
+                use_for_backends: vec![default_backend],
                 created_at: now,
                 updated_at: now,
             });
@@ -3989,10 +4345,32 @@ async fn create_provider(
 
     let provider_type = req.provider_type;
 
-    // For custom providers, store in AIProviderStore (ai_providers.json)
-    // so that workspace preparation can read custom models and base URL
-    if provider_type == ProviderType::Custom {
+    // label and priority are only supported for providers stored in AIProviderStore
+    // (Custom and Amp). Standard providers are stored in OpenCode's config which
+    // doesn't support these fields.
+    if provider_type != ProviderType::Custom && provider_type != ProviderType::Amp {
+        if req.label.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "label is only supported for custom/amp providers".to_string(),
+            ));
+        }
+        if req.priority.is_some() && req.priority != Some(0) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "priority is only supported for custom/amp providers".to_string(),
+            ));
+        }
+    }
+
+    // For custom providers and Amp, store in AIProviderStore (ai_providers.json).
+    // Custom: workspace preparation reads custom models and base URL from here.
+    // Amp: keys are read by get_all_amp_keys_from_ai_providers() for rotation.
+    //       Amp doesn't use OpenCode's auth.json (opencode_auth_keys returns []).
+    if provider_type == ProviderType::Custom || provider_type == ProviderType::Amp {
         let mut provider = crate::ai_providers::AIProvider::new(provider_type, req.name.clone());
+        provider.label = req.label.clone();
+        provider.priority = req.priority.unwrap_or(0);
         provider.base_url = req.base_url.clone();
         provider.api_key = req.api_key.clone();
         provider.custom_models = req.custom_models.clone();
@@ -4003,18 +4381,25 @@ async fn create_provider(
         state.ai_providers.add(provider.clone()).await;
 
         tracing::info!(
-            "Created custom AI provider: {} with {} models",
+            "Created {} AI provider: {} ({})",
+            provider_type.display_name(),
             req.name,
-            req.custom_models.as_ref().map(|m| m.len()).unwrap_or(0)
+            provider.id
         );
 
-        // Return a response for custom provider
         let now = chrono::Utc::now();
+        let default_backend = if provider_type == ProviderType::Amp {
+            "amp".to_string()
+        } else {
+            "opencode".to_string()
+        };
         return Ok(Json(ProviderResponse {
             id: provider.id.to_string(),
-            provider_type: ProviderType::Custom,
-            provider_type_name: "Custom".to_string(),
+            provider_type,
+            provider_type_name: provider_type.display_name().to_string(),
             name: req.name,
+            label: req.label,
+            priority: req.priority.unwrap_or(0),
             google_project_id: None,
             has_api_key: req.api_key.is_some(),
             has_oauth: false,
@@ -4031,7 +4416,9 @@ async fn create_provider(
             } else {
                 ProviderStatusResponse::NeedsAuth { auth_url: None }
             },
-            use_for_backends: vec!["opencode".to_string()], // Custom providers work with OpenCode
+            use_for_backends: req
+                .use_for_backends
+                .unwrap_or_else(|| vec![default_backend]),
             created_at: now,
             updated_at: now,
         }));
@@ -4134,9 +4521,6 @@ async fn update_provider(
     AxumPath(id): AxumPath<String>,
     Json(req): Json<UpdateProviderRequest>,
 ) -> Result<Json<ProviderResponse>, (StatusCode, String)> {
-    let provider_type = ProviderType::from_id(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-
     if let Some(ref name) = req.name {
         if name.is_empty() {
             return Err((StatusCode::BAD_REQUEST, "Name cannot be empty".to_string()));
@@ -4147,6 +4531,29 @@ async fn update_provider(
         if url::Url::parse(base_url).is_err() {
             return Err((StatusCode::BAD_REQUEST, "Invalid URL format".to_string()));
         }
+    }
+
+    // Try UUID first (store-based providers: Amp, Custom)
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        return update_store_provider(&state, uuid, req).await;
+    }
+
+    // Otherwise, treat as provider type ID (standard providers)
+    let provider_type = ProviderType::from_id(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+
+    // label and priority are only supported for providers stored in AIProviderStore
+    if req.label.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "label is only supported for custom/amp providers".to_string(),
+        ));
+    }
+    if req.priority.is_some() && req.priority != Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "priority is only supported for custom/amp providers".to_string(),
+        ));
     }
 
     let config_path = get_opencode_config_path(&state.config.working_dir);
@@ -4212,11 +4619,120 @@ async fn update_provider(
     Ok(Json(response))
 }
 
+/// Update a store-based provider (Amp, Custom) by UUID.
+async fn update_store_provider(
+    state: &Arc<super::routes::AppState>,
+    uuid: uuid::Uuid,
+    req: UpdateProviderRequest,
+) -> Result<Json<ProviderResponse>, (StatusCode, String)> {
+    let providers = state.ai_providers.list().await;
+    let existing = providers
+        .into_iter()
+        .find(|p| p.id == uuid)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Provider {} not found", uuid),
+            )
+        })?;
+
+    let mut updated = existing.clone();
+    if let Some(name) = req.name {
+        updated.name = name;
+    }
+    if let Some(label) = req.label {
+        updated.label = label;
+    }
+    if let Some(priority) = req.priority {
+        updated.priority = priority;
+    }
+    if let Some(base_url) = req.base_url {
+        updated.base_url = base_url;
+    }
+    if let Some(enabled) = req.enabled {
+        updated.enabled = enabled;
+    }
+    if let Some(api_key_update) = req.api_key {
+        updated.api_key = api_key_update;
+    }
+
+    let result = state
+        .ai_providers
+        .update(uuid, updated.clone())
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to update provider".to_string(),
+            )
+        })?;
+
+    let pt = result.provider_type;
+    let default_backend = if pt == ProviderType::Amp {
+        "amp".to_string()
+    } else {
+        "opencode".to_string()
+    };
+    let now = chrono::Utc::now();
+    let has_credentials = result.api_key.is_some() || result.base_url.is_some();
+    let response = ProviderResponse {
+        id: result.id.to_string(),
+        provider_type: pt,
+        provider_type_name: pt.display_name().to_string(),
+        name: result.name,
+        label: result.label,
+        priority: result.priority,
+        google_project_id: None,
+        has_api_key: result.api_key.is_some(),
+        has_oauth: false,
+        base_url: result.base_url,
+        custom_models: result.custom_models,
+        custom_env_var: result.custom_env_var,
+        npm_package: result.npm_package,
+        enabled: result.enabled,
+        is_default: result.is_default,
+        uses_oauth: false,
+        auth_methods: vec![],
+        status: if has_credentials {
+            ProviderStatusResponse::Connected
+        } else {
+            ProviderStatusResponse::NeedsAuth { auth_url: None }
+        },
+        use_for_backends: vec![default_backend],
+        created_at: now,
+        updated_at: result.updated_at,
+    };
+
+    tracing::info!(
+        "Updated {} provider: {} ({})",
+        pt.display_name(),
+        response.name,
+        uuid
+    );
+
+    Ok(Json(response))
+}
+
 /// DELETE /api/ai/providers/:id - Delete a provider.
+///
+/// The `:id` param can be either a provider type ID (e.g. "anthropic") for
+/// standard providers, or a UUID for store-based providers (Amp, Custom).
 async fn delete_provider(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
+    // Try UUID first (store-based providers: Amp, Custom)
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        if state.ai_providers.delete(uuid).await {
+            return Ok((
+                StatusCode::OK,
+                format!("Provider {} deleted successfully", id),
+            ));
+        }
+        return Err((StatusCode::NOT_FOUND, format!("Provider {} not found", id)));
+    }
+
+    // Otherwise, treat as provider type ID (standard providers)
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     let config_path = get_opencode_config_path(&state.config.working_dir);
@@ -4250,9 +4766,34 @@ async fn delete_provider(
 
 /// POST /api/ai/providers/:id/auth - Initiate authentication for a provider.
 async fn authenticate_provider(
-    State(_state): State<Arc<super::routes::AppState>>,
+    State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<AuthResponse>, (StatusCode, String)> {
+    // Try UUID first (store-based providers: Amp, Custom)
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        let provider = state
+            .ai_providers
+            .get(uuid)
+            .await
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+
+        // Store-based providers: connected if they have an API key or a base URL
+        let has_credentials = provider
+            .api_key
+            .as_ref()
+            .is_some_and(|k| !k.trim().is_empty())
+            || provider.base_url.is_some();
+        return Ok(Json(AuthResponse {
+            success: has_credentials,
+            message: if has_credentials {
+                "Provider is authenticated".to_string()
+            } else {
+                "API key is required for this provider".to_string()
+            },
+            auth_url: None,
+        }));
+    }
+
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -4303,6 +4844,55 @@ async fn set_default(
     State(state): State<Arc<super::routes::AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ProviderResponse>, (StatusCode, String)> {
+    // Try UUID first (store-based providers: Amp, Custom)
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        let provider = state
+            .ai_providers
+            .get(uuid)
+            .await
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
+        state.ai_providers.set_default(uuid).await;
+
+        let pt = provider.provider_type;
+        let default_backend = if pt == ProviderType::Amp {
+            "amp".to_string()
+        } else {
+            "opencode".to_string()
+        };
+        let now = chrono::Utc::now();
+        let has_credentials = provider.api_key.is_some() || provider.base_url.is_some();
+        let response = ProviderResponse {
+            id: provider.id.to_string(),
+            provider_type: pt,
+            provider_type_name: pt.display_name().to_string(),
+            name: provider.name,
+            label: provider.label,
+            priority: provider.priority,
+            google_project_id: None,
+            has_api_key: provider.api_key.is_some(),
+            has_oauth: false,
+            base_url: provider.base_url,
+            custom_models: provider.custom_models,
+            custom_env_var: provider.custom_env_var,
+            npm_package: provider.npm_package,
+            enabled: provider.enabled,
+            is_default: true,
+            uses_oauth: false,
+            auth_methods: vec![],
+            status: if has_credentials {
+                ProviderStatusResponse::Connected
+            } else {
+                ProviderStatusResponse::NeedsAuth { auth_url: None }
+            },
+            use_for_backends: vec![default_backend],
+            created_at: now,
+            updated_at: provider.updated_at,
+        };
+        tracing::info!("Set default AI provider: {} ({})", response.name, id);
+        return Ok(Json(response));
+    }
+
+    // Standard providers: by type ID
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     write_default_provider_state(&state.config.working_dir, provider_type)

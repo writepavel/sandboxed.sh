@@ -104,6 +104,7 @@ pub enum ProviderType {
     GithubCopilot,
     Zai,
     Minimax,
+    Amp,
     Custom,
 }
 
@@ -127,6 +128,7 @@ impl ProviderType {
             Self::GithubCopilot => "GitHub Copilot",
             Self::Zai => "Z.AI",
             Self::Minimax => "Minimax",
+            Self::Amp => "Amp",
             Self::Custom => "Custom",
         }
     }
@@ -150,6 +152,7 @@ impl ProviderType {
             Self::GithubCopilot => "github-copilot",
             Self::Zai => "zai",
             Self::Minimax => "minimax",
+            Self::Amp => "amp",
             Self::Custom => "custom",
         }
     }
@@ -174,6 +177,7 @@ impl ProviderType {
             "github-copilot" => Some(Self::GithubCopilot),
             "zai" => Some(Self::Zai),
             "minimax" => Some(Self::Minimax),
+            "amp" => Some(Self::Amp),
             "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -198,6 +202,7 @@ impl ProviderType {
             Self::GithubCopilot => None, // Uses OAuth
             Self::Zai => Some("ZHIPU_API_KEY"),
             Self::Minimax => Some("MINIMAX_API_KEY"),
+            Self::Amp => Some("AMP_API_KEY"),
             Self::Custom => None,
         }
     }
@@ -291,6 +296,13 @@ pub struct AIProvider {
     pub provider_type: ProviderType,
     /// Human-readable name (e.g., "My Claude Account", "Work OpenAI")
     pub name: String,
+    /// Optional label to distinguish multiple accounts of the same provider type
+    /// (e.g., "Thomas (OAuth)", "Ben (OAuth)", "Team (API key)")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Priority order for fallback chains (lower = higher priority, used first)
+    #[serde(default)]
+    pub priority: u32,
     /// Optional Google Cloud project ID (required for Gemini via OpenCode)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub google_project_id: Option<String>,
@@ -349,6 +361,8 @@ impl AIProvider {
             id: Uuid::new_v4(),
             provider_type,
             name,
+            label: None,
+            priority: 0,
             google_project_id: None,
             api_key: None,
             oauth: None,
@@ -430,7 +444,10 @@ impl AIProviderStore {
         let contents = serde_json::to_string_pretty(&providers_vec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        std::fs::write(&self.storage_path, contents)?;
+        // Write-then-rename for crash safety (atomic on POSIX)
+        let tmp_path = self.storage_path.with_extension("tmp");
+        std::fs::write(&tmp_path, contents)?;
+        std::fs::rename(&tmp_path, &self.storage_path)?;
         Ok(())
     }
 
@@ -447,24 +464,46 @@ impl AIProviderStore {
         providers.get(&id).cloned()
     }
 
-    /// Get the default provider (first enabled, or first overall).
+    /// Get the default provider (first enabled default, or highest-priority enabled).
     pub async fn get_default(&self) -> Option<AIProvider> {
         let providers = self.providers.read().await;
         // Find the one marked as default
         if let Some(provider) = providers.values().find(|p| p.is_default && p.enabled) {
             return Some(provider.clone());
         }
-        // Fallback to first enabled
-        providers.values().find(|p| p.enabled).cloned()
+        // Fallback to highest-priority enabled (UUID tiebreaker for determinism)
+        providers
+            .values()
+            .filter(|p| p.enabled)
+            .min_by_key(|p| (p.priority, p.id))
+            .cloned()
     }
 
-    /// Get provider by type.
+    /// Get highest-priority enabled provider by type.
+    ///
+    /// When multiple accounts exist for the same provider type, returns the one
+    /// with the lowest `priority` value (i.e. highest priority).  Ties are
+    /// broken by UUID for deterministic ordering.
     pub async fn get_by_type(&self, provider_type: ProviderType) -> Option<AIProvider> {
         let providers = self.providers.read().await;
         providers
             .values()
-            .find(|p| p.provider_type == provider_type && p.enabled)
+            .filter(|p| p.provider_type == provider_type && p.enabled)
+            .min_by_key(|p| (p.priority, p.id))
             .cloned()
+    }
+
+    /// Get all providers of a given type, sorted by priority (lower = higher priority).
+    /// Ties are broken by UUID for deterministic ordering.
+    pub async fn get_all_by_type(&self, provider_type: ProviderType) -> Vec<AIProvider> {
+        let providers = self.providers.read().await;
+        let mut matched: Vec<AIProvider> = providers
+            .values()
+            .filter(|p| p.provider_type == provider_type && p.enabled)
+            .cloned()
+            .collect();
+        matched.sort_by_key(|p| (p.priority, p.id));
+        matched
     }
 
     pub async fn add(&self, provider: AIProvider) -> Uuid {

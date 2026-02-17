@@ -89,6 +89,7 @@ export {
   type ProvidersResponse,
   type BackendModelOption,
   type BackendModelOptionsResponse,
+  type CustomModel,
   listAIProviders,
   listAIProviderTypes,
   getAIProvider,
@@ -104,6 +105,23 @@ export {
   listProviders,
   listBackendModelOptions,
 } from "./providers";
+
+// Model Routing
+export {
+  type ChainEntry,
+  type ModelChain,
+  type ResolvedEntry,
+  type AccountHealthSnapshot,
+  type FallbackEvent,
+  listModelChains,
+  createModelChain,
+  updateModelChain,
+  deleteModelChain,
+  resolveModelChain,
+  listAccountHealth,
+  clearAccountCooldown,
+  listFallbackEvents,
+} from "./model-routing";
 
 // Automations
 export {

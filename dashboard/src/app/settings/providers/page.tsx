@@ -38,6 +38,12 @@ const providerConfig: Record<string, { color: string; icon: string }> = {
   zai: { color: 'bg-cyan-500/10 text-cyan-400', icon: 'Z' },
   minimax: { color: 'bg-teal-500/10 text-teal-400', icon: 'M' },
   'github-copilot': { color: 'bg-gray-500/10 text-gray-400', icon: '🐙' },
+  'deep-infra': { color: 'bg-blue-500/10 text-blue-400', icon: '🔗' },
+  cerebras: { color: 'bg-lime-500/10 text-lime-400', icon: 'C' },
+  'together-ai': { color: 'bg-orange-500/10 text-orange-400', icon: '🤝' },
+  perplexity: { color: 'bg-cyan-500/10 text-cyan-400', icon: '🔍' },
+  cohere: { color: 'bg-rose-500/10 text-rose-400', icon: '💬' },
+  amp: { color: 'bg-violet-500/10 text-violet-400', icon: 'A' },
   custom: { color: 'bg-white/10 text-white/60', icon: '🔧' },
 };
 
@@ -56,6 +62,7 @@ const defaultProviderTypes: AIProviderTypeInfo[] = [
   { id: 'zai', name: 'Z.AI', uses_oauth: false, env_var: 'ZHIPU_API_KEY' },
   { id: 'minimax', name: 'Minimax', uses_oauth: false, env_var: 'MINIMAX_API_KEY' },
   { id: 'github-copilot', name: 'GitHub Copilot', uses_oauth: true, env_var: null },
+  { id: 'amp', name: 'Amp', uses_oauth: false, env_var: 'AMP_API_KEY' },
 ];
 
 export default function ProvidersPage() {
@@ -64,6 +71,7 @@ export default function ProvidersPage() {
   const [editingProvider, setEditingProvider] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<{
     name?: string;
+    label?: string;
     google_project_id?: string;
     api_key?: string;
     base_url?: string;
@@ -119,6 +127,7 @@ export default function ProvidersPage() {
   };
 
   const handleDeleteProvider = async (id: string) => {
+    if (!confirm('Are you sure you want to delete this provider?')) return;
     try {
       await deleteAIProvider(id);
       toast.success('Provider removed');
@@ -134,6 +143,7 @@ export default function ProvidersPage() {
     setEditingProvider(provider.id);
     setEditForm({
       name: provider.name,
+      label: provider.label || '',
       google_project_id: provider.google_project_id ?? '',
       api_key: '',
       base_url: provider.base_url || '',
@@ -144,9 +154,14 @@ export default function ProvidersPage() {
   const handleSaveEdit = async () => {
     if (!editingProvider) return;
 
+    const provider = providers.find((p) => p.id === editingProvider);
+    const isCustom = provider?.provider_type === 'custom';
+
     try {
       await updateAIProvider(editingProvider, {
         name: editForm.name,
+        // label is only accepted by the backend for custom providers
+        ...(isCustom ? { label: editForm.label?.trim() || null } : {}),
         google_project_id:
           editForm.google_project_id === ''
             ? null
@@ -251,6 +266,17 @@ export default function ProvidersPage() {
                           placeholder="Name"
                           className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
                         />
+                        {provider.provider_type === 'custom' && (
+                          <input
+                            type="text"
+                            value={editForm.label ?? ''}
+                            onChange={(e) =>
+                              setEditForm({ ...editForm, label: e.target.value })
+                            }
+                            placeholder="Account label (e.g. Team, Personal)"
+                            className="w-full rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500/50"
+                          />
+                        )}
                         <input
                           type="password"
                           value={editForm.api_key ?? ''}
@@ -314,7 +340,12 @@ export default function ProvidersPage() {
                         !provider.enabled && 'opacity-40'
                       )}>
                         <span className="text-base">{config.icon}</span>
-                        <span className="text-sm text-white/80 flex-1 truncate">{provider.name}</span>
+                        <span className="text-sm text-white/80 flex-1 truncate">
+                          {provider.name}
+                          {provider.label && (
+                            <span className="ml-1.5 text-xs text-white/40">({provider.label})</span>
+                          )}
+                        </span>
 
                         {provider.use_for_backends && provider.use_for_backends.length > 0 && (
                           <div className="flex items-center gap-1">

@@ -53,8 +53,11 @@ use super::desktop_stream;
 use super::fs;
 use super::library as library_api;
 use super::mcp as mcp_api;
+use super::model_routing as model_routing_api;
 use super::monitoring;
 use super::opencode as opencode_api;
+use super::proxy as proxy_api;
+use super::proxy_keys as proxy_keys_api;
 use super::secrets as secrets_api;
 use super::settings as settings_api;
 use super::system as system_api;
@@ -96,6 +99,16 @@ pub struct AppState {
     pub backend_configs: Arc<crate::backend_config::BackendConfigStore>,
     /// Cached model catalog fetched from provider APIs at startup
     pub model_catalog: ModelCatalog,
+    /// Provider health tracker (per-account cooldown and stats)
+    pub health_tracker: crate::provider_health::SharedProviderHealthTracker,
+    /// Model chain store (fallback chain definitions)
+    pub chain_store: crate::provider_health::SharedModelChainStore,
+    /// Shared HTTP client for the proxy (connection pooling)
+    pub http_client: reqwest::Client,
+    /// Bearer token for the internal proxy endpoint
+    pub proxy_secret: String,
+    /// User-generated proxy API keys for external tools
+    pub proxy_api_keys: super::proxy_keys::SharedProxyApiKeyStore,
 }
 
 /// Start the HTTP server.
@@ -138,6 +151,23 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .await,
     );
     let pending_oauth = Arc::new(RwLock::new(HashMap::new()));
+
+    // Initialize provider health tracker and model chain store
+    let health_tracker = Arc::new(crate::provider_health::ProviderHealthTracker::new());
+    let chain_store = Arc::new(
+        crate::provider_health::ModelChainStore::new(
+            config.working_dir.join(".sandboxed-sh/model_chains.json"),
+        )
+        .await,
+    );
+
+    // Initialize proxy API key store
+    let proxy_api_keys = Arc::new(
+        super::proxy_keys::ProxyApiKeyStore::new(
+            config.working_dir.join(".sandboxed-sh/proxy_api_keys.json"),
+        )
+        .await,
+    );
 
     // Initialize secrets store
     let secrets = match crate::secrets::SecretsStore::new(&config.working_dir).await {
@@ -358,6 +388,26 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         backend_registry,
         backend_configs,
         model_catalog: Arc::new(RwLock::new(HashMap::new())),
+        health_tracker,
+        chain_store,
+        http_client: reqwest::Client::builder()
+            // No global timeout — it applies to the full response body including
+            // streaming chunks, which would kill long-running LLM generations.
+            // Per-request timeouts are set in the proxy where needed.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default(),
+        proxy_secret: std::env::var("SANDBOXED_PROXY_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                let secret = uuid::Uuid::new_v4().to_string();
+                tracing::info!("No SANDBOXED_PROXY_SECRET set; generated ephemeral proxy secret");
+                // Also set in env so mission_runner can read it for OpenCode config.
+                std::env::set_var("SANDBOXED_PROXY_SECRET", &secret);
+                secret
+            }),
+        proxy_api_keys,
     });
 
     // Start background desktop session cleanup task
@@ -415,7 +465,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             get(desktop_stream::desktop_stream_ws),
         )
         // WebSocket system monitoring uses subprotocol-based auth
-        .route("/api/monitoring/ws", get(monitoring::monitoring_ws));
+        .route("/api/monitoring/ws", get(monitoring::monitoring_ws))
+        // OpenAI-compatible proxy endpoint (bearer token auth via SANDBOXED_PROXY_SECRET).
+        // LLM payloads with tool outputs and long contexts can exceed the default 2MB
+        // body limit, so set a generous 50MB limit for proxy routes.
+        .nest(
+            "/v1",
+            proxy_api::routes().layer(DefaultBodyLimit::max(50 * 1024 * 1024)),
+        );
 
     // File upload routes with increased body limit (10GB)
     let upload_route = Router::new()
@@ -611,6 +668,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         )
         // AI Provider endpoints
         .nest("/api/ai/providers", ai_providers_api::routes())
+        // Model routing (chains + health)
+        .nest("/api/model-routing", model_routing_api::routes())
+        // Proxy API key management
+        .nest("/api/proxy-keys", proxy_keys_api::routes())
         // Secrets management endpoints
         .nest("/api/secrets", secrets_api::routes())
         // Global settings endpoints
