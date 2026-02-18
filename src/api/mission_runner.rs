@@ -81,10 +81,6 @@ fn extract_part_text<'a>(part: &'a serde_json::Value, part_type: &str) -> Option
     }
 }
 
-fn strip_opencode_status_lines(text: &str) -> Cow<'_, str> {
-    strip_opencode_banner_lines(text)
-}
-
 /// Strip `<think>...</think>` tags from text output.
 /// Some models (e.g. Minimax, DeepSeek) emit internal reasoning inside inline
 /// `<think>` tags that should not be shown in the text output.
@@ -333,7 +329,7 @@ fn handle_part_update(
     };
 
     let mut content = content;
-    if let Cow::Owned(cleaned) = strip_opencode_status_lines(&content) {
+    if let Cow::Owned(cleaned) = strip_opencode_banner_lines(&content) {
         if cleaned != content {
             *buffer = cleaned.clone();
         }
@@ -9728,8 +9724,8 @@ mod tests {
         is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
         parse_opencode_session_token, parse_opencode_stderr_text_part, running_health,
         sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_opencode_status_lines, strip_think_tags, sync_opencode_agent_config, MissionHealth,
-        MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        strip_think_tags, sync_opencode_agent_config, MissionHealth, MissionRunState,
+        MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use serde_json::json;
@@ -10159,15 +10155,6 @@ mod tests {
         assert_eq!(thought, "first");
         assert!(remaining.contains("thought: second"));
         assert!(remaining.contains("regular text"));
-    }
-
-    // ── strip_opencode_status_lines delegation tests ──────────────────
-
-    #[test]
-    fn strip_opencode_status_lines_delegates_to_banner_lines() {
-        let input = "Starting opencode server\nHere is your answer\nall tasks completed";
-        let result = strip_opencode_status_lines(input);
-        assert_eq!(result.trim(), "Here is your answer");
     }
 
     // ── strip_ansi_codes tests ────────────────────────────────────────
