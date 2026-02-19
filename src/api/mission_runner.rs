@@ -476,13 +476,12 @@ fn parse_opencode_sse_event(
             tracing::warn!(
                 mission_id = %mission_id,
                 event_data = ?props,
-                "response.incomplete received — treating as completion (common with GLM models)"
+                "response.incomplete received — waiting for session.idle/response.completed before finishing"
             );
-            // GLM models from z.ai frequently emit response.incomplete as their
-            // terminal event without a subsequent response.completed.  Treat it
-            // the same as response.completed so the mission can finish.  If a
-            // retry does happen, it will produce a new response.completed.
-            message_complete = true;
+            // Some providers emit response.incomplete during intermediate states.
+            // Do not treat it as terminal; wait for stronger completion signals
+            // (response.completed, message.completed, or session idle fallback)
+            // to avoid cutting off follow-up output.
             None
         }
         "response.output_item.added" => {
@@ -7634,6 +7633,11 @@ pub async fn run_opencode_turn(
     let (sse_session_idle_tx, mut sse_session_idle_rx) = tokio::sync::watch::channel(false);
     let (sse_retry_tx, mut sse_retry_rx) = tokio::sync::watch::channel(0u32);
     let last_activity = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    // Track recent OpenCode heartbeats separately from "meaningful" activity.
+    // Some provider chains can spend >120s between message/status updates while
+    // still emitting heartbeats, so treating heartbeat-only periods as hard
+    // inactivity can kill valid runs prematurely.
+    let last_heartbeat = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let (text_output_tx, mut text_output_rx) = tokio::sync::watch::channel(false);
     // Track active tool call depth: incremented on ToolCall, decremented on ToolResult.
     // Used to skip inactivity timeouts during long tool runs (builds, tests, etc.).
@@ -7901,6 +7905,7 @@ pub async fn run_opencode_turn(
     let stderr_recent_capture = stderr_recent_lines.clone();
     let stderr_text_output_tx = text_output_tx.clone();
     let stderr_last_activity = last_activity.clone();
+    let stderr_last_heartbeat = last_heartbeat.clone();
     let stderr_rate_limit = rate_limit_detected.clone();
     let stderr_events_tx = events_tx.clone();
     let stderr_handle = stderr.map(|stderr| {
@@ -7924,9 +7929,15 @@ pub async fn run_opencode_turn(
                     // real work progress.  Heartbeats and server-internal status
                     // lines are excluded — they fire every ~30s and would keep a
                     // hung LLM call alive forever.
-                    let is_server_noise = clean.contains("server.heartbeat")
+                    let is_heartbeat = clean.contains("server.heartbeat");
+                    let is_server_noise = is_heartbeat
                         || clean.contains("server.connected")
                         || clean.contains("server.listening");
+                    if is_heartbeat {
+                        if let Ok(mut guard) = stderr_last_heartbeat.lock() {
+                            *guard = Some(std::time::Instant::now());
+                        }
+                    }
                     if !is_server_noise {
                         if let Ok(mut guard) = stderr_last_activity.lock() {
                             *guard = std::time::Instant::now();
@@ -8308,18 +8319,40 @@ pub async fn run_opencode_turn(
                 // so treat that as "no tools active".
                 let sse_alive = sse_handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
                 let tools_active = sse_alive && *sse_tool_depth_rx.borrow() > 0;
-                let inactive_too_long = !tools_active
-                    && last_activity
-                        .lock()
-                        .map(|g| g.elapsed() >= std::time::Duration::from_secs(120))
-                        .unwrap_or(false);
-                if inactive_too_long {
-                    tracing::warn!(
-                        mission_id = %mission_id,
-                        "Global inactivity timeout (120s); terminating stuck CLI process"
-                    );
-                    let _ = child.kill().await;
-                    break;
+                let inactivity_elapsed = last_activity
+                    .lock()
+                    .ok()
+                    .map(|g| g.elapsed())
+                    .unwrap_or_default();
+                let recent_heartbeat = last_heartbeat
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(|ts| ts.elapsed() <= std::time::Duration::from_secs(45))
+                    .unwrap_or(false);
+                if !tools_active && inactivity_elapsed >= std::time::Duration::from_secs(120) {
+                    // Heartbeat-only grace: avoid killing while the OpenCode server is
+                    // still alive and sending heartbeats. This especially affects smart
+                    // routing chains (e.g. GLM/Minimax fallbacks) that can take longer
+                    // to produce non-heartbeat events.
+                    if recent_heartbeat {
+                        if inactivity_elapsed >= std::time::Duration::from_secs(420) {
+                            tracing::warn!(
+                                mission_id = %mission_id,
+                                inactivity_secs = inactivity_elapsed.as_secs(),
+                                "Heartbeat-only inactivity timeout (420s); terminating stuck CLI process"
+                            );
+                            let _ = child.kill().await;
+                            break;
+                        }
+                    } else {
+                        tracing::warn!(
+                            mission_id = %mission_id,
+                            "Global inactivity timeout (120s); terminating stuck CLI process"
+                        );
+                        let _ = child.kill().await;
+                        break;
+                    }
                 }
             }
             line_result = stdout_lines.next_line() => {
@@ -10002,15 +10035,17 @@ mod tests {
         extract_opencode_session_id, extract_part_text, extract_str, extract_thought_line,
         is_codex_node_wrapper, is_rate_limited_error, is_session_corruption_error,
         is_tool_call_only_output, opencode_output_needs_fallback, opencode_session_token_from_line,
-        parse_opencode_session_token, parse_opencode_stderr_text_part, running_health,
-        sanitized_opencode_stdout, stall_severity, strip_ansi_codes, strip_opencode_banner_lines,
-        strip_think_tags, summarize_recent_opencode_stderr, sync_opencode_agent_config,
-        MissionHealth, MissionRunState, MissionStallSeverity, STALL_SEVERE_SECS, STALL_WARN_SECS,
+        parse_opencode_session_token, parse_opencode_sse_event, parse_opencode_stderr_text_part,
+        running_health, sanitized_opencode_stdout, stall_severity, strip_ansi_codes,
+        strip_opencode_banner_lines, strip_think_tags, summarize_recent_opencode_stderr,
+        sync_opencode_agent_config, MissionHealth, MissionRunState, MissionStallSeverity,
+        OpencodeSseState, STALL_SEVERE_SECS, STALL_WARN_SECS,
     };
     use crate::agents::{AgentResult, TerminalReason};
     use serde_json::json;
     use std::borrow::Cow;
     use std::fs;
+    use uuid::Uuid;
 
     #[test]
     fn sync_opencode_agent_config_removes_overrides_when_plugin_enabled() {
@@ -10376,6 +10411,43 @@ mod tests {
     fn extract_part_text_normal_type_checks_text_first() {
         let val = json!({"text": "hello", "content": "world"});
         assert_eq!(extract_part_text(&val, "text"), Some("hello"));
+    }
+
+    #[test]
+    fn parse_opencode_sse_event_response_incomplete_is_not_terminal() {
+        let mut state = OpencodeSseState::default();
+        let mission_id = Uuid::new_v4();
+        let data = json!({
+            "type": "response.incomplete",
+            "properties": {
+                "status": "incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
+            .expect("event should parse");
+        assert!(parsed.event.is_none());
+        assert!(!parsed.message_complete);
+        assert!(!parsed.session_idle);
+        assert!(!parsed.session_retry);
+    }
+
+    #[test]
+    fn parse_opencode_sse_event_response_completed_is_terminal() {
+        let mut state = OpencodeSseState::default();
+        let mission_id = Uuid::new_v4();
+        let data = json!({
+            "type": "response.completed",
+            "properties": { "status": "completed" }
+        })
+        .to_string();
+
+        let parsed = parse_opencode_sse_event(&data, None, None, &mut state, mission_id)
+            .expect("event should parse");
+        assert!(parsed.event.is_none());
+        assert!(parsed.message_complete);
     }
 
     #[test]
