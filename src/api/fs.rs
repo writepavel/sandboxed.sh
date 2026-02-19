@@ -59,6 +59,44 @@ fn workspace_root_path(state: &RuntimeWorkspace) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Remap `/root/context` to the mission-specific context directory if available.
+///
+/// Checks (in order): `mission_context`, `context_root` from the runtime
+/// workspace state, and the `SANDBOXED_SH_CONTEXT_ROOT` env var.
+fn remap_context_path(path: &str) -> Option<PathBuf> {
+    if !path.starts_with("/root/context") {
+        return None;
+    }
+    let suffix = path.trim_start_matches("/root/context");
+    let join = |base: &str| PathBuf::from(base).join(suffix.trim_start_matches('/'));
+
+    if let Some(state) = load_runtime_workspace() {
+        if let Some(ctx) = state.mission_context {
+            return Some(join(&ctx));
+        }
+        if let Some(root) = state.context_root {
+            return Some(join(&root));
+        }
+    }
+    if let Ok(val) = std::env::var("SANDBOXED_SH_CONTEXT_ROOT") {
+        let val = val.trim();
+        if !val.is_empty() {
+            return Some(join(val));
+        }
+    }
+    None
+}
+
+/// Move a file from `src` to `dst`, falling back to copy+delete when a rename
+/// fails (e.g. across filesystem boundaries).
+async fn move_file(src: &Path, dst: &Path) -> Result<(), (StatusCode, String)> {
+    if tokio::fs::rename(src, dst).await.is_err() {
+        tokio::fs::copy(src, dst).await.map_err(internal_error)?;
+        let _ = tokio::fs::remove_file(src).await;
+    }
+    Ok(())
+}
+
 fn map_container_path_to_host(path: &Path, state: &RuntimeWorkspace) -> Option<PathBuf> {
     let root = workspace_root_path(state)?;
     let rel = path.strip_prefix("/").unwrap_or(path);
@@ -72,25 +110,8 @@ fn resolve_download_path(
     let input = Path::new(path);
 
     if input.is_absolute() {
-        // Remap /root/context to mission-specific context if available
-        if path.starts_with("/root/context") {
-            if let Some(state) = load_runtime_workspace() {
-                if let Some(ctx) = state.mission_context {
-                    let suffix = path.trim_start_matches("/root/context");
-                    return Ok(PathBuf::from(ctx).join(suffix.trim_start_matches('/')));
-                }
-                if let Some(root) = state.context_root {
-                    let suffix = path.trim_start_matches("/root/context");
-                    return Ok(PathBuf::from(root).join(suffix.trim_start_matches('/')));
-                }
-            }
-            if let Ok(context_root) = std::env::var("SANDBOXED_SH_CONTEXT_ROOT") {
-                let context_root = context_root.trim();
-                if !context_root.is_empty() {
-                    let suffix = path.trim_start_matches("/root/context");
-                    return Ok(PathBuf::from(context_root).join(suffix.trim_start_matches('/')));
-                }
-            }
+        if let Some(remapped) = remap_context_path(path) {
+            return Ok(remapped);
         }
 
         if let Some(state) = load_runtime_workspace() {
@@ -303,18 +324,8 @@ pub async fn resolve_path_for_workspace(
 fn resolve_upload_base(path: &str) -> Result<PathBuf, (StatusCode, String)> {
     // Absolute path
     if Path::new(path).is_absolute() {
-        // Remap /root/context to mission-specific context if available
-        if path.starts_with("/root/context") {
-            if let Some(state) = load_runtime_workspace() {
-                if let Some(ctx) = state.mission_context {
-                    let suffix = path.trim_start_matches("/root/context");
-                    return Ok(PathBuf::from(ctx).join(suffix.trim_start_matches('/')));
-                }
-                if let Some(root) = state.context_root {
-                    let suffix = path.trim_start_matches("/root/context");
-                    return Ok(PathBuf::from(root).join(suffix.trim_start_matches('/')));
-                }
-            }
+        if let Some(remapped) = remap_context_path(path) {
+            return Ok(remapped);
         }
         return Ok(PathBuf::from(path));
     }
@@ -706,15 +717,7 @@ pub async fn upload(
         })?;
 
         // Try rename first (fast), fall back to copy+delete if across filesystems
-        if tokio::fs::rename(&tmp, &remote_path).await.is_err() {
-            tokio::fs::copy(&tmp, &remote_path).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to copy file: {}", e),
-                )
-            })?;
-            let _ = tokio::fs::remove_file(&tmp).await;
-        }
+        move_file(&tmp, &remote_path).await?;
 
         return Ok(Json(serde_json::json!({
             "ok": true,
@@ -875,20 +878,7 @@ pub async fn upload_finalize(
             )
         })?;
 
-        if tokio::fs::rename(&assembled_path, &remote_path)
-            .await
-            .is_err()
-        {
-            tokio::fs::copy(&assembled_path, &remote_path)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to copy file: {}", e),
-                    )
-                })?;
-            let _ = tokio::fs::remove_file(&assembled_path).await;
-        }
+        move_file(&assembled_path, &remote_path).await?;
 
         Ok::<_, (StatusCode, String)>(())
     }
@@ -1048,15 +1038,7 @@ pub async fn download_from_url(
         )
     })?;
 
-    if tokio::fs::rename(&tmp, &remote_path).await.is_err() {
-        tokio::fs::copy(&tmp, &remote_path).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to copy file: {}", e),
-            )
-        })?;
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
+    move_file(&tmp, &remote_path).await?;
 
     Ok(Json(
         serde_json::json!({ "ok": true, "path": remote_path, "name": file_name }),
