@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
-use crate::util::{home_dir, strip_jsonc_comments, AI_PROVIDERS_PATH};
+use crate::util::{home_dir, internal_error, strip_jsonc_comments, AI_PROVIDERS_PATH};
 
 /// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -3758,7 +3758,7 @@ async fn get_opencode_auth() -> Result<Json<OpenCodeAuthResponse>, (StatusCode, 
             message: "OpenCode auth retrieved".to_string(),
             auth: Some(auth),
         })),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(e) => Err(internal_error(e)),
     }
 }
 
@@ -3780,7 +3780,7 @@ async fn set_opencode_auth(
     }
 
     // Read existing auth
-    let mut auth = read_opencode_auth().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut auth = read_opencode_auth().map_err(internal_error)?;
 
     // Create the auth entry in OpenCode format
     let entry = serde_json::json!({
@@ -3816,7 +3816,7 @@ async fn set_opencode_auth(
     }
 
     // Write back to file
-    write_opencode_auth(&auth).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_opencode_auth(&auth).map_err(internal_error)?;
 
     if matches!(
         provider_type,
@@ -3962,9 +3962,8 @@ async fn list_providers(
     State(state): State<Arc<super::routes::AppState>>,
 ) -> Result<Json<Vec<ProviderResponse>>, (StatusCode, String)> {
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config =
-        read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
+    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
     let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -4084,7 +4083,7 @@ async fn get_provider_for_backend(
     }
 
     // Get the Anthropic provider credentials from auth.json
-    let auth = read_opencode_auth().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let auth = read_opencode_auth().map_err(internal_error)?;
     let anthropic_auth = auth.get("anthropic");
 
     let (api_key, oauth, has_credentials) = if let Some(auth_entry) = anthropic_auth {
@@ -4224,9 +4223,8 @@ async fn check_provider_health(
             }
 
             // Read OpenCode auth to get API key for standard providers
-            let auth_map =
-                read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            let auth = read_opencode_auth().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let auth_map = read_opencode_auth_map().map_err(internal_error)?;
+            let auth = read_opencode_auth().map_err(internal_error)?;
 
             let auth_kind = auth_map.get(&provider_type);
 
@@ -4288,7 +4286,7 @@ async fn check_provider_health(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     let (api_url, test_body, auth_header) = match provider_type {
         ProviderType::Cerebras => {
@@ -4502,8 +4500,7 @@ async fn create_provider(
     }
 
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config =
-        read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
     // Default use_for_backends to ["opencode"] if not specified.
     let use_for_backends = req
@@ -4520,8 +4517,7 @@ async fn create_provider(
         req.google_project_id.map(Some),
     );
 
-    write_opencode_config(&config_path, &opencode_config)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
 
     // Save backends to separate state file (not in opencode.json)
     if let Some(ref backends) = use_for_backends {
@@ -4573,9 +4569,8 @@ async fn get_provider(
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config =
-        read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
+    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
     let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -4634,8 +4629,7 @@ async fn update_provider(
     }
 
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config =
-        read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
     set_provider_config_entry(
         &mut opencode_config,
@@ -4647,8 +4641,7 @@ async fn update_provider(
         req.google_project_id,
     );
 
-    write_opencode_config(&config_path, &opencode_config)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
 
     // Save backends to separate state file if provided
     if let Some(ref backends) = req.use_for_backends {
@@ -4676,7 +4669,7 @@ async fn update_provider(
         }
     }
 
-    let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let default_provider = read_default_provider_state(&state.config.working_dir)
         .or_else(|| get_default_provider(&opencode_config));
     let backends_state = read_provider_backends_state(&state.config.working_dir);
@@ -4813,12 +4806,10 @@ async fn delete_provider(
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let mut opencode_config =
-        read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
 
     remove_provider_config_entry(&mut opencode_config, provider_type);
-    write_opencode_config(&config_path, &opencode_config)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    write_opencode_config(&config_path, &opencode_config).map_err(internal_error)?;
 
     if let Err(e) = remove_opencode_auth_entry(provider_type) {
         tracing::error!("Failed to remove OpenCode auth entry: {}", e);
@@ -4873,7 +4864,7 @@ async fn authenticate_provider(
 
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
-    let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
 
     // For OAuth providers, we need to return an auth URL
     if provider_type.uses_oauth() {
@@ -4973,12 +4964,11 @@ async fn set_default(
     let provider_type = ProviderType::from_id(&id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Provider {} not found", id)))?;
     write_default_provider_state(&state.config.working_dir, provider_type)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(internal_error)?;
 
     let config_path = get_opencode_config_path(&state.config.working_dir);
-    let opencode_config =
-        read_opencode_config(&config_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let auth_map = read_opencode_auth_map().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
+    let auth_map = read_opencode_auth_map().map_err(internal_error)?;
     let backends_state = read_provider_backends_state(&state.config.working_dir);
     let default_provider = Some(provider_type);
     let config_entry = get_provider_config_entry(&opencode_config, provider_type);
@@ -5158,8 +5148,7 @@ async fn oauth_authorize(
             let (verifier, challenge) = generate_pkce();
             let state_value = generate_state();
 
-            let url = openai_authorize_url(&challenge, &state_value)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let url = openai_authorize_url(&challenge, &state_value).map_err(internal_error)?;
 
             let instructions = if method.label.contains("Manual") {
                 "After logging in, copy the full redirect URL and paste it here".to_string()
@@ -5191,8 +5180,7 @@ async fn oauth_authorize(
             let (verifier, challenge) = generate_pkce();
             let state_value = generate_state();
 
-            let url = google_authorize_url(&challenge, &state_value)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let url = google_authorize_url(&challenge, &state_value).map_err(internal_error)?;
 
             {
                 let mut pending = state.pending_oauth.write().await;
@@ -5403,8 +5391,8 @@ async fn oauth_callback_inner(
                 }
 
                 let config_path = get_opencode_config_path(&state.config.working_dir);
-                let mut opencode_config = read_opencode_config(&config_path)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                let mut opencode_config =
+                    read_opencode_config(&config_path).map_err(internal_error)?;
 
                 // Update use_for_backends if specified
                 if let Some(ref backends) = req.use_for_backends {
@@ -5502,8 +5490,8 @@ async fn oauth_callback_inner(
                 }
 
                 let config_path = get_opencode_config_path(&state.config.working_dir);
-                let mut opencode_config = read_opencode_config(&config_path)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                let mut opencode_config =
+                    read_opencode_config(&config_path).map_err(internal_error)?;
 
                 // Update use_for_backends if specified
                 if let Some(ref backends) = req.use_for_backends {
@@ -5673,8 +5661,7 @@ async fn oauth_callback_inner(
             }
 
             let config_path = get_opencode_config_path(&state.config.working_dir);
-            let opencode_config = read_opencode_config(&config_path)
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
@@ -5776,8 +5763,7 @@ async fn oauth_callback_inner(
             }
 
             let config_path = get_opencode_config_path(&state.config.working_dir);
-            let opencode_config = read_opencode_config(&config_path)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            let opencode_config = read_opencode_config(&config_path).map_err(internal_error)?;
             let backends_state = read_provider_backends_state(&state.config.working_dir);
             let default_provider = get_default_provider(&opencode_config);
             let config_entry = get_provider_config_entry(&opencode_config, provider_type);
