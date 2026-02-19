@@ -28,7 +28,7 @@ use crate::library::LibraryStore;
 use crate::mcp::{McpRegistry, McpScope, McpServerConfig, McpTransport};
 use crate::nspawn::{self, NspawnDistro};
 use crate::tools::terminal::{rtk_binary_path, rtk_enabled};
-use crate::util::{env_var_bool, home_dir};
+use crate::util::{env_var_bool, home_dir, strip_jsonc_comments, AI_PROVIDERS_PATH};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace Types
@@ -943,64 +943,6 @@ async fn write_opencode_config(
     shared_network: Option<bool>,
     custom_providers: Option<&[AIProvider]>,
 ) -> anyhow::Result<()> {
-    fn strip_jsonc_comments(input: &str) -> String {
-        let mut out = String::with_capacity(input.len());
-        let mut chars = input.chars().peekable();
-        let mut in_string = false;
-        let mut escape = false;
-
-        while let Some(c) = chars.next() {
-            if in_string {
-                out.push(c);
-                if escape {
-                    escape = false;
-                } else if c == '\\' {
-                    escape = true;
-                } else if c == '"' {
-                    in_string = false;
-                }
-                continue;
-            }
-
-            if c == '"' {
-                in_string = true;
-                out.push(c);
-                continue;
-            }
-
-            if c == '/' {
-                match chars.peek() {
-                    Some('/') => {
-                        chars.next();
-                        for n in chars.by_ref() {
-                            if n == '\n' {
-                                out.push('\n');
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    Some('*') => {
-                        chars.next();
-                        let mut prev = '\0';
-                        for n in chars.by_ref() {
-                            if prev == '*' && n == '/' {
-                                break;
-                            }
-                            prev = n;
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-
-            out.push(c);
-        }
-
-        out
-    }
-
     let mut mcp_map = serde_json::Map::new();
     let mut used = std::collections::HashSet::new();
     let has_desktop_mcp = mcp_configs
@@ -3174,12 +3116,8 @@ pub async fn prepare_mission_workspace_with_skills(
 fn read_custom_providers_from_file(workspace_root: &Path) -> Vec<AIProvider> {
     // Try both possible locations for ai_providers.json
     let candidates = [
-        workspace_root
-            .join(".sandboxed-sh")
-            .join("ai_providers.json"),
-        std::path::PathBuf::from(home_dir())
-            .join(".sandboxed-sh")
-            .join("ai_providers.json"),
+        workspace_root.join(AI_PROVIDERS_PATH),
+        std::path::PathBuf::from(home_dir()).join(AI_PROVIDERS_PATH),
     ];
 
     for path in &candidates {

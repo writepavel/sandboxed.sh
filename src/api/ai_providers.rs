@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::ai_providers::{AuthMethod, PendingOAuth, ProviderType};
-use crate::util::home_dir;
+use crate::util::{home_dir, strip_jsonc_comments, AI_PROVIDERS_PATH};
 
 /// Anthropic OAuth client ID (from opencode-anthropic-auth plugin)
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -845,7 +845,7 @@ fn get_anthropic_auth_from_ai_providers(working_dir: &Path) -> Option<ClaudeCode
 
 /// Get all Anthropic credentials from ai_providers.json, sorted by priority.
 fn get_all_anthropic_auth_from_ai_providers(working_dir: &Path) -> Vec<ClaudeCodeAuth> {
-    let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
+    let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
     let contents = match std::fs::read_to_string(&ai_providers_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -985,7 +985,7 @@ pub fn get_all_openai_keys_for_codex(working_dir: &Path) -> Vec<String> {
 
 /// Get all OpenAI API keys from ai_providers.json, sorted by priority.
 fn get_all_openai_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
-    let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
+    let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
     let contents = match std::fs::read_to_string(&ai_providers_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -1066,7 +1066,7 @@ pub fn get_all_amp_api_keys(working_dir: &Path) -> Vec<String> {
 
 /// Get all Amp API keys from ai_providers.json, sorted by priority.
 fn get_all_amp_keys_from_ai_providers(working_dir: &Path) -> Vec<String> {
-    let ai_providers_path = working_dir.join(".sandboxed-sh/ai_providers.json");
+    let ai_providers_path = working_dir.join(AI_PROVIDERS_PATH);
     let contents = match std::fs::read_to_string(&ai_providers_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -3389,64 +3389,6 @@ fn get_opencode_config_path(working_dir: &Path) -> PathBuf {
         return PathBuf::from(path);
     }
     working_dir.join("opencode.json")
-}
-
-fn strip_jsonc_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            if escape {
-                escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if c == '"' {
-            in_string = true;
-            out.push(c);
-            continue;
-        }
-
-        if c == '/' {
-            match chars.peek() {
-                Some('/') => {
-                    chars.next();
-                    for n in chars.by_ref() {
-                        if n == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for n in chars.by_ref() {
-                        if prev == '*' && n == '/' {
-                            break;
-                        }
-                        prev = n;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        out.push(c);
-    }
-
-    out
 }
 
 fn strip_sandboxed_key(mut value: serde_json::Value) -> serde_json::Value {
