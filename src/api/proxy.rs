@@ -504,6 +504,8 @@ async fn chat_completions(
 
         // Stream the response back to the client.
         if is_stream && status.is_success() {
+            // Extract headers before consuming the response with bytes_stream()
+            let upstream_headers = upstream_resp.headers().clone();
             // Peek at the first SSE data line to detect in-stream errors.
             // Some providers (e.g. MiniMax) return HTTP 200 but send an error
             // payload as the first SSE event.
@@ -652,6 +654,9 @@ async fn chat_completions(
             let account_id = entry.account_id;
             let health_tracker = state.health_tracker.clone();
 
+            // Extract rate-limit snapshot to record after stream completes
+            let rate_limit_snapshot = extract_rate_limit_snapshot(&upstream_headers, provider_type);
+
             let mut response_headers = HeaderMap::new();
             response_headers.insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
             response_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
@@ -664,7 +669,8 @@ async fn chat_completions(
             let byte_stream = normalize_sse_stream(combined);
 
             // Wrap the stream to record success/failure on completion.
-            let tracked_stream = track_stream_health(byte_stream, health_tracker, account_id);
+            let tracked_stream =
+                track_stream_health(byte_stream, health_tracker, account_id, rate_limit_snapshot);
 
             return (status, response_headers, Body::from_stream(tracked_stream)).into_response();
         }
@@ -724,6 +730,16 @@ async fn chat_completions(
                         .record_latency(entry.account_id, elapsed_ms)
                         .await;
                     state.health_tracker.record_success(entry.account_id).await;
+
+                    // Extract rate-limit quota snapshot from response headers
+                    if let Some(snapshot) =
+                        extract_rate_limit_snapshot(&response_headers, provider_type)
+                    {
+                        state
+                            .health_tracker
+                            .record_rate_limits(entry.account_id, snapshot)
+                            .await;
+                    }
 
                     // Extract token usage from the response
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp_body) {
@@ -942,6 +958,178 @@ fn parse_rate_limit_headers(
     }
 }
 
+/// Extract full rate-limit quota snapshot from provider response headers.
+///
+/// Called on every successful response to track remaining quotas.
+/// Different providers include different header formats:
+///
+/// - **OpenAI / xAI / Groq**: `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`,
+///   `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-*`
+/// - **Anthropic**: `anthropic-ratelimit-requests-limit`, `anthropic-ratelimit-requests-remaining`,
+///   `anthropic-ratelimit-tokens-limit`, `anthropic-ratelimit-tokens-remaining`,
+///   `anthropic-ratelimit-input-tokens-*`, `anthropic-ratelimit-output-tokens-*`
+fn extract_rate_limit_snapshot(
+    headers: &HeaderMap,
+    provider_type: ProviderType,
+) -> Option<crate::provider_health::RateLimitSnapshot> {
+    let now = chrono::Utc::now();
+
+    match provider_type {
+        ProviderType::OpenAI
+        | ProviderType::Xai
+        | ProviderType::Groq
+        | ProviderType::OpenRouter => {
+            let requests_limit = headers
+                .get("x-ratelimit-limit-requests")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let requests_remaining = headers
+                .get("x-ratelimit-remaining-requests")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let tokens_limit = headers
+                .get("x-ratelimit-limit-tokens")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let tokens_remaining = headers
+                .get("x-ratelimit-remaining-tokens")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let requests_reset = headers
+                .get("x-ratelimit-reset-requests")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| parse_reset_timestamp(s, &now));
+            let tokens_reset = headers
+                .get("x-ratelimit-reset-tokens")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| parse_reset_timestamp(s, &now));
+
+            if requests_limit.is_none()
+                && requests_remaining.is_none()
+                && tokens_limit.is_none()
+                && tokens_remaining.is_none()
+            {
+                return None;
+            }
+
+            Some(crate::provider_health::RateLimitSnapshot {
+                requests_limit,
+                requests_remaining,
+                requests_reset,
+                tokens_limit,
+                tokens_remaining,
+                tokens_reset,
+                input_tokens_limit: None,
+                input_tokens_remaining: None,
+                output_tokens_limit: None,
+                output_tokens_remaining: None,
+                updated_at: now,
+            })
+        }
+        ProviderType::Anthropic => {
+            let requests_limit = headers
+                .get("anthropic-ratelimit-requests-limit")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let requests_remaining = headers
+                .get("anthropic-ratelimit-requests-remaining")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let tokens_limit = headers
+                .get("anthropic-ratelimit-tokens-limit")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let tokens_remaining = headers
+                .get("anthropic-ratelimit-tokens-remaining")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let input_tokens_limit = headers
+                .get("anthropic-ratelimit-input-tokens-limit")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let input_tokens_remaining = headers
+                .get("anthropic-ratelimit-input-tokens-remaining")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let output_tokens_limit = headers
+                .get("anthropic-ratelimit-output-tokens-limit")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let output_tokens_remaining = headers
+                .get("anthropic-ratelimit-output-tokens-remaining")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            let requests_reset = headers
+                .get("anthropic-ratelimit-requests-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_iso_timestamp);
+            let tokens_reset = headers
+                .get("anthropic-ratelimit-tokens-reset")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_iso_timestamp);
+
+            if requests_limit.is_none()
+                && requests_remaining.is_none()
+                && tokens_limit.is_none()
+                && tokens_remaining.is_none()
+                && input_tokens_limit.is_none()
+                && input_tokens_remaining.is_none()
+                && output_tokens_limit.is_none()
+                && output_tokens_remaining.is_none()
+            {
+                return None;
+            }
+
+            Some(crate::provider_health::RateLimitSnapshot {
+                requests_limit,
+                requests_remaining,
+                requests_reset,
+                tokens_limit,
+                tokens_remaining,
+                tokens_reset,
+                input_tokens_limit,
+                input_tokens_remaining,
+                output_tokens_limit,
+                output_tokens_remaining,
+                updated_at: now,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse an ISO 8601 timestamp and return as DateTime.
+fn parse_iso_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Parse a reset timestamp and convert to DateTime.
+/// Handles both ISO 8601 timestamps and duration strings (e.g., "2s", "1m30s").
+///
+/// Note: Uses uncapped duration parsing since rate-limit reset windows can legitimately
+/// span many hours (e.g., OpenAI daily limits reset in ~24h).
+fn parse_reset_timestamp(
+    s: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+
+    if let Some(duration) = parse_rate_limit_duration(s) {
+        return Some(*now + chrono::Duration::from_std(duration).ok()?);
+    }
+
+    None
+}
+
 /// Parse a standard `Retry-After` header as numeric seconds.
 fn parse_retry_after_secs(headers: &HeaderMap) -> Option<std::time::Duration> {
     let value = headers.get("retry-after")?.to_str().ok()?;
@@ -1055,6 +1243,84 @@ fn parse_duration_string(s: &str) -> Option<std::time::Duration> {
     if total_ms > 0.0 {
         let secs = (total_ms / 1000.0).min(MAX_HEADER_COOLDOWN_SECS);
         Some(std::time::Duration::from_secs_f64(secs))
+    } else {
+        None
+    }
+}
+
+/// Parse a duration string for rate-limit quota tracking (no 1-hour cap).
+///
+/// Unlike `parse_duration_string`, this function does NOT cap durations at 1 hour
+/// because rate-limit reset windows can legitimately span many hours (e.g., OpenAI
+/// daily limits reset in ~24h).
+fn parse_rate_limit_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Ok(secs) = s.parse::<f64>() {
+        if secs <= 0.0 {
+            return None;
+        }
+        if secs > 1_000_000_000.0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            let remaining = secs - now;
+            return if remaining > 0.0 {
+                Some(std::time::Duration::from_secs_f64(remaining))
+            } else {
+                None
+            };
+        }
+        return Some(std::time::Duration::from_secs_f64(secs));
+    }
+
+    let mut total_ms: f64 = 0.0;
+    let mut num_buf = String::new();
+    let mut chars = s.chars().peekable();
+
+    while chars.peek().is_some() {
+        num_buf.clear();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() || c == '.' {
+                num_buf.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if num_buf.is_empty() {
+            return None;
+        }
+
+        let num: f64 = num_buf.parse().ok()?;
+
+        let mut unit = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphabetic() {
+                unit.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        total_ms += match unit.as_str() {
+            "h" => num * 3_600_000.0,
+            "m" => num * 60_000.0,
+            "s" => num * 1_000.0,
+            "ms" => num,
+            "" => num * 1_000.0,
+            _ => return None,
+        };
+    }
+
+    if total_ms > 0.0 {
+        Some(std::time::Duration::from_secs_f64(total_ms / 1000.0))
     } else {
         None
     }
@@ -1224,6 +1490,7 @@ fn track_stream_health(
     inner: impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static,
     health_tracker: crate::provider_health::SharedProviderHealthTracker,
     account_id: uuid::Uuid,
+    rate_limit_snapshot: Option<crate::provider_health::RateLimitSnapshot>,
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut stream = std::pin::pin!(inner);
@@ -1267,6 +1534,9 @@ fn track_stream_health(
             health_tracker.record_success(account_id).await;
             if input_tokens > 0 || output_tokens > 0 {
                 health_tracker.record_token_usage(account_id, input_tokens, output_tokens).await;
+            }
+            if let Some(snapshot) = rate_limit_snapshot {
+                health_tracker.record_rate_limits(account_id, snapshot).await;
             }
         }
     }
