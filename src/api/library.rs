@@ -579,7 +579,11 @@ async fn get_skill(
     headers: HeaderMap,
 ) -> Result<Json<Skill>, (StatusCode, String)> {
     let library = ensure_library(&state, &headers).await?;
-    library.get_skill(&name).await.map(Json).map_err(not_found_or_internal)
+    library
+        .get_skill(&name)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
 }
 
 /// PUT /api/library/skills/:name - Save a skill.
@@ -892,7 +896,11 @@ async fn get_command(
     headers: HeaderMap,
 ) -> Result<Json<Command>, (StatusCode, String)> {
     let library = ensure_library(&state, &headers).await?;
-    library.get_command(&name).await.map(Json).map_err(not_found_or_internal)
+    library
+        .get_command(&name)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
 }
 
 /// PUT /api/library/commands/:name - Save a command.
@@ -1253,7 +1261,11 @@ async fn get_init_script(
     headers: HeaderMap,
 ) -> Result<Json<InitScript>, (StatusCode, String)> {
     let library = ensure_library(&state, &headers).await?;
-    library.get_init_script(&name).await.map(Json).map_err(not_found_or_internal)
+    library
+        .get_init_script(&name)
+        .await
+        .map(Json)
+        .map_err(not_found_or_internal)
 }
 
 /// PUT /api/library/init-script/:name - Save an init script fragment.
