@@ -267,7 +267,8 @@ struct ResolvedEntryResponse {
     provider_id: String,
     model_id: String,
     account_id: String,
-    has_api_key: bool,
+    has_credentials: bool,
+    auth_kind: &'static str,
     has_base_url: bool,
 }
 
@@ -303,10 +304,17 @@ async fn resolve_chain(
         resolved
             .into_iter()
             .map(|e| ResolvedEntryResponse {
+                auth_kind: if e.api_key.is_some() {
+                    "api_key"
+                } else if e.has_oauth {
+                    "oauth"
+                } else {
+                    "none"
+                },
                 provider_id: e.provider_id,
                 model_id: e.model_id,
                 account_id: e.account_id.to_string(),
-                has_api_key: e.api_key.is_some(),
+                has_credentials: e.api_key.is_some() || e.has_oauth,
                 has_base_url: e.base_url.is_some(),
             })
             .collect(),

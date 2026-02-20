@@ -317,7 +317,7 @@ fn google_authorize_url(challenge: &str, state: &str) -> Result<String, String> 
 }
 
 /// Build [`StandardAccount`] entries for all standard (non-custom) providers
-/// that have API-key credentials in OpenCode's `auth.json`.
+/// that have credentials in OpenCode's `auth.json`.
 ///
 /// These are used by chain resolution to include standard providers alongside
 /// custom providers from `AIProviderStore`.
@@ -352,9 +352,21 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.to_string());
+        let has_oauth = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|t| t == "oauth")
+            .unwrap_or(false)
+            || value
+                .get("refresh")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
 
-        // Only include accounts that have a non-empty API key
-        if api_key.is_none() {
+        // Only include accounts that have credentials we can route with.
+        // For now, OAuth routing support is Google-specific.
+        let has_routable_credentials =
+            api_key.is_some() || (provider_type == ProviderType::Google && has_oauth);
+        if !has_routable_credentials {
             continue;
         }
 
@@ -379,6 +391,7 @@ pub fn read_standard_accounts(working_dir: &Path) -> Vec<crate::provider_health:
             account_id: crate::provider_health::stable_provider_uuid(provider_type.id()),
             provider_type,
             api_key,
+            has_oauth,
             base_url,
         });
     }
@@ -1507,6 +1520,15 @@ fn ensure_codex_auth_json(config_dir: &std::path::Path) -> Result<(), String> {
 /// Used to pass the token as OPENAI_OAUTH_TOKEN env var to the Codex CLI.
 pub fn read_openai_oauth_access_token() -> Option<String> {
     read_oauth_token_entry(ProviderType::OpenAI).map(|entry| entry.access_token)
+}
+
+/// Read the Google OAuth access token from the credential store.
+///
+/// Returns the access token string if found and non-empty.
+pub fn read_google_oauth_access_token() -> Option<String> {
+    read_oauth_token_entry(ProviderType::Google)
+        .map(|entry| entry.access_token)
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Write Codex credentials to a workspace.

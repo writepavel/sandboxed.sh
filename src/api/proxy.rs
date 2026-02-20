@@ -5,12 +5,13 @@
 //! the chain until one succeeds. Pre-stream 429/529 errors trigger instant
 //! failover to the next entry in the chain.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     body::Body,
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -20,6 +21,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::ai_providers::ProviderType;
 use crate::provider_health::CooldownReason;
+
+static GOOGLE_PROJECT_CACHE: OnceLock<tokio::sync::RwLock<HashMap<(uuid::Uuid, String), String>>> =
+    OnceLock::new();
+const GOOGLE_USER_AGENT: &str = "google-api-nodejs-client/9.15.1";
+const GOOGLE_API_CLIENT: &str = "gl-node/22.17.0";
+const GOOGLE_CLIENT_METADATA: &str =
+    "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI";
+
+const TEXT_EVENT_STREAM: &str = "text/event-stream";
+const NO_CACHE: &str = "no-cache";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -288,28 +299,73 @@ async fn chat_completions(
             None => continue,
         };
 
-        // Custom providers may work without an API key (base_url only),
-        // but standard providers always require one.
-        if entry.api_key.is_none() && provider_type != ProviderType::Custom {
+        // Custom providers may work without an API key (base_url only).
+        // Standard providers require credentials (API key or provider OAuth).
+        if entry.api_key.is_none() && !entry.has_oauth && provider_type != ProviderType::Custom {
             continue;
         }
 
-        let Some(url) = completions_url(provider_type, entry.base_url.as_deref()) else {
-            tracing::debug!(
-                provider = %entry.provider_id,
-                "Skipping non-OpenAI-compatible provider in chain"
-            );
-            continue;
-        };
-
-        // Build the upstream request body: replace model with the real model ID
-        let upstream_body = match rewrite_model(&body, &entry.model_id) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("Failed to rewrite model in request body: {}", e);
-                server_error_count += 1;
+        let use_google_oauth_adapter = provider_type == ProviderType::Google && entry.has_oauth;
+        let (url, upstream_body, extra_headers) = if use_google_oauth_adapter {
+            let access_token = match get_google_access_token().await {
+                Ok(token) => token,
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %entry.provider_id,
+                        account_id = %entry.account_id,
+                        error = %e,
+                        "Google OAuth token unavailable for routing"
+                    );
+                    client_error_count += 1;
+                    continue;
+                }
+            };
+            let project_id =
+                match get_google_project_id(&state.http_client, entry.account_id, &access_token)
+                    .await
+                {
+                    Ok(project_id) => project_id,
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = %entry.provider_id,
+                            account_id = %entry.account_id,
+                            error = %e,
+                            "Failed to resolve Google Code Assist project for routing"
+                        );
+                        client_error_count += 1;
+                        continue;
+                    }
+                };
+            let (google_url, google_body) =
+                match build_google_upstream_request(&body, &entry.model_id, &project_id, is_stream)
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("Failed to build Google upstream request: {}", e);
+                        server_error_count += 1;
+                        continue;
+                    }
+                };
+            let headers = build_google_proxy_headers(&access_token, is_stream);
+            (google_url, google_body, headers)
+        } else {
+            let Some(url) = completions_url(provider_type, entry.base_url.as_deref()) else {
+                tracing::debug!(
+                    provider = %entry.provider_id,
+                    "Skipping non-OpenAI-compatible provider in chain"
+                );
                 continue;
-            }
+            };
+            // Build the upstream request body: replace model with the real model ID
+            let upstream_body = match rewrite_model(&body, &entry.model_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("Failed to rewrite model in request body: {}", e);
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+            (url, upstream_body, HeaderMap::new())
         };
 
         // Forward the request.
@@ -322,8 +378,13 @@ async fn chat_completions(
             .post(&url)
             .header("Content-Type", "application/json")
             .body(upstream_body);
-        if let Some(api_key) = &entry.api_key {
-            upstream_req = upstream_req.header("Authorization", format!("Bearer {}", api_key));
+        if !use_google_oauth_adapter {
+            if let Some(api_key) = &entry.api_key {
+                upstream_req = upstream_req.header("Authorization", format!("Bearer {}", api_key));
+            }
+        }
+        for (name, value) in &extra_headers {
+            upstream_req = upstream_req.header(name, value);
         }
         if !is_stream {
             upstream_req = upstream_req.timeout(std::time::Duration::from_secs(300));
@@ -388,6 +449,228 @@ async fn chat_completions(
         };
 
         let status = upstream_resp.status();
+
+        if use_google_oauth_adapter {
+            if is_stream && status.is_success() {
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static(TEXT_EVENT_STREAM),
+                );
+                response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_CACHE));
+
+                let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+                let stream_created = chrono::Utc::now().timestamp();
+                let model_id = entry.model_id.clone();
+                let response_stream = transform_google_sse_to_openai(
+                    upstream_resp.bytes_stream(),
+                    stream_id,
+                    stream_created,
+                    model_id,
+                );
+
+                let ttft_ms = request_start.elapsed().as_millis() as u64;
+                state
+                    .health_tracker
+                    .record_latency(entry.account_id, ttft_ms)
+                    .await;
+                let account_id = entry.account_id;
+                let health_tracker = state.health_tracker.clone();
+                let tracked_stream =
+                    track_stream_health(response_stream, health_tracker, account_id, None);
+
+                let success_provider = entry.provider_id.clone();
+                for evt in &mut pending_fallback_events {
+                    if evt.to_provider.is_none() {
+                        evt.to_provider = Some(success_provider.clone());
+                    }
+                }
+                for evt in pending_fallback_events {
+                    state.health_tracker.record_fallback_event(evt).await;
+                }
+
+                return (status, response_headers, Body::from_stream(tracked_stream))
+                    .into_response();
+            }
+
+            let response_headers = upstream_resp.headers().clone();
+            let resp_body = match upstream_resp.bytes().await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                    tracing::warn!(
+                        provider = %entry.provider_id,
+                        account_id = %entry.account_id,
+                        error = %e,
+                        "Failed to read Google upstream response body"
+                    );
+                    let cooldown = state
+                        .health_tracker
+                        .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                        .await;
+                    pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                        timestamp: chrono::Utc::now(),
+                        chain_id: chain_id.clone(),
+                        from_provider: entry.provider_id.clone(),
+                        from_model: entry.model_id.clone(),
+                        from_account_id: entry.account_id,
+                        reason: CooldownReason::ServerError,
+                        cooldown_secs: Some(cooldown.as_secs_f64()),
+                        to_provider: None,
+                        latency_ms: Some(elapsed_ms),
+                        attempt_number: (entry_idx + 1) as u32,
+                        chain_length,
+                    });
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let retry_after = parse_google_retry_after(&response_headers, &resp_body)
+                    .or_else(|| parse_rate_limit_headers(&response_headers, provider_type));
+                let cooldown = state
+                    .health_tracker
+                    .record_failure(entry.account_id, CooldownReason::RateLimit, retry_after)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason: CooldownReason::RateLimit,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
+                rate_limit_count += 1;
+                continue;
+            }
+
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let maybe_reason = classify_google_error_reason(&resp_body);
+                let reason = maybe_reason.unwrap_or(CooldownReason::AuthError);
+                let retry_after = if matches!(
+                    reason,
+                    CooldownReason::RateLimit | CooldownReason::Overloaded
+                ) {
+                    parse_google_retry_after(&response_headers, &resp_body)
+                        .or_else(|| parse_rate_limit_headers(&response_headers, provider_type))
+                } else {
+                    None
+                };
+                let cooldown = state
+                    .health_tracker
+                    .record_failure(entry.account_id, reason, retry_after)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
+                match reason {
+                    CooldownReason::RateLimit | CooldownReason::Overloaded => rate_limit_count += 1,
+                    CooldownReason::AuthError => client_error_count += 1,
+                    _ => server_error_count += 1,
+                }
+                continue;
+            }
+
+            if status.is_server_error() {
+                let elapsed_ms = request_start.elapsed().as_millis() as u64;
+                let cooldown = state
+                    .health_tracker
+                    .record_failure(entry.account_id, CooldownReason::ServerError, None)
+                    .await;
+                pending_fallback_events.push(crate::provider_health::FallbackEvent {
+                    timestamp: chrono::Utc::now(),
+                    chain_id: chain_id.clone(),
+                    from_provider: entry.provider_id.clone(),
+                    from_model: entry.model_id.clone(),
+                    from_account_id: entry.account_id,
+                    reason: CooldownReason::ServerError,
+                    cooldown_secs: Some(cooldown.as_secs_f64()),
+                    to_provider: None,
+                    latency_ms: Some(elapsed_ms),
+                    attempt_number: (entry_idx + 1) as u32,
+                    chain_length,
+                });
+                server_error_count += 1;
+                continue;
+            }
+
+            if status.is_client_error() {
+                client_error_count += 1;
+                continue;
+            }
+
+            let translated = translate_google_json_to_openai(
+                &resp_body,
+                &entry.model_id,
+                chrono::Utc::now().timestamp(),
+            );
+            let (translated_body, usage) = match translated {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %entry.provider_id,
+                        account_id = %entry.account_id,
+                        error = %e,
+                        "Failed to translate Google response to OpenAI format"
+                    );
+                    server_error_count += 1;
+                    continue;
+                }
+            };
+            let elapsed_ms = request_start.elapsed().as_millis() as u64;
+            state
+                .health_tracker
+                .record_latency(entry.account_id, elapsed_ms)
+                .await;
+            state.health_tracker.record_success(entry.account_id).await;
+            if let Some((input, output)) = usage {
+                state
+                    .health_tracker
+                    .record_token_usage(entry.account_id, input, output)
+                    .await;
+            }
+            let success_provider = entry.provider_id.clone();
+            for evt in &mut pending_fallback_events {
+                if evt.to_provider.is_none() {
+                    evt.to_provider = Some(success_provider.clone());
+                }
+            }
+            for evt in pending_fallback_events {
+                state.health_tracker.record_fallback_event(evt).await;
+            }
+
+            let mut builder = Response::builder().status(StatusCode::OK);
+            if let Some(ct) = response_headers.get(header::CONTENT_TYPE) {
+                builder = builder.header(header::CONTENT_TYPE, ct);
+            }
+            return builder
+                .body(Body::from(translated_body))
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to build response".to_string(),
+                        "internal_error",
+                    )
+                });
+        }
 
         // Pre-stream error handling: 429, 529, 5xx → cooldown + try next
         if status == StatusCode::TOO_MANY_REQUESTS || status.as_u16() == 529 {
@@ -1542,9 +1825,786 @@ fn track_stream_health(
     }
 }
 
+fn get_google_project_cache() -> &'static tokio::sync::RwLock<HashMap<(uuid::Uuid, String), String>>
+{
+    GOOGLE_PROJECT_CACHE.get_or_init(|| tokio::sync::RwLock::new(HashMap::new()))
+}
+
+fn apply_google_client_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    builder
+        .header(header::USER_AGENT, GOOGLE_USER_AGENT)
+        .header("X-Goog-Api-Client", GOOGLE_API_CLIENT)
+        .header("Client-Metadata", GOOGLE_CLIENT_METADATA)
+}
+
+fn build_google_proxy_headers(access_token: &str, is_stream: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", access_token)) {
+        headers.insert(header::AUTHORIZATION, v);
+    }
+    headers.insert(
+        header::USER_AGENT,
+        HeaderValue::from_static(GOOGLE_USER_AGENT),
+    );
+    headers.insert(
+        "X-Goog-Api-Client",
+        HeaderValue::from_static(GOOGLE_API_CLIENT),
+    );
+    headers.insert(
+        "Client-Metadata",
+        HeaderValue::from_static(GOOGLE_CLIENT_METADATA),
+    );
+    if is_stream {
+        headers.insert(header::ACCEPT, HeaderValue::from_static(TEXT_EVENT_STREAM));
+    }
+    headers
+}
+
+async fn get_google_access_token() -> Result<String, String> {
+    super::ai_providers::ensure_google_oauth_token_valid().await?;
+    super::ai_providers::read_google_oauth_access_token()
+        .ok_or_else(|| "Google OAuth access token not found".to_string())
+}
+
+async fn get_google_project_id(
+    http_client: &reqwest::Client,
+    account_id: uuid::Uuid,
+    access_token: &str,
+) -> Result<String, String> {
+    let cache_key = (account_id, access_token.to_string());
+    if let Some(cached) = get_google_project_cache()
+        .read()
+        .await
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+
+    let load_body = serde_json::json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+    });
+    let resp = apply_google_client_headers(
+        http_client
+            .post("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", access_token)),
+    )
+    .json(&load_body)
+    .send()
+    .await
+    .map_err(|e| format!("loadCodeAssist request failed: {}", e))?;
+
+    let status = resp.status();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("loadCodeAssist body read failed: {}", e))?;
+    if !status.is_success() {
+        return Err(format!(
+            "loadCodeAssist failed ({}): {}",
+            status,
+            String::from_utf8_lossy(&body)
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| format!("Invalid loadCodeAssist JSON: {}", e))?;
+    let project = value
+        .get("cloudaicompanionProject")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            value
+                .get("cloudaicompanionProject")
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_str())
+        })
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "loadCodeAssist did not return a managed project".to_string())?
+        .to_string();
+
+    let mut cache = get_google_project_cache().write().await;
+    cache.retain(|(cached_account_id, _), _| *cached_account_id != account_id);
+    cache.insert(cache_key, project.clone());
+    Ok(project)
+}
+
+fn build_google_upstream_request(
+    openai_body: &[u8],
+    model_id: &str,
+    project_id: &str,
+    is_stream: bool,
+) -> Result<(String, bytes::Bytes), String> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(openai_body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    let req = value
+        .as_object_mut()
+        .ok_or_else(|| "Request body must be a JSON object".to_string())?;
+
+    let mut contents: Vec<serde_json::Value> = Vec::new();
+    let mut system_text_parts: Vec<String> = Vec::new();
+
+    for message in req
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user")
+            .to_string();
+        if role == "system" {
+            let text = extract_openai_message_text(message.get("content"));
+            if !text.is_empty() {
+                system_text_parts.push(text);
+            }
+            continue;
+        }
+
+        let gemini_role = match role.as_str() {
+            "assistant" => "model",
+            _ => "user",
+        };
+        let mut parts: Vec<serde_json::Value> = if role == "tool" {
+            Vec::new()
+        } else {
+            extract_openai_parts(message.get("content"))
+        };
+
+        if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tool_calls {
+                let function = tc.get("function").and_then(|f| f.as_object());
+                let name = function
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool");
+                let args_value = function
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
+                parts.push(serde_json::json!({
+                    "functionCall": {
+                        "name": name,
+                        "args": args_value,
+                    },
+                    "thoughtSignature": "skip_thought_signature_validator"
+                }));
+            }
+        }
+
+        if role == "tool" {
+            let name = message
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tool");
+            let content = extract_openai_message_text(message.get("content"));
+            parts.push(serde_json::json!({
+                "functionResponse": {
+                    "name": name,
+                    "response": { "output": content }
+                }
+            }));
+        }
+
+        if parts.is_empty() {
+            continue;
+        }
+        contents.push(serde_json::json!({
+            "role": gemini_role,
+            "parts": parts,
+        }));
+    }
+
+    let mut request = serde_json::Map::new();
+    request.insert("contents".to_string(), serde_json::Value::Array(contents));
+
+    if !system_text_parts.is_empty() {
+        request.insert(
+            "systemInstruction".to_string(),
+            serde_json::json!({
+                "parts": system_text_parts
+                    .into_iter()
+                    .map(|t| serde_json::json!({ "text": t }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
+    let mut generation_config = serde_json::Map::new();
+    if let Some(v) = req.get("temperature").and_then(|v| v.as_f64()) {
+        generation_config.insert("temperature".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = req.get("top_p").and_then(|v| v.as_f64()) {
+        generation_config.insert("topP".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = req.get("max_tokens").and_then(|v| v.as_u64()) {
+        generation_config.insert("maxOutputTokens".to_string(), serde_json::json!(v));
+    }
+    if let Some(v) = req.get("stop") {
+        if let Some(arr) = v.as_array() {
+            let stops: Vec<String> = arr
+                .iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect();
+            if !stops.is_empty() {
+                generation_config.insert("stopSequences".to_string(), serde_json::json!(stops));
+            }
+        } else if let Some(s) = v.as_str() {
+            generation_config.insert("stopSequences".to_string(), serde_json::json!([s]));
+        }
+    }
+    if !generation_config.is_empty() {
+        request.insert(
+            "generationConfig".to_string(),
+            serde_json::Value::Object(generation_config),
+        );
+    }
+
+    if let Some(tools) = req.get("tools").and_then(|v| v.as_array()) {
+        let mut function_decls = Vec::new();
+        for tool in tools {
+            if tool.get("type").and_then(|v| v.as_str()) != Some("function") {
+                continue;
+            }
+            let Some(func) = tool.get("function").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let Some(name) = func.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let mut decl = serde_json::Map::new();
+            decl.insert("name".to_string(), serde_json::json!(name));
+            if let Some(desc) = func.get("description").and_then(|v| v.as_str()) {
+                decl.insert("description".to_string(), serde_json::json!(desc));
+            }
+            if let Some(params) = func.get("parameters") {
+                decl.insert("parameters".to_string(), params.clone());
+            }
+            function_decls.push(serde_json::Value::Object(decl));
+        }
+        if !function_decls.is_empty() {
+            request.insert(
+                "tools".to_string(),
+                serde_json::json!([{ "functionDeclarations": function_decls }]),
+            );
+        }
+    }
+
+    if let Some(tool_choice) = req.get("tool_choice") {
+        let tool_cfg = if let Some(s) = tool_choice.as_str() {
+            match s {
+                "none" => Some(serde_json::json!({ "functionCallingConfig": { "mode": "NONE" } })),
+                "required" => {
+                    Some(serde_json::json!({ "functionCallingConfig": { "mode": "ANY" } }))
+                }
+                _ => None,
+            }
+        } else {
+            tool_choice
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|name| {
+                    serde_json::json!({
+                        "functionCallingConfig": {
+                            "mode": "ANY",
+                            "allowedFunctionNames": [name]
+                        }
+                    })
+                })
+        };
+        if let Some(cfg) = tool_cfg {
+            request.insert("toolConfig".to_string(), cfg);
+        }
+    }
+
+    let payload = serde_json::json!({
+        "project": project_id,
+        "model": model_id,
+        "request": serde_json::Value::Object(request),
+    });
+    let body = serde_json::to_vec(&payload)
+        .map(bytes::Bytes::from)
+        .map_err(|e| format!("Failed to serialize Google request body: {}", e))?;
+    let action = if is_stream {
+        "streamGenerateContent?alt=sse"
+    } else {
+        "generateContent"
+    };
+    Ok((
+        format!("https://cloudcode-pa.googleapis.com/v1internal:{}", action),
+        body,
+    ))
+}
+
+fn extract_openai_parts(content: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    if let Some(s) = content.as_str() {
+        if s.is_empty() {
+            return Vec::new();
+        }
+        return vec![serde_json::json!({ "text": s })];
+    }
+    let Some(arr) = content.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for part in arr {
+        let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match ptype {
+            "text" => {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    out.push(serde_json::json!({ "text": text }));
+                }
+            }
+            "image_url" => {
+                if let Some(url) = part
+                    .get("image_url")
+                    .and_then(|v| v.get("url"))
+                    .and_then(|v| v.as_str())
+                {
+                    out.push(serde_json::json!({ "text": format!("[image:{}]", url) }));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn extract_openai_message_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(v) if v.is_string() => v.as_str().unwrap_or_default().to_string(),
+        Some(v) if v.is_array() => v
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    p.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn finish_reason_from_google(s: Option<&str>) -> &'static str {
+    match s.unwrap_or("STOP") {
+        "STOP" => "stop",
+        "MAX_TOKENS" => "length",
+        "SAFETY" | "RECITATION" | "BLOCKLIST" => "content_filter",
+        _ => "stop",
+    }
+}
+
+fn translate_google_json_to_openai(
+    body: &[u8],
+    model_id: &str,
+    created: i64,
+) -> Result<(bytes::Bytes, Option<(u64, u64)>), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Invalid JSON: {}", e))?;
+    let response = parsed.get("response").unwrap_or(&parsed);
+    let candidate = response
+        .get("candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| "Google response missing candidates".to_string())?;
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    if let Some(parts) = candidate
+        .get("content")
+        .and_then(|v| v.get("parts"))
+        .and_then(|v| v.as_array())
+    {
+        for (idx, part) in parts.iter().enumerate() {
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                content.push_str(text);
+            }
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                let args = fc
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+                tool_calls.push(serde_json::json!({
+                    "id": format!("call_{}", idx),
+                    "type": "function",
+                    "function": { "name": name, "arguments": args_str }
+                }));
+            }
+        }
+    }
+    let finish_reason = finish_reason_from_google(
+        candidate
+            .get("finishReason")
+            .and_then(|v| v.as_str())
+            .or(Some("STOP")),
+    );
+    let has_tool_calls = !tool_calls.is_empty();
+
+    let prompt_tokens = response
+        .get("usageMetadata")
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = response
+        .get("usageMetadata")
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total_tokens = response
+        .get("usageMetadata")
+        .and_then(|u| u.get("totalTokenCount"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(prompt_tokens + completion_tokens);
+
+    let openai = serde_json::json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": created,
+        "model": model_id,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": if content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(content) },
+                "tool_calls": if tool_calls.is_empty() { serde_json::Value::Null } else { serde_json::Value::Array(tool_calls) },
+            },
+            "finish_reason": if has_tool_calls { "tool_calls" } else { finish_reason },
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        }
+    });
+    let bytes = serde_json::to_vec(&openai)
+        .map(bytes::Bytes::from)
+        .map_err(|e| format!("Failed to serialize translated response: {}", e))?;
+    Ok((bytes, Some((prompt_tokens, completion_tokens))))
+}
+
+fn transform_google_sse_to_openai(
+    inner: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    stream_id: String,
+    created: i64,
+    model_id: String,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    futures::stream::unfold(
+        (
+            Box::pin(inner),
+            Vec::<u8>::new(),
+            false, // sent role chunk
+            false, // emitted terminal chunk
+            false, // emitted tool call
+            stream_id,
+            model_id,
+            created,
+        ),
+        |(
+            mut stream,
+            mut buf,
+            mut sent_role,
+            mut emitted_done,
+            mut emitted_tool_call,
+            stream_id,
+            model_id,
+            created,
+        )| async move {
+            loop {
+                if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let line = buf.drain(..=pos).collect::<Vec<u8>>();
+                    let trimmed = line
+                        .strip_suffix(b"\r\n")
+                        .or_else(|| line.strip_suffix(b"\n"))
+                        .unwrap_or(&line);
+                    if !trimmed.starts_with(b"data: ") {
+                        continue;
+                    }
+                    let payload = &trimmed[6..];
+                    if payload == b"[DONE]" {
+                        if !emitted_done {
+                            emitted_done = true;
+                            return Some((
+                                Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+                                (
+                                    stream,
+                                    buf,
+                                    sent_role,
+                                    emitted_done,
+                                    emitted_tool_call,
+                                    stream_id,
+                                    model_id,
+                                    created,
+                                ),
+                            ));
+                        }
+                        continue;
+                    }
+                    let parsed = match serde_json::from_slice::<serde_json::Value>(payload) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let resp = parsed.get("response").unwrap_or(&parsed);
+                    let candidate = resp
+                        .get("candidates")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let mut chunks: Vec<String> = Vec::new();
+                    if !sent_role {
+                        let first = serde_json::json!({
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": serde_json::Value::Null }],
+                        });
+                        chunks.push(format!("data: {}\n\n", first));
+                        sent_role = true;
+                    }
+                    if let Some(parts) = candidate
+                        .get("content")
+                        .and_then(|v| v.get("parts"))
+                        .and_then(|v| v.as_array())
+                    {
+                        for (idx, part) in parts.iter().enumerate() {
+                            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                                if !text.is_empty() {
+                                    let chunk = serde_json::json!({
+                                        "id": stream_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": serde_json::Value::Null }],
+                                    });
+                                    chunks.push(format!("data: {}\n\n", chunk));
+                                }
+                            }
+                            if let Some(fc) = part.get("functionCall") {
+                                let name =
+                                    fc.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                                let args = fc
+                                    .get("args")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                let args_str = serde_json::to_string(&args)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                let chunk = serde_json::json!({
+                                    "id": stream_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [{
+                                                "index": idx,
+                                                "id": format!("call_{}", idx),
+                                                "type": "function",
+                                                "function": { "name": name, "arguments": args_str }
+                                            }]
+                                        },
+                                        "finish_reason": serde_json::Value::Null
+                                    }],
+                                });
+                                chunks.push(format!("data: {}\n\n", chunk));
+                                emitted_tool_call = true;
+                            }
+                        }
+                    }
+
+                    if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str()) {
+                        let mut finish_reason = finish_reason_from_google(Some(fr)).to_string();
+                        if emitted_tool_call && finish_reason == "stop" {
+                            finish_reason = "tool_calls".to_string();
+                        }
+                        let finish_chunk = serde_json::json!({
+                            "id": stream_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": finish_reason,
+                            }],
+                        });
+                        chunks.push(format!("data: {}\n\n", finish_chunk));
+                        if !emitted_done {
+                            chunks.push("data: [DONE]\n\n".to_string());
+                            emitted_done = true;
+                        }
+                    }
+                    if chunks.is_empty() {
+                        continue;
+                    }
+                    return Some((
+                        Ok(bytes::Bytes::from(chunks.concat())),
+                        (
+                            stream,
+                            buf,
+                            sent_role,
+                            emitted_done,
+                            emitted_tool_call,
+                            stream_id,
+                            model_id,
+                            created,
+                        ),
+                    ));
+                }
+
+                match stream.next().await {
+                    Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
+                    Some(Err(e)) => {
+                        return Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            (
+                                stream,
+                                buf,
+                                sent_role,
+                                emitted_done,
+                                emitted_tool_call,
+                                stream_id,
+                                model_id,
+                                created,
+                            ),
+                        ));
+                    }
+                    None => {
+                        if emitted_done {
+                            return None;
+                        }
+                        return Some((
+                            Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n")),
+                            (
+                                stream,
+                                buf,
+                                sent_role,
+                                true,
+                                emitted_tool_call,
+                                stream_id,
+                                model_id,
+                                created,
+                            ),
+                        ));
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn classify_google_error_reason(body: &[u8]) -> Option<CooldownReason> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error")?;
+    if let Some(details) = error.get("details").and_then(|v| v.as_array()) {
+        for detail in details {
+            let r#type = detail.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+            if r#type == "type.googleapis.com/google.rpc.ErrorInfo" {
+                let reason = detail
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                if reason == "RATE_LIMIT_EXCEEDED" {
+                    return Some(CooldownReason::RateLimit);
+                }
+                if reason == "QUOTA_EXHAUSTED" {
+                    return Some(CooldownReason::Overloaded);
+                }
+            }
+        }
+    }
+    let status = error
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    if status == "RESOURCE_EXHAUSTED" {
+        return Some(CooldownReason::RateLimit);
+    }
+    let code = error.get("code").and_then(|v| v.as_u64())?;
+    match code {
+        429 => Some(CooldownReason::RateLimit),
+        529 => Some(CooldownReason::Overloaded),
+        401 | 403 => Some(CooldownReason::AuthError),
+        _ => None,
+    }
+}
+
+fn parse_google_retry_after(headers: &HeaderMap, body: &[u8]) -> Option<std::time::Duration> {
+    parse_retry_after_secs(headers).or_else(|| {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let error = value.get("error")?;
+        let details = error.get("details").and_then(|v| v.as_array())?;
+        for detail in details {
+            let r#type = detail.get("@type").and_then(|v| v.as_str()).unwrap_or("");
+            if r#type != "type.googleapis.com/google.rpc.RetryInfo" {
+                continue;
+            }
+            let retry_delay = detail.get("retryDelay")?;
+            if let Some(s) = retry_delay.as_str() {
+                if let Some(d) = parse_duration_string(s) {
+                    return Some(d);
+                }
+            } else if let Some(obj) = retry_delay.as_object() {
+                let secs = obj.get("seconds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let nanos = obj.get("nanos").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let total = secs + (nanos / 1e9);
+                if total > 0.0 {
+                    return Some(std::time::Duration::from_secs_f64(
+                        total.min(MAX_HEADER_COOLDOWN_SECS),
+                    ));
+                }
+            }
+        }
+        error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .and_then(extract_google_retry_from_message)
+    })
+}
+
+fn extract_google_retry_from_message(message: &str) -> Option<std::time::Duration> {
+    let lower = message.to_ascii_lowercase();
+    for marker in ["please retry in ", "after "] {
+        if let Some(idx) = lower.find(marker) {
+            let rem = &message[idx + marker.len()..];
+            let token = rem
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| c == ',' || c == '.');
+            if let Some(d) = parse_duration_string(token) {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use futures::StreamExt;
 
     #[test]
     fn parse_duration_simple_seconds() {
@@ -1699,5 +2759,157 @@ mod tests {
         assert!(d.is_some());
         let secs = d.unwrap().as_secs();
         assert!((25..=35).contains(&secs), "got {} seconds", secs);
+    }
+
+    #[test]
+    fn parse_google_retry_after_from_retry_info_detail() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "message": "rate limited",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "7s"
+                }]
+            }
+        });
+        let d = parse_google_retry_after(&headers, serde_json::to_vec(&body).unwrap().as_slice());
+        assert_eq!(d, Some(std::time::Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn parse_google_retry_after_from_message_hint() {
+        let headers = HeaderMap::new();
+        let body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "You have exhausted your capacity on this model. Your quota will reset after 28s.",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "RATE_LIMIT_EXCEEDED",
+                    "domain": "cloudcode-pa.googleapis.com",
+                    "metadata": {
+                        "model": "gemini-2.5-flash",
+                        "uiMessage": "true"
+                    }
+                }]
+            }
+        });
+        let d = parse_google_retry_after(&headers, serde_json::to_vec(&body).unwrap().as_slice());
+        assert_eq!(d, Some(std::time::Duration::from_secs(28)));
+    }
+
+    #[test]
+    fn classify_google_rate_limit_error_info() {
+        let body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "RATE_LIMIT_EXCEEDED",
+                    "domain": "cloudcode-pa.googleapis.com"
+                }]
+            }
+        });
+        let reason =
+            classify_google_error_reason(serde_json::to_vec(&body).unwrap().as_slice()).unwrap();
+        assert!(matches!(reason, CooldownReason::RateLimit));
+    }
+
+    #[test]
+    fn classify_google_quota_exhausted_error_info() {
+        let body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{
+                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                    "reason": "QUOTA_EXHAUSTED",
+                    "domain": "cloudcode-pa.googleapis.com"
+                }]
+            }
+        });
+        let reason =
+            classify_google_error_reason(serde_json::to_vec(&body).unwrap().as_slice()).unwrap();
+        assert!(matches!(reason, CooldownReason::Overloaded));
+    }
+
+    #[test]
+    fn build_google_request_tool_message_uses_only_function_response_part() {
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "content": "file content"
+                }
+            ]
+        });
+
+        let (_, payload_bytes) = build_google_upstream_request(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            "gemini-2.5-pro",
+            "project-123",
+            false,
+        )
+        .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_slice(payload_bytes.as_ref()).unwrap();
+        let parts = payload
+            .get("request")
+            .and_then(|v| v.get("contents"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.get("parts"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].get("functionResponse").is_some());
+        assert!(parts[0].get("text").is_none());
+    }
+
+    #[test]
+    fn google_stream_finish_reason_maps_to_tool_calls_when_function_call_seen() {
+        let sse_payload = serde_json::json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "functionCall": {
+                                "name": "search",
+                                "args": { "q": "test" }
+                            }
+                        }]
+                    },
+                    "finishReason": "STOP"
+                }]
+            }
+        });
+        let sse_bytes = Bytes::from(format!("data: {}\n\n", sse_payload));
+        let input = futures::stream::iter(vec![Ok(sse_bytes)]);
+
+        let out = futures::executor::block_on(async move {
+            transform_google_sse_to_openai(
+                input,
+                "chatcmpl-test".to_string(),
+                1,
+                "gemini-2.5-pro".to_string(),
+            )
+            .collect::<Vec<_>>()
+            .await
+        });
+
+        let text = out
+            .into_iter()
+            .map(|item| String::from_utf8(item.unwrap().to_vec()).unwrap())
+            .collect::<String>();
+
+        assert!(text.contains("\"finish_reason\":\"tool_calls\""));
     }
 }
