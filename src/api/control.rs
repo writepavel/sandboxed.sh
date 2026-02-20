@@ -279,6 +279,28 @@ async fn mission_has_active_automation(
     }
 }
 
+fn mission_is_terminal(status: MissionStatus) -> bool {
+    matches!(
+        status,
+        MissionStatus::Completed
+            | MissionStatus::Failed
+            | MissionStatus::Interrupted
+            | MissionStatus::Blocked
+            | MissionStatus::NotFeasible
+    )
+}
+
+fn stop_policy_matches_status(
+    stop_policy: &mission_store::StopPolicy,
+    status: MissionStatus,
+) -> bool {
+    match stop_policy {
+        mission_store::StopPolicy::Never => false,
+        mission_store::StopPolicy::OnMissionCompleted => status == MissionStatus::Completed,
+        mission_store::StopPolicy::OnTerminalAny => mission_is_terminal(status),
+    }
+}
+
 pub(crate) async fn resolve_claudecode_default_model(
     library: &SharedLibrary,
     config_profile: Option<&str>,
@@ -2593,6 +2615,26 @@ async fn automation_scheduler_loop(
                 }
             };
 
+            if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+                tracing::info!(
+                    "Disabling automation {} due to stop policy {:?} (mission {} status {:?})",
+                    automation.id,
+                    automation.stop_policy,
+                    mission.id,
+                    mission.status
+                );
+                let mut updated = automation.clone();
+                updated.active = false;
+                if let Err(e) = mission_store.update_automation(updated).await {
+                    tracing::warn!(
+                        "Failed to disable automation {} after stop policy match: {}",
+                        automation.id,
+                        e
+                    );
+                }
+                continue;
+            }
+
             // Check if enough time has passed since last trigger
             let should_trigger = if let Some(ref last_triggered) = automation.last_triggered_at {
                 match chrono::DateTime::parse_from_rfc3339(last_triggered) {
@@ -2950,6 +2992,35 @@ async fn agent_finished_automation_messages(
             return Vec::new();
         }
     };
+
+    let mut eligible = Vec::with_capacity(active.len());
+    for automation in active {
+        if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+            tracing::info!(
+                "Disabling agent_finished automation {} due to stop policy {:?} (mission {} status {:?})",
+                automation.id,
+                automation.stop_policy,
+                mission.id,
+                mission.status
+            );
+            let mut updated = automation.clone();
+            updated.active = false;
+            if let Err(e) = mission_store.update_automation(updated).await {
+                tracing::warn!(
+                    "Failed to disable automation {} after stop policy match: {}",
+                    automation.id,
+                    e
+                );
+            }
+            continue;
+        }
+        eligible.push(automation);
+    }
+    active = eligible;
+
+    if active.is_empty() {
+        return Vec::new();
+    }
 
     // Stable ordering to avoid surprising changes in multi-automation setups.
     active.sort_by_key(|a| a.created_at.clone());
@@ -5874,6 +5945,8 @@ pub struct CreateAutomationRequest {
     pub variables: HashMap<String, String>,
     #[serde(default)]
     pub retry_config: Option<mission_store::RetryConfig>,
+    #[serde(default)]
+    pub stop_policy: Option<mission_store::StopPolicy>,
     /// When true, trigger the first execution immediately after creation.
     #[serde(default)]
     pub start_immediately: bool,
@@ -5885,6 +5958,7 @@ pub struct UpdateAutomationRequest {
     pub trigger: Option<mission_store::TriggerType>,
     pub variables: Option<HashMap<String, String>>,
     pub retry_config: Option<mission_store::RetryConfig>,
+    pub stop_policy: Option<mission_store::StopPolicy>,
     pub active: Option<bool>,
 }
 
@@ -5966,12 +6040,13 @@ pub async fn create_automation(
         trigger,
         variables: req.variables,
         active: true,
+        stop_policy: req.stop_policy.unwrap_or(mission_store::StopPolicy::Never),
         created_at: mission_store::now_string(),
         last_triggered_at,
         retry_config: req.retry_config.unwrap_or_default(),
     };
 
-    let automation = control
+    let mut automation = control
         .mission_store
         .create_automation(automation)
         .await
@@ -5986,6 +6061,22 @@ pub async fn create_automation(
             mission_store::TriggerType::AgentFinished
         )
     {
+        if let Ok(Some(mission)) = control.mission_store.get_mission(mission_id).await {
+            if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+                let mut updated = automation.clone();
+                updated.active = false;
+                if let Err(e) = control.mission_store.update_automation(updated).await {
+                    tracing::warn!(
+                        "Failed to disable automation {} on create due to stop policy: {}",
+                        automation.id,
+                        e
+                    );
+                }
+                automation.active = false;
+                return Ok(Json(automation));
+            }
+        }
+
         let cmd_content =
             resolve_automation_command(&automation, mission_id, &state, &control.mission_store)
                 .await;
@@ -6086,6 +6177,10 @@ pub async fn update_automation(
 
     if let Some(retry_config) = req.retry_config {
         automation.retry_config = retry_config;
+    }
+
+    if let Some(stop_policy) = req.stop_policy {
+        automation.stop_policy = stop_policy;
     }
 
     if let Some(active) = req.active {
@@ -6291,6 +6386,25 @@ pub async fn webhook_receiver(
             StatusCode::NOT_FOUND,
             format!("Mission {} not found", mission_id),
         ))?;
+
+    if stop_policy_matches_status(&automation.stop_policy, mission.status) {
+        let mut updated = automation.clone();
+        updated.active = false;
+        if let Err(e) = control.mission_store.update_automation(updated).await {
+            tracing::warn!(
+                "Failed to disable webhook automation {} after stop policy match: {}",
+                automation.id,
+                e
+            );
+        }
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Automation {} is stopped by policy {:?} for mission status {:?}",
+                automation.id, automation.stop_policy, mission.status
+            ),
+        ));
+    }
 
     // Get workspace for reading local files
     let workspace = state.workspaces.get(mission.workspace_id).await;
@@ -6593,6 +6707,58 @@ Investigate <service/> failures.
             automation_library_command_body("  Echo current status. \n"),
             "Echo current status."
         );
+    }
+
+    #[test]
+    fn test_stop_policy_matches_completed_only_for_completed_policy() {
+        assert!(stop_policy_matches_status(
+            &mission_store::StopPolicy::OnMissionCompleted,
+            MissionStatus::Completed
+        ));
+        assert!(!stop_policy_matches_status(
+            &mission_store::StopPolicy::OnMissionCompleted,
+            MissionStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn test_stop_policy_matches_any_terminal_for_terminal_policy() {
+        assert!(stop_policy_matches_status(
+            &mission_store::StopPolicy::OnTerminalAny,
+            MissionStatus::Completed
+        ));
+        assert!(stop_policy_matches_status(
+            &mission_store::StopPolicy::OnTerminalAny,
+            MissionStatus::Failed
+        ));
+        assert!(stop_policy_matches_status(
+            &mission_store::StopPolicy::OnTerminalAny,
+            MissionStatus::Interrupted
+        ));
+        assert!(stop_policy_matches_status(
+            &mission_store::StopPolicy::OnTerminalAny,
+            MissionStatus::Blocked
+        ));
+        assert!(stop_policy_matches_status(
+            &mission_store::StopPolicy::OnTerminalAny,
+            MissionStatus::NotFeasible
+        ));
+        assert!(!stop_policy_matches_status(
+            &mission_store::StopPolicy::OnTerminalAny,
+            MissionStatus::Active
+        ));
+    }
+
+    #[test]
+    fn test_stop_policy_never_never_matches() {
+        assert!(!stop_policy_matches_status(
+            &mission_store::StopPolicy::Never,
+            MissionStatus::Completed
+        ));
+        assert!(!stop_policy_matches_status(
+            &mission_store::StopPolicy::Never,
+            MissionStatus::Failed
+        ));
     }
 
     #[tokio::test]

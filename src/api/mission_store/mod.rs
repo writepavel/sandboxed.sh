@@ -140,6 +140,22 @@ pub enum TriggerType {
     AgentFinished,
 }
 
+/// Stop policy for automation lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopPolicy {
+    /// Never auto-disable this automation.
+    Never,
+    /// Auto-disable when mission reaches completed status.
+    OnMissionCompleted,
+    /// Auto-disable on any terminal status (completed/failed/interrupted/blocked/not_feasible).
+    OnTerminalAny,
+}
+
+fn default_stop_policy() -> StopPolicy {
+    StopPolicy::Never
+}
+
 /// Retry configuration for automation execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryConfig {
@@ -189,6 +205,9 @@ pub struct Automation {
     /// Retry configuration
     #[serde(default)]
     pub retry_config: RetryConfig,
+    /// Auto-stop behavior when mission reaches terminal state.
+    #[serde(default = "default_stop_policy")]
+    pub stop_policy: StopPolicy,
 }
 
 /// Execution status for automation runs.
