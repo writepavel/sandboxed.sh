@@ -26,7 +26,8 @@ export interface ResolvedEntry {
   provider_id: string;
   model_id: string;
   account_id: string;
-  has_api_key: boolean;
+  has_credentials: boolean;
+  auth_kind: "api_key" | "oauth" | "none";
   has_base_url: boolean;
 }
 

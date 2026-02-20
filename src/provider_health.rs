@@ -530,6 +530,8 @@ pub struct StandardAccount {
     pub provider_type: crate::ai_providers::ProviderType,
     /// API key from auth.json (None if OAuth-only or unconfigured).
     pub api_key: Option<String>,
+    /// Whether this standard account has OAuth credentials available.
+    pub has_oauth: bool,
     /// Base URL override from opencode.json (if any).
     pub base_url: Option<String>,
 }
@@ -566,6 +568,8 @@ pub struct ResolvedEntry {
     pub account_id: Uuid,
     /// The account's API key (if available).
     pub api_key: Option<String>,
+    /// Whether this account has OAuth credentials available.
+    pub has_oauth: bool,
     /// The account's base URL (if custom).
     pub base_url: Option<String>,
 }
@@ -832,6 +836,7 @@ impl ModelChainStore {
                     model_id: entry.model_id.clone(),
                     account_id: account.id,
                     api_key: account.api_key.clone(),
+                    has_oauth: account.oauth.is_some(),
                     base_url: account.base_url.clone(),
                 });
             }
@@ -854,8 +859,8 @@ impl ModelChainStore {
                     );
                     continue;
                 }
-                // Standard accounts must have an API key to be usable
-                if sa.api_key.is_none() {
+                // Standard accounts must have either API key credentials or OAuth.
+                if sa.api_key.is_none() && !sa.has_oauth {
                     continue;
                 }
                 resolved.push(ResolvedEntry {
@@ -863,6 +868,7 @@ impl ModelChainStore {
                     model_id: entry.model_id.clone(),
                     account_id: sa.account_id,
                     api_key: sa.api_key.clone(),
+                    has_oauth: sa.has_oauth,
                     base_url: sa.base_url.clone(),
                 });
             }

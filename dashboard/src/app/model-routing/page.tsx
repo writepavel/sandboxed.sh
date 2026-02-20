@@ -388,8 +388,11 @@ function ChainCard({
                           </span>
                           <span className={cn(
                             'h-1.5 w-1.5 rounded-full',
-                            r.has_api_key ? 'bg-emerald-400' : 'bg-red-400'
+                            r.has_credentials ? 'bg-emerald-400' : 'bg-red-400'
                           )} />
+                          <span className="text-white/30 text-[10px] uppercase">
+                            {r.auth_kind}
+                          </span>
                         </div>
                       ))
                     )}
