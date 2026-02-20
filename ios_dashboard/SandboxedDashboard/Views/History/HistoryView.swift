@@ -31,8 +31,8 @@ struct HistoryView: View {
         var missionStatuses: [MissionStatus]? {
             switch self {
             case .all: return nil
-            case .active: return [.active]
-            case .interrupted: return [.interrupted, .blocked]
+            case .active: return [.pending, .active]
+            case .interrupted: return [.interrupted, .blocked, .unknown]
             case .completed: return [.completed]
             case .failed: return [.failed, .notFeasible]
             }
