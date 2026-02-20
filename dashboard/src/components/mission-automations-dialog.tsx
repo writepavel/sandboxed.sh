@@ -164,6 +164,14 @@ export function shouldPrefillInlinePromptOnSourceSwitch(
   );
 }
 
+export function clearInlinePrefillCache(
+  commandNameRef: { current: string },
+  libraryCommandContentRef: { current: string }
+): void {
+  commandNameRef.current = '';
+  libraryCommandContentRef.current = '';
+}
+
 export function MissionAutomationsDialog({
   open,
   missionId,
@@ -585,6 +593,7 @@ export function MissionAutomationsDialog({
       ]);
       // Reset form
       setCommandName('');
+      clearInlinePrefillCache(commandNameRef, libraryCommandContentRef);
       setInlinePromptState('');
       setIntervalValue('5');
       setIntervalUnit('minutes');
