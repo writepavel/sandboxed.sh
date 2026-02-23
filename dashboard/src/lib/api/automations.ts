@@ -23,6 +23,9 @@ export type TriggerType =
 
 export type StopPolicy =
   | { type: "never" }
+  | { type: "when_failing_consecutively"; count: number }
+  | { type: "when_all_issues_closed_and_prs_merged"; repo: string }
+  // Legacy value kept for backward compatibility with older payloads.
   | { type: "on_consecutive_failures"; count: number };
 
 export type FreshSession = "always" | "keep";
@@ -80,12 +83,18 @@ export interface CreateAutomationInput {
 }
 
 function normalizeAutomation(raw: Automation): Automation {
+  const stop_policy: StopPolicy | undefined =
+    raw.stop_policy?.type === "on_consecutive_failures"
+      ? { type: "when_failing_consecutively", count: raw.stop_policy.count }
+      : raw.stop_policy;
+
   const command_name =
     raw.command_source?.type === "library" ? raw.command_source.name : undefined;
   const interval_seconds =
     raw.trigger?.type === "interval" ? raw.trigger.seconds : undefined;
   return {
     ...raw,
+    stop_policy,
     command_name,
     interval_seconds,
   };

@@ -345,8 +345,11 @@ export function MissionAutomationsDialog({
 
   const getStopPolicyLabel = useCallback((policy?: StopPolicy) => {
     if (!policy || policy.type === 'never') return 'Never';
-    if (policy.type === 'on_consecutive_failures') {
+    if (policy.type === 'when_failing_consecutively' || policy.type === 'on_consecutive_failures') {
       return `After ${policy.count} consecutive failures`;
+    }
+    if (policy.type === 'when_all_issues_closed_and_prs_merged') {
+      return `When all issues closed + PRs merged (${policy.repo})`;
     }
     return 'Never';
   }, []);
@@ -903,8 +906,8 @@ export function MissionAutomationsDialog({
                     value={stopPolicy.type}
                     onChange={(e) =>
                       setStopPolicy(
-                        e.target.value === 'on_consecutive_failures'
-                          ? { type: 'on_consecutive_failures', count: 2 }
+                        e.target.value === 'when_failing_consecutively'
+                          ? { type: 'when_failing_consecutively', count: 2 }
                           : { type: 'never' }
                       )
                     }
@@ -914,7 +917,7 @@ export function MissionAutomationsDialog({
                     <option value="never" className="bg-[#1a1a1a]">
                       Never (recommended)
                     </option>
-                    <option value="on_consecutive_failures" className="bg-[#1a1a1a]">
+                    <option value="when_failing_consecutively" className="bg-[#1a1a1a]">
                       After 2 consecutive failures
                     </option>
                   </select>
