@@ -304,27 +304,6 @@ export default function BackendsPage() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 mb-4">
-            {backends.map((backend) => (
-              <button
-                key={backend.id}
-                onClick={() =>
-                  setActiveBackendTab(
-                    backend.id as 'opencode' | 'claudecode' | 'amp'
-                  )
-                }
-                className={cn(
-                  'px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors',
-                  activeBackendTab === backend.id
-                    ? 'bg-white/[0.08] border-white/[0.12] text-white'
-                    : 'bg-white/[0.02] border-white/[0.06] text-white/50 hover:text-white/70'
-                )}
-              >
-                {backend.name}
-              </button>
-            ))}
-          </div>
-
           <div className="mb-4 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
             <label className="block text-xs text-white/60 mb-1.5">
               Max Parallel Missions
@@ -352,8 +331,29 @@ export default function BackendsPage() {
               </button>
             </div>
             <p className="mt-1.5 text-xs text-white/30">
-              Controls how many missions can run at the same time. Applies immediately.
+              Global limit across all backends. Controls how many missions can run at the same time.
             </p>
+          </div>
+
+          <div className="flex items-center gap-2 mb-4">
+            {backends.map((backend) => (
+              <button
+                key={backend.id}
+                onClick={() =>
+                  setActiveBackendTab(
+                    backend.id as 'opencode' | 'claudecode' | 'amp'
+                  )
+                }
+                className={cn(
+                  'px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors',
+                  activeBackendTab === backend.id
+                    ? 'bg-white/[0.08] border-white/[0.12] text-white'
+                    : 'bg-white/[0.02] border-white/[0.06] text-white/50 hover:text-white/70'
+                )}
+              >
+                {backend.name}
+              </button>
+            ))}
           </div>
 
           {activeBackendTab === 'opencode' ? (
