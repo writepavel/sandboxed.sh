@@ -187,6 +187,7 @@ fn ok_json() -> Json<serde_json::Value> {
 }
 
 /// Unwrap a mission ID or emit an error event and return a failure result.
+#[allow(clippy::result_large_err)]
 fn require_mission_id(
     mission_id: Option<Uuid>,
     backend: &str,
@@ -727,7 +728,12 @@ pub enum AgentEvent {
         content: String,
         success: bool,
         cost_cents: u64,
+        cost_source: crate::agents::CostSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::cost::TokenUsage>,
         model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_normalized: Option<String>,
         /// Mission this message belongs to (for parallel execution)
         #[serde(skip_serializing_if = "Option::is_none")]
         mission_id: Option<Uuid>,
@@ -2120,9 +2126,10 @@ pub async fn get_parallel_config(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let control = control_for_user(&state, &user).await;
     let running = get_running_missions(&control).await?;
+    let max_parallel = crate::settings::max_parallel_missions_cached_or(control.max_parallel);
 
     Ok(Json(serde_json::json!({
-        "max_parallel_missions": control.max_parallel,
+        "max_parallel_missions": max_parallel,
         "running_count": running.len(),
     })))
 }
@@ -2347,7 +2354,8 @@ fn spawn_control_session(
     let current_tree = Arc::new(RwLock::new(None));
     let progress = Arc::new(RwLock::new(ExecutionProgress::default()));
     let running_missions = Arc::new(RwLock::new(Vec::new()));
-    let max_parallel = config.max_parallel_missions;
+    let max_parallel =
+        crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
     let state = ControlState {
         cmd_tx,
@@ -3654,7 +3662,7 @@ async fn control_actor_loop(
                                 // Check capacity
                                 let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
                                 let total_running = parallel_running + 1; // +1 for main
-                                let max_parallel = config.max_parallel_missions;
+                                let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                                 if total_running >= max_parallel {
                                     tracing::warn!(
@@ -4204,7 +4212,7 @@ async fn control_actor_loop(
                         let parallel_running = parallel_runners.values().filter(|r| r.is_running()).count();
                         let main_running = if running.is_some() { 1 } else { 0 };
                         let total_running = parallel_running + main_running;
-                        let max_parallel = config.max_parallel_missions;
+                        let max_parallel = crate::settings::max_parallel_missions_cached_or(config.max_parallel_missions);
 
                         if total_running >= max_parallel {
                             let _ = respond.send(Err(format!(
@@ -4972,12 +4980,18 @@ async fn control_actor_loop(
 
                             // Mark failures as resumable so UI can show a resume button
                             let resumable = !agent_result.success && completed_mission_id.is_some();
+                            let model_used = agent_result.model_used.clone();
                             let _ = events_tx.send(AgentEvent::AssistantMessage {
                                 id: Uuid::new_v4(),
                                 content: agent_result.output.clone(),
                                 success: agent_result.success,
                                 cost_cents: agent_result.cost_cents,
-                                model: agent_result.model_used,
+                                cost_source: agent_result.cost_source,
+                                usage: agent_result.usage.clone(),
+                                model: model_used.clone(),
+                                model_normalized: model_used
+                                    .as_deref()
+                                    .map(crate::cost::normalized_model),
                                 mission_id: completed_mission_id,
                                 shared_files,
                                 resumable,
@@ -5203,7 +5217,13 @@ async fn control_actor_loop(
                                 content: result.output.clone(),
                                 success: result.success,
                                 cost_cents: result.cost_cents,
+                                cost_source: result.cost_source,
+                                usage: result.usage.clone(),
                                 model: result.model_used.clone(),
+                                model_normalized: result
+                                    .model_used
+                                    .as_deref()
+                                    .map(crate::cost::normalized_model),
                                 mission_id: Some(*mission_id),
                                 shared_files,
                                 resumable,
@@ -6011,7 +6031,6 @@ async fn run_single_control_turn(
                 events_tx.clone(),
                 cancel,
                 &config.working_dir,
-                session_id.as_deref(),
             ))
             .await
         }

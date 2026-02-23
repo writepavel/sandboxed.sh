@@ -18,7 +18,7 @@ pub struct ModelPricing {
 }
 
 /// Token usage from an API call.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -29,7 +29,10 @@ pub struct TokenUsage {
 impl TokenUsage {
     /// Check if there's any usage to compute cost from.
     pub fn has_usage(&self) -> bool {
-        self.input_tokens > 0 || self.output_tokens > 0
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_creation_input_tokens.unwrap_or(0) > 0
+            || self.cache_read_input_tokens.unwrap_or(0) > 0
     }
 }
 
@@ -59,7 +62,10 @@ fn normalize_model(model: &str) -> &str {
         s if s.contains("o3") && !s.contains("gpt-4o") => "o3",
         s if s.contains("o4-mini") => "o4-mini",
 
-        // Gemini models
+        // Gemini models (ordered most-specific first to avoid substring conflicts)
+        s if s.contains("gemini-3.1-pro") || s.contains("gemini-3-1-pro") => "gemini-3.1-pro",
+        s if s.contains("gemini-3") && s.contains("pro") => "gemini-3-pro",
+        s if s.contains("gemini-3") && s.contains("flash") => "gemini-3-flash",
         s if s.contains("gemini-2.5-pro") || s.contains("gemini-2-5-pro") => "gemini-2.5-pro",
         s if s.contains("gemini-2.5-flash") || s.contains("gemini-2-5-flash") => "gemini-2.5-flash",
         s if s.contains("gemini-2.0-flash") || s.contains("gemini-2-0-flash") => "gemini-2.0-flash",
@@ -69,6 +75,11 @@ fn normalize_model(model: &str) -> &str {
         // Return as-is if no alias found
         _ => trimmed,
     }
+}
+
+/// Normalize model names to the canonical pricing key.
+pub fn normalized_model(model: &str) -> String {
+    normalize_model(model).to_string()
 }
 
 /// Get pricing for a model. Returns None if model is unknown.
@@ -194,6 +205,30 @@ pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_nano_per_token: Some(550),
         }),
 
+        // Gemini 3.1 Pro: $2/1M input, $12/1M output (<=200k context)
+        "gemini-3.1-pro" => Some(ModelPricing {
+            input_nano_per_token: 2_000,
+            output_nano_per_token: 12_000,
+            cache_create_nano_per_token: None,
+            cache_read_nano_per_token: None,
+        }),
+
+        // Gemini 3 Pro: $2/1M input, $12/1M output (<=200k context)
+        "gemini-3-pro" => Some(ModelPricing {
+            input_nano_per_token: 2_000,
+            output_nano_per_token: 12_000,
+            cache_create_nano_per_token: None,
+            cache_read_nano_per_token: None,
+        }),
+
+        // Gemini 3 Flash: assume same as 2.5 Flash until pricing confirmed
+        "gemini-3-flash" => Some(ModelPricing {
+            input_nano_per_token: 150,
+            output_nano_per_token: 600,
+            cache_create_nano_per_token: None,
+            cache_read_nano_per_token: None,
+        }),
+
         // Gemini 2.5 Pro: $1.25/1M input, $10/1M output (>200k context)
         "gemini-2.5-pro" => Some(ModelPricing {
             input_nano_per_token: 1_250,
@@ -259,9 +294,9 @@ pub fn cost_cents_from_usage(model: &str, usage: &TokenUsage) -> u64 {
     let mut cost_nano: u64 = 0;
 
     // Regular input tokens
-    let regular_input = usage.input_tokens.saturating_sub(
-        usage.cache_creation_input_tokens.unwrap_or(0) + usage.cache_read_input_tokens.unwrap_or(0),
-    );
+    let regular_input = usage
+        .input_tokens
+        .saturating_sub(usage.cache_creation_input_tokens.unwrap_or(0));
     cost_nano += regular_input.saturating_mul(pricing.input_nano_per_token);
 
     // Output tokens
@@ -290,6 +325,41 @@ pub fn cost_cents_from_usage(model: &str, usage: &TokenUsage) -> u64 {
     (cost_nano + 5_000_000) / 10_000_000
 }
 
+/// Resolve cost and provenance from optional actual billing, model name, and
+/// token usage.  This is the canonical function used by all agent backends
+/// (Claude Code, Amp, OpenCode, Codex) to produce the `(cost_cents, CostSource)`
+/// pair stored in mission event metadata.
+///
+/// Priority:
+///   1. `actual_cost_cents` present → `(actual, CostSource::Actual)`
+///   2. Token usage + known model pricing → `(estimated, CostSource::Estimated)`
+///   3. Otherwise → `(0, CostSource::Unknown)`
+pub fn resolve_cost_cents_and_source(
+    actual_cost_cents: Option<u64>,
+    model: Option<&str>,
+    usage: &TokenUsage,
+) -> (u64, crate::agents::CostSource) {
+    use crate::agents::CostSource;
+
+    if let Some(actual) = actual_cost_cents {
+        return (actual, CostSource::Actual);
+    }
+
+    if usage.has_usage() {
+        if let Some(model_name) = model {
+            if pricing_for_model(model_name).is_some() {
+                return (
+                    cost_cents_from_usage(model_name, usage),
+                    CostSource::Estimated,
+                );
+            }
+            return (0, CostSource::Unknown);
+        }
+    }
+
+    (0, CostSource::Unknown)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +376,9 @@ mod tests {
         );
         assert_eq!(normalize_model("gpt-4o-2024-08-06"), "gpt-4o");
         assert_eq!(normalize_model("gemini-2.5-pro-preview"), "gemini-2.5-pro");
+        assert_eq!(normalize_model("gemini-3.1-pro-preview"), "gemini-3.1-pro");
+        assert_eq!(normalize_model("gemini-3-1-pro-preview"), "gemini-3.1-pro");
+        assert_eq!(normalize_model("gemini-3-pro-preview"), "gemini-3-pro");
     }
 
     #[test]
@@ -313,6 +386,9 @@ mod tests {
         assert!(pricing_for_model("claude-3-5-sonnet").is_some());
         assert!(pricing_for_model("gpt-4o").is_some());
         assert!(pricing_for_model("gemini-2.5-pro").is_some());
+        assert!(pricing_for_model("gemini-3.1-pro-preview").is_some());
+        assert!(pricing_for_model("gemini-3-pro-preview").is_some());
+        assert!(pricing_for_model("gemini-3-flash-preview").is_some());
     }
 
     #[test]
@@ -341,7 +417,7 @@ mod tests {
         // 5000 cache read tokens at $0.30/1M = 1500 nanodollars
         // 1000 output tokens at $15/1M = 15_000_000 nanodollars
         let usage = TokenUsage {
-            input_tokens: 5000, // These will be treated as cache read
+            input_tokens: 0,
             output_tokens: 1000,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: Some(5000),
@@ -349,6 +425,18 @@ mod tests {
         let cost = cost_cents_from_usage("claude-3-5-sonnet", &usage);
         // (0 * 3000 + 1000 * 15000 + 5000 * 300) / 10_000_000 = (15_000_000 + 1_500_000) / 10_000_000 = 1.65 cents
         assert_eq!(cost, 2); // Rounds to 2 cents
+    }
+
+    #[test]
+    fn test_cache_read_tokens_do_not_reduce_regular_input_tokens() {
+        let usage = TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(20_000),
+        };
+        let cost = cost_cents_from_usage("claude-3-5-sonnet", &usage);
+        assert_eq!(cost, 4);
     }
 
     #[test]
@@ -383,5 +471,44 @@ mod tests {
         };
         let cost = cost_cents_from_usage("completely-unknown-model", &usage);
         assert_eq!(cost, 0);
+    }
+
+    #[test]
+    fn test_has_usage_true_for_cache_only() {
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: Some(1_000),
+            cache_read_input_tokens: Some(2_000),
+        };
+        assert!(usage.has_usage());
+    }
+
+    #[test]
+    fn resolve_cost_prefers_actual_then_estimated_then_unknown() {
+        use crate::agents::CostSource;
+
+        let usage = TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 1_000,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+
+        // Actual takes priority
+        let (cost, source) = resolve_cost_cents_and_source(Some(42), Some("gpt-4o"), &usage);
+        assert_eq!(cost, 42);
+        assert_eq!(source, CostSource::Actual);
+
+        // Falls back to estimated when model is known
+        let (cost, source) = resolve_cost_cents_and_source(None, Some("gpt-4o"), &usage);
+        assert!(cost > 0);
+        assert_eq!(source, CostSource::Estimated);
+
+        // Unknown when no usage
+        let empty = TokenUsage::default();
+        let (cost, source) = resolve_cost_cents_and_source(None, Some("gpt-4o"), &empty);
+        assert_eq!(cost, 0);
+        assert_eq!(source, CostSource::Unknown);
     }
 }

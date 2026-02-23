@@ -16,6 +16,60 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 type LegacyAutomationRow = (String, String, String, i64, i64, String, Option<String>);
+const COST_CURRENCY_USD: &str = "USD";
+
+#[derive(serde::Serialize)]
+struct AssistantCostMetadata {
+    amount_cents: u64,
+    currency: &'static str,
+    source: crate::agents::CostSource,
+}
+
+#[derive(serde::Serialize)]
+struct AssistantMessageMetadata {
+    success: bool,
+    cost_cents: u64,
+    cost: AssistantCostMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<crate::cost::TokenUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_normalized: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_files: Option<Vec<crate::api::control::SharedFile>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    resumable: bool,
+}
+
+struct AssistantMessageMetadataInput<'a> {
+    success: bool,
+    cost_cents: u64,
+    cost_source: crate::agents::CostSource,
+    usage: &'a Option<crate::cost::TokenUsage>,
+    model: &'a Option<String>,
+    model_normalized: &'a Option<String>,
+    shared_files: &'a Option<Vec<crate::api::control::SharedFile>>,
+    resumable: bool,
+}
+
+fn assistant_message_metadata(input: AssistantMessageMetadataInput<'_>) -> serde_json::Value {
+    let metadata = AssistantMessageMetadata {
+        success: input.success,
+        cost_cents: input.cost_cents,
+        cost: AssistantCostMetadata {
+            amount_cents: input.cost_cents,
+            currency: COST_CURRENCY_USD,
+            source: input.cost_source,
+        },
+        usage: input.usage.clone(),
+        model: input.model.clone(),
+        model_normalized: input.model_normalized.clone(),
+        shared_files: input.shared_files.clone(),
+        resumable: input.resumable,
+    };
+    serde_json::to_value(metadata).expect("assistant metadata should serialize")
+}
 
 /// Parse a UUID from a database string, logging a warning and falling back to
 /// the nil UUID when the value is malformed.  This prevents silent data
@@ -1369,7 +1423,10 @@ impl MissionStore for SqliteMissionStore {
                 content,
                 success,
                 cost_cents,
+                cost_source,
+                usage,
                 model,
+                model_normalized,
                 shared_files,
                 resumable,
                 ..
@@ -1379,12 +1436,15 @@ impl MissionStore for SqliteMissionStore {
                 None,
                 None,
                 content.clone(),
-                serde_json::json!({
-                    "success": success,
-                    "cost_cents": cost_cents,
-                    "model": model,
-                    "shared_files": shared_files,
-                    "resumable": resumable,
+                assistant_message_metadata(AssistantMessageMetadataInput {
+                    success: *success,
+                    cost_cents: *cost_cents,
+                    cost_source: *cost_source,
+                    usage,
+                    model,
+                    model_normalized,
+                    shared_files,
+                    resumable: *resumable,
                 }),
             ),
             AgentEvent::Thinking { content, done, .. } => (
@@ -1623,26 +1683,164 @@ impl MissionStore for SqliteMissionStore {
     async fn get_total_cost_cents(&self) -> Result<u64, String> {
         let conn = self.conn.lock().await;
 
-        // Use SQLite JSON1 extension to extract cost_cents from metadata
-        // and sum across all assistant_message events
+        // Prefer normalized cost.amount_cents while remaining backward-compatible
+        // with legacy flat cost_cents metadata. Clamp malformed negative values
+        // to zero so aggregate cost invariants remain non-negative.
         let query = r#"
+            WITH assistant_costs AS (
+                SELECT CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) AS raw_cost
+                FROM mission_events
+                WHERE event_type = 'assistant_message'
+            )
             SELECT COALESCE(
-                SUM(
-                    CAST(
-                        COALESCE(json_extract(metadata, '$.cost_cents'), 0) AS INTEGER
-                    )
-                ),
+                SUM(CASE WHEN raw_cost > 0 THEN raw_cost ELSE 0 END),
                 0
             ) as total_cost
-            FROM mission_events
-            WHERE event_type = 'assistant_message'
+            FROM assistant_costs
         "#;
 
         let total: i64 = conn
             .query_row(query, [], |row| row.get(0))
             .map_err(|e| e.to_string())?;
 
-        Ok(total as u64)
+        u64::try_from(total).map_err(|_| format!("negative aggregate cost is invalid: {total}"))
+    }
+
+    async fn get_cost_by_source(&self) -> Result<(u64, u64, u64), String> {
+        let conn = self.conn.lock().await;
+
+        // Group costs by source provenance. Events may store cost in the
+        // normalized shape (cost.amount_cents + cost.source) or in the legacy
+        // flat shape (cost_cents, with no source — treated as unknown).
+        let query = r#"
+            WITH source_costs AS (
+                SELECT
+                    CAST(
+                        COALESCE(
+                            json_extract(metadata, '$.cost.amount_cents'),
+                            json_extract(metadata, '$.cost_cents'),
+                            0
+                        ) AS INTEGER
+                    ) AS raw_cost,
+                    COALESCE(
+                        json_extract(metadata, '$.cost.source'),
+                        'unknown'
+                    ) AS source
+                FROM mission_events
+                WHERE event_type = 'assistant_message'
+            )
+            SELECT
+                source,
+                COALESCE(SUM(CASE WHEN raw_cost > 0 THEN raw_cost ELSE 0 END), 0) AS total
+            FROM source_costs
+            GROUP BY source
+        "#;
+
+        let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let source: String = row.get(0)?;
+                let total: i64 = row.get(1)?;
+                Ok((source, total.max(0) as u64))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut actual: u64 = 0;
+        let mut estimated: u64 = 0;
+        let mut unknown: u64 = 0;
+
+        for row in rows {
+            let (source, total) = row.map_err(|e| e.to_string())?;
+            match source.as_str() {
+                "actual" => actual = total,
+                "estimated" => estimated = total,
+                _ => unknown = unknown.saturating_add(total),
+            }
+        }
+
+        Ok((actual, estimated, unknown))
+    }
+
+    async fn get_total_cost_cents_since(&self, since: &str) -> Result<u64, String> {
+        let conn = self.conn.lock().await;
+        let query = r#"
+            WITH assistant_costs AS (
+                SELECT CAST(
+                    COALESCE(
+                        json_extract(metadata, '$.cost.amount_cents'),
+                        json_extract(metadata, '$.cost_cents'),
+                        0
+                    ) AS INTEGER
+                ) AS raw_cost
+                FROM mission_events
+                WHERE event_type = 'assistant_message'
+                  AND timestamp >= ?1
+            )
+            SELECT COALESCE(
+                SUM(CASE WHEN raw_cost > 0 THEN raw_cost ELSE 0 END),
+                0
+            ) as total_cost
+            FROM assistant_costs
+        "#;
+        let total: i64 = conn
+            .query_row(query, [since], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        u64::try_from(total).map_err(|_| format!("negative aggregate cost is invalid: {total}"))
+    }
+
+    async fn get_cost_by_source_since(&self, since: &str) -> Result<(u64, u64, u64), String> {
+        let conn = self.conn.lock().await;
+        let query = r#"
+            WITH source_costs AS (
+                SELECT
+                    CAST(
+                        COALESCE(
+                            json_extract(metadata, '$.cost.amount_cents'),
+                            json_extract(metadata, '$.cost_cents'),
+                            0
+                        ) AS INTEGER
+                    ) AS raw_cost,
+                    COALESCE(
+                        json_extract(metadata, '$.cost.source'),
+                        'unknown'
+                    ) AS source
+                FROM mission_events
+                WHERE event_type = 'assistant_message'
+                  AND timestamp >= ?1
+            )
+            SELECT
+                source,
+                COALESCE(SUM(CASE WHEN raw_cost > 0 THEN raw_cost ELSE 0 END), 0) AS total
+            FROM source_costs
+            GROUP BY source
+        "#;
+        let mut stmt = conn.prepare(query).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([since], |row| {
+                let source: String = row.get(0)?;
+                let total: i64 = row.get(1)?;
+                Ok((source, total.max(0) as u64))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut actual: u64 = 0;
+        let mut estimated: u64 = 0;
+        let mut unknown: u64 = 0;
+        for row in rows {
+            let (source, total) = row.map_err(|e| e.to_string())?;
+            match source.as_str() {
+                "actual" => actual = total,
+                "estimated" => estimated = total,
+                _ => unknown = unknown.saturating_add(total),
+            }
+        }
+        Ok((actual, estimated, unknown))
     }
 
     async fn create_automation(&self, automation: Automation) -> Result<Automation, String> {
@@ -2127,5 +2325,387 @@ impl MissionStore for SqliteMissionStore {
         })
         .await
         .map_err(|e| format!("Task join error: {}", e))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assistant_message_metadata, AssistantMessageMetadataInput, SqliteMissionStore};
+    use crate::agents::CostSource;
+    use crate::api::mission_store::MissionStore;
+    use crate::cost::TokenUsage;
+    use rusqlite::params;
+    use serde_json::json;
+
+    #[test]
+    fn assistant_message_metadata_uses_normalized_cost_shape() {
+        let metadata = assistant_message_metadata(AssistantMessageMetadataInput {
+            success: true,
+            cost_cents: 42,
+            cost_source: CostSource::Estimated,
+            usage: &Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+            model: &Some("gpt-4o".to_string()),
+            model_normalized: &Some("gpt-4o".to_string()),
+            shared_files: &None,
+            resumable: false,
+        });
+
+        assert_eq!(
+            metadata,
+            json!({
+                "success": true,
+                "cost_cents": 42,
+                "cost": {
+                    "amount_cents": 42,
+                    "currency": "USD",
+                    "source": "estimated",
+                },
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cache_creation_input_tokens": null,
+                    "cache_read_input_tokens": null,
+                },
+                "model": "gpt-4o",
+                "model_normalized": "gpt-4o",
+            })
+        );
+    }
+
+    #[test]
+    fn assistant_message_metadata_skips_optional_none_fields() {
+        let metadata = assistant_message_metadata(AssistantMessageMetadataInput {
+            success: false,
+            cost_cents: 0,
+            cost_source: CostSource::Unknown,
+            usage: &None,
+            model: &None,
+            model_normalized: &None,
+            shared_files: &None,
+            resumable: false,
+        });
+
+        assert_eq!(
+            metadata,
+            json!({
+                "success": false,
+                "cost_cents": 0,
+                "cost": {
+                    "amount_cents": 0,
+                    "currency": "USD",
+                    "source": "unknown",
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn get_total_cost_cents_prefers_normalized_shape_with_legacy_fallback() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Cost mission"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let conn = store.conn.lock().await;
+        let query = r#"
+            INSERT INTO mission_events (
+                mission_id, sequence, event_type, timestamp, metadata
+            ) VALUES (?1, ?2, 'assistant_message', ?3, ?4)
+        "#;
+
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                1i64,
+                "2026-02-21T00:00:00Z",
+                json!({
+                    "cost": { "amount_cents": 150 },
+                    "cost_cents": 99
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert normalized + legacy");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                2i64,
+                "2026-02-21T00:00:01Z",
+                json!({ "cost_cents": 25 }).to_string()
+            ],
+        )
+        .expect("insert legacy");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                3i64,
+                "2026-02-21T00:00:02Z",
+                json!({ "cost": { "amount_cents": 5 } }).to_string()
+            ],
+        )
+        .expect("insert normalized");
+        drop(conn);
+
+        let total = store
+            .get_total_cost_cents()
+            .await
+            .expect("total cost should calculate");
+        assert_eq!(total, 180);
+    }
+
+    #[tokio::test]
+    async fn get_total_cost_cents_clamps_negative_values_to_zero() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(Some("Cost mission"), None, None, None, None, None, None)
+            .await
+            .expect("mission");
+
+        let conn = store.conn.lock().await;
+        let query = r#"
+            INSERT INTO mission_events (
+                mission_id, sequence, event_type, timestamp, metadata
+            ) VALUES (?1, ?2, 'assistant_message', ?3, ?4)
+        "#;
+
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                1i64,
+                "2026-02-21T00:00:00Z",
+                json!({ "cost": { "amount_cents": -50 } }).to_string()
+            ],
+        )
+        .expect("insert malformed negative normalized");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                2i64,
+                "2026-02-21T00:00:01Z",
+                json!({ "cost_cents": -10 }).to_string()
+            ],
+        )
+        .expect("insert malformed negative legacy");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                3i64,
+                "2026-02-21T00:00:02Z",
+                json!({ "cost": { "amount_cents": 25 } }).to_string()
+            ],
+        )
+        .expect("insert valid normalized");
+        drop(conn);
+
+        let total = store
+            .get_total_cost_cents()
+            .await
+            .expect("total cost should calculate");
+        assert_eq!(total, 25);
+    }
+
+    #[tokio::test]
+    async fn get_cost_by_source_groups_by_provenance() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(
+                Some("Cost source mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+
+        let conn = store.conn.lock().await;
+        let query = r#"
+            INSERT INTO mission_events (
+                mission_id, sequence, event_type, timestamp, metadata
+            ) VALUES (?1, ?2, 'assistant_message', ?3, ?4)
+        "#;
+
+        // Actual cost
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                1i64,
+                "2026-02-22T00:00:00Z",
+                json!({
+                    "cost": { "amount_cents": 100, "source": "actual", "currency": "USD" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert actual");
+
+        // Estimated cost
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                2i64,
+                "2026-02-22T00:00:01Z",
+                json!({
+                    "cost": { "amount_cents": 50, "source": "estimated", "currency": "USD" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert estimated");
+
+        // Unknown cost (explicit)
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                3i64,
+                "2026-02-22T00:00:02Z",
+                json!({
+                    "cost": { "amount_cents": 10, "source": "unknown", "currency": "USD" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert unknown");
+
+        // Legacy cost (no source field → unknown)
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                4i64,
+                "2026-02-22T00:00:03Z",
+                json!({ "cost_cents": 5 }).to_string()
+            ],
+        )
+        .expect("insert legacy");
+
+        drop(conn);
+
+        let (actual, estimated, unknown) = store
+            .get_cost_by_source()
+            .await
+            .expect("cost by source should calculate");
+        assert_eq!(actual, 100);
+        assert_eq!(estimated, 50);
+        // Unknown (10) + legacy (5) both go into the unknown bucket
+        assert_eq!(unknown, 15);
+    }
+
+    #[tokio::test]
+    async fn get_cost_since_filters_by_timestamp() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SqliteMissionStore::new(temp_dir.path().to_path_buf(), "test-user")
+            .await
+            .expect("sqlite store");
+        let mission = store
+            .create_mission(
+                Some("Period cost mission"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("mission");
+
+        let conn = store.conn.lock().await;
+        let query = r#"
+            INSERT INTO mission_events (
+                mission_id, sequence, event_type, timestamp, metadata
+            ) VALUES (?1, ?2, 'assistant_message', ?3, ?4)
+        "#;
+
+        // Old event — outside the "since" window
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                1i64,
+                "2026-02-01T00:00:00Z",
+                json!({
+                    "cost": { "amount_cents": 200, "source": "actual" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert old actual");
+
+        // Recent events — inside the "since" window
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                2i64,
+                "2026-02-20T00:00:00Z",
+                json!({
+                    "cost": { "amount_cents": 30, "source": "actual" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert recent actual");
+        conn.execute(
+            query,
+            params![
+                mission.id.to_string(),
+                3i64,
+                "2026-02-21T00:00:00Z",
+                json!({
+                    "cost": { "amount_cents": 15, "source": "estimated" }
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert recent estimated");
+
+        drop(conn);
+
+        // All-time totals
+        let all_total = store.get_total_cost_cents().await.expect("all-time total");
+        assert_eq!(all_total, 245); // 200 + 30 + 15
+
+        // Period-filtered: since 2026-02-15 should only include the two recent events
+        let since = "2026-02-15T00:00:00Z";
+        let period_total = store
+            .get_total_cost_cents_since(since)
+            .await
+            .expect("period total");
+        assert_eq!(period_total, 45); // 30 + 15
+
+        let (actual, estimated, unknown) = store
+            .get_cost_by_source_since(since)
+            .await
+            .expect("period cost by source");
+        assert_eq!(actual, 30);
+        assert_eq!(estimated, 15);
+        assert_eq!(unknown, 0);
     }
 }

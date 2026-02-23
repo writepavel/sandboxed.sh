@@ -40,6 +40,7 @@ import {
   getRunningMissions,
   isNetworkError,
   cancelMission,
+  autoGenerateMissionTitle,
   listWorkspaces,
   getHealth,
   listDesktopSessions,
@@ -193,6 +194,8 @@ import { MissionSwitcher } from "@/components/mission-switcher";
 
 import type { SharedFile } from "@/lib/api";
 
+type CostSource = "actual" | "estimated" | "unknown";
+
 type ChatItem =
   | {
       kind: "user";
@@ -207,6 +210,7 @@ type ChatItem =
       content: string;
       success: boolean;
       costCents: number;
+      costSource: CostSource;
       model: string | null;
       timestamp: number;
       sharedFiles?: SharedFile[];
@@ -472,6 +476,55 @@ function QuestionToolItem({
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function parseCostSource(raw: unknown): CostSource {
+  if (raw === "actual" || raw === "estimated" || raw === "unknown") {
+    return raw;
+  }
+  return "unknown";
+}
+
+function parseCostAmount(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return raw;
+  }
+  if (typeof raw === "string") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function parseCostMetadata(
+  meta: Record<string, unknown>,
+  fallback?: { costCents: number; costSource: CostSource }
+): { costCents: number; costSource: CostSource } {
+  const cost = meta["cost"];
+  if (isRecord(cost)) {
+    const parsedAmount = parseCostAmount(cost["amount_cents"]);
+    const hasSource = cost["source"] !== undefined;
+    return {
+      costCents: parsedAmount ?? fallback?.costCents ?? 0,
+      costSource: hasSource ? parseCostSource(cost["source"]) : fallback?.costSource ?? "unknown",
+    };
+  }
+
+  const parsedAmount = parseCostAmount(meta["cost_cents"]);
+  const hasSource = meta["cost_source"] !== undefined;
+  if (parsedAmount !== undefined || hasSource) {
+    return {
+      costCents: parsedAmount ?? fallback?.costCents ?? 0,
+      costSource: hasSource ? parseCostSource(meta["cost_source"]) : fallback?.costSource ?? "unknown",
+    };
+  }
+
+  return {
+    costCents: fallback?.costCents ?? 0,
+    costSource: fallback?.costSource ?? "unknown",
+  };
 }
 
 /**
@@ -2818,6 +2871,7 @@ export default function ControlClient() {
   const currentMissionRef = useRef<Mission | null>(null);
   const viewingMissionRef = useRef<Mission | null>(null);
   const submittingRef = useRef(false); // Guard against double-submission
+  const autoTitleAttemptedRef = useRef<Set<string>>(new Set()); // Track missions we've tried to auto-title
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -3328,6 +3382,7 @@ export default function ControlClient() {
           content: entry.content,
           success,
           costCents: 0,
+          costSource: "unknown" as const,
           model: null,
           timestamp,
           resumable: isLastAssistant && missionFailed ? mission.resumable : undefined,
@@ -3394,6 +3449,7 @@ export default function ControlClient() {
           finalizePendingThinking(timestamp);
           const meta = event.metadata || {};
           const isFailure = meta.success === false;
+          const { costCents, costSource } = parseCostMetadata(meta);
 
           // When mission fails, mark all pending tool calls as failed
           // This ensures subagent headers don't stay stuck showing "Running for X"
@@ -3421,7 +3477,8 @@ export default function ControlClient() {
             id: assistantId,
             content: event.content,
             success: !isFailure,
-            costCents: typeof meta.cost_cents === "number" ? meta.cost_cents : 0,
+            costCents,
+            costSource,
             model: typeof meta.model === "string" ? meta.model : null,
             timestamp,
           });
@@ -4686,7 +4743,10 @@ export default function ControlClient() {
               ...existing,
               content: String(data["content"] ?? existing.content),
               success: !isFailure,
-              costCents: Number(data["cost_cents"] ?? existing.costCents ?? 0),
+              ...parseCostMetadata(data, {
+                costCents: existing.costCents,
+                costSource: existing.costSource,
+              }),
               model: data["model"] ? String(data["model"]) : existing.model ?? null,
               timestamp: now,
               sharedFiles: sharedFiles ?? existing.sharedFiles,
@@ -4700,7 +4760,7 @@ export default function ControlClient() {
             id: incomingId,
             content: String(data["content"] ?? ""),
             success: !isFailure,
-            costCents: Number(data["cost_cents"] ?? 0),
+            ...parseCostMetadata(data),
             model: data["model"] ? String(data["model"]) : null,
             timestamp: now,
             sharedFiles,
@@ -4724,6 +4784,41 @@ export default function ControlClient() {
           ...prev,
           phase: "idle",
         }));
+
+        // Auto-generate mission title on first successful assistant response (LLM-powered, best-effort).
+        // Use viewingMissionIdRef (not currentMissionRef) to target the correct mission —
+        // events are already filtered by viewingId, so this matches the event's mission.
+        const targetMissionId = viewingMissionIdRef.current;
+        const targetMission = viewingMissionRef.current;
+        if (
+          targetMissionId &&
+          !isFailure &&
+          !targetMission?.title &&
+          !autoTitleAttemptedRef.current.has(targetMissionId)
+        ) {
+          autoTitleAttemptedRef.current.add(targetMissionId);
+          const assistantContent = String(data["content"] ?? "");
+          // Use itemsRef for synchronous read — avoids side effects in state updaters
+          // and prevents double-firing in React StrictMode.
+          const firstUser = itemsRef.current.find((it) => it.kind === "user");
+          if (firstUser && firstUser.kind === "user") {
+            autoGenerateMissionTitle(
+              targetMissionId,
+              firstUser.content,
+              assistantContent
+            ).then((title) => {
+              if (title) {
+                // Update local mission state so the UI reflects the new title immediately
+                setCurrentMission((m) =>
+                  m?.id === targetMissionId ? { ...m, title } : m
+                );
+                setViewingMission((m) =>
+                  m?.id === targetMissionId ? { ...m, title } : m
+                );
+              }
+            });
+          }
+        }
         return;
       }
 
@@ -5754,8 +5849,8 @@ export default function ControlClient() {
                       <span className="text-white/40">·</span>
                     </>
                   )}
-                  <span className="text-sm font-medium text-white/70 truncate max-w-[140px] sm:max-w-[180px]">
-                    {getMissionShortName(activeMission.id)}
+                  <span className="text-sm font-medium text-white/70 truncate max-w-[140px] sm:max-w-[180px]" title={activeMission.title ?? undefined}>
+                    {activeMission.title || getMissionShortName(activeMission.id)}
                   </span>
                 </>
               ) : (
@@ -6426,14 +6521,31 @@ export default function ControlClient() {
                               </span>
                             </>
                           )}
-                          {item.costCents > 0 && (
-                            <>
-                              <span>•</span>
-                              <span className="text-emerald-400">
-                                ${(item.costCents / 100).toFixed(4)}
-                              </span>
-                            </>
-                          )}
+                          <>
+                            <span>•</span>
+                            <span
+                              className={
+                                item.costSource === "actual"
+                                  ? "text-emerald-400"
+                                  : item.costSource === "estimated"
+                                    ? "text-amber-300"
+                                    : "text-white/50"
+                              }
+                            >
+                              {item.costSource === "unknown"
+                                ? item.costCents > 0
+                                  ? `$${(item.costCents / 100).toFixed(4)}`
+                                  : "N/A"
+                                : `$${(item.costCents / 100).toFixed(4)}`}
+                            </span>
+                            <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/60">
+                              {item.costSource === "actual"
+                                ? "Actual"
+                                : item.costSource === "estimated"
+                                  ? "Estimated"
+                                  : "Unknown"}
+                            </span>
+                          </>
                           <span>•</span>
                           <span className="text-white/30">
                             {formatTime(item.timestamp)}
