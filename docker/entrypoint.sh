@@ -8,7 +8,7 @@ set -e
 
 cleanup() {
     echo "[entrypoint] shutting down..."
-    kill "$BACKEND_PID" "$DASHBOARD_PID" 2>/dev/null || true
+    kill "$BACKEND_PID" "$DASHBOARD_PID" "$OPENCODE_PID" 2>/dev/null || true
     [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null || true
     wait
 }
@@ -31,6 +31,30 @@ if [ -d /root/.ssh ]; then
         ssh-keyscan -t ed25519,rsa github.com gitlab.com >> "$KNOWN_HOSTS" 2>/dev/null || true
     fi
 fi
+
+# -- D-Bus (required for systemd-nspawn container workspaces) -----------------
+echo "[entrypoint] starting D-Bus system bus"
+mkdir -p /run/dbus
+dbus-daemon --system --fork
+
+# -- OpenCode Server (for agent discovery) ------------------------------------
+echo "[entrypoint] starting OpenCode server on port 4096"
+cd /root
+opencode serve --port 4096 --hostname 127.0.0.1 &
+OPENCODE_PID=$!
+cd /
+
+# Wait for OpenCode server to be ready
+for i in $(seq 1 20); do
+    if curl -sf http://127.0.0.1:4096/health >/dev/null 2>&1; then
+        echo "[entrypoint] OpenCode server ready"
+        break
+    fi
+    if [ "$i" -eq 20 ]; then
+        echo "[entrypoint] WARNING: OpenCode server not ready after 10s, continuing anyway"
+    fi
+    sleep 0.5
+done
 
 # -- Optional: Desktop (Xvfb + i3) -------------------------------------------
 if [ "${DESKTOP_ENABLED:-false}" = "true" ]; then

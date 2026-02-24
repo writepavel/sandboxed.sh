@@ -109,6 +109,11 @@ RUN curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path \
     && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
     && echo "[docker] OpenCode CLI installed: $(opencode --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: OpenCode CLI install failed (will be installed on first mission)"
+
+# -- oh-my-opencode platform binary (required for bunx oh-my-opencode) --
+RUN npm install -g oh-my-opencode-linux-x64 \
+    && echo "[docker] oh-my-opencode platform binary installed" \
+    || echo "[docker] WARNING: oh-my-opencode platform binary install failed"
 RUN npm install -g @sourcegraph/amp@latest \
     && echo "[docker] Amp CLI installed: $(amp --version 2>/dev/null || echo 'unknown')" \
     || echo "[docker] WARNING: Amp CLI install failed (will be installed on first mission)"
@@ -129,6 +134,10 @@ COPY docker/i3config /root/.config/i3/config
 COPY docker/Caddyfile /etc/caddy/Caddyfile
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# -- systemd-nspawn wrapper (for containers without systemd as PID 1) -------
+COPY docker/systemd-nspawn-wrapper.sh /usr/local/bin/systemd-nspawn
+RUN chmod +x /usr/local/bin/systemd-nspawn
 
 # -- Working directories ------------------------------------------------------
 RUN mkdir -p /root/.sandboxed-sh /root/.claude /root/work/screenshots

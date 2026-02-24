@@ -7280,14 +7280,15 @@ pub async fn run_opencode_turn(
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }
     } else {
-        // Prefer bunx for oh-my-opencode (avoids version conflicts from npm global installs)
-        if command_available(&workspace_exec, work_dir, "bunx").await {
-            "bunx".to_string()
-        } else if command_available(&workspace_exec, work_dir, "npx").await {
+        // Prefer npx (uses global npm packages where platform binary is installed)
+        // bunx has its own cache and doesn't see npm global packages
+        if command_available(&workspace_exec, work_dir, "npx").await {
             "npx".to_string()
+        } else if command_available(&workspace_exec, work_dir, "bunx").await {
+            "bunx".to_string()
         } else {
             let err_msg =
-                "No OpenCode CLI runner found in workspace (expected bunx or npx).".to_string();
+                "No OpenCode CLI runner found in workspace (expected npx or bunx).".to_string();
             tracing::error!("{}", err_msg);
             return AgentResult::failure(err_msg, 0).with_terminal_reason(TerminalReason::LlmError);
         }

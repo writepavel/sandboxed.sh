@@ -4061,7 +4061,11 @@ if command -v npm >/dev/null 2>&1; then
   fi
   if [ "{install_opencode}" = "true" ] && ! command -v oh-my-opencode >/dev/null 2>&1; then
     echo "[sandboxed] Installing oh-my-opencode..."
-    if ! npm install -g oh-my-opencode@latest; then
+    if npm install -g oh-my-opencode@latest; then
+      # Install platform-specific binary required by oh-my-opencode
+      echo "[sandboxed] Installing oh-my-opencode platform binary..."
+      npm install -g oh-my-opencode-linux-x64 || echo "[sandboxed] Platform binary install failed (may already exist)"
+    else
       echo "[sandboxed] OpenCode plugin install failed"
     fi
   fi
