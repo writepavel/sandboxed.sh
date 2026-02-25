@@ -277,6 +277,7 @@ async fn restore_from_cache(path: &Path, distro: NspawnDistro) -> NspawnResult<b
     }
 
     tracing::info!("Container restored from cache successfully");
+
     Ok(true)
 }
 
@@ -555,6 +556,9 @@ pub async fn execute_in_container(
     cmd.arg("--quiet");
     // Disable timezone bind-mount (minbase containers lack /usr/share/zoneinfo)
     cmd.arg("--timezone=off");
+    // Skip registration with systemd and avoid D-Bus requirement (needed for Docker)
+    cmd.arg("--register=no");
+    cmd.arg("--keep-unit");
 
     match config.network_mode {
         NetworkMode::Host => {}
@@ -644,6 +648,9 @@ pub async fn execute_in_container_streaming(
     cmd.arg("-D").arg(path);
     cmd.arg("--quiet");
     cmd.arg("--timezone=off");
+    // Skip registration with systemd and avoid D-Bus requirement (needed for Docker)
+    cmd.arg("--register=no");
+    cmd.arg("--keep-unit");
 
     match config.network_mode {
         NetworkMode::Host => {}
