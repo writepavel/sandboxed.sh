@@ -114,7 +114,8 @@ impl SettingsStore {
 
         Settings {
             library_remote: std::env::var("LIBRARY_REMOTE").ok().or_else(|| {
-                Some("https://github.com/Th0rgal/sandboxed-library-template.git".to_string())
+                // Default library with arm64 support (ports.ubuntu.com for arm64 packages)
+                Some("https://github.com/writepavel/sandboxed-library-template.git".to_string())
             }),
             sandboxed_repo_path: std::env::var("SANDBOXED_SH_REPO_PATH")
                 .or_else(|_| std::env::var("SANDBOXED_REPO_PATH"))
