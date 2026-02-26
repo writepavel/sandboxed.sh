@@ -49,6 +49,12 @@ export const LLM_PROVIDERS: Record<
     defaultModel: "glm-4.7",
     models: ["glm-4.7", "glm-4.6", "glm-4.5", "glm-4.6v-flash"],
   },
+  "zai-coding-plan": {
+    name: "Z.AI Coding Plan",
+    baseUrl: "https://api.z.ai/api/coding/paas/v4",
+    defaultModel: "glm-5",
+    models: ["glm-5", "glm-4.7", "glm-4.6", "glm-4-flash"],
+  },
   groq: {
     name: "Groq",
     baseUrl: "https://api.groq.com/openai/v1",

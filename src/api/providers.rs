@@ -44,6 +44,7 @@ pub const DEFAULT_CATALOG_PROVIDER_IDS: &[&str] = &[
     "xai",
     "cerebras",
     "zai",
+    "zai-coding-plan",
     "minimax",
 ];
 
@@ -513,6 +514,29 @@ fn default_providers_config() -> ProvidersConfig {
                         id: "glm-4.6v-flash".to_string(),
                         name: "GLM-4.6V Flash".to_string(),
                         description: Some("Vision model, fast variant".to_string()),
+                    },
+                ],
+            },
+            Provider {
+                id: "zai-coding-plan".to_string(),
+                name: "Z.AI Coding Plan (API Key)".to_string(),
+                billing: "subscription".to_string(),
+                description: "GLM models via Z.AI Coding Plan subscription".to_string(),
+                models: vec![
+                    ProviderModel {
+                        id: "glm-5".to_string(),
+                        name: "GLM-5".to_string(),
+                        description: Some("Most capable GLM model for coding".to_string()),
+                    },
+                    ProviderModel {
+                        id: "glm-4.7".to_string(),
+                        name: "GLM-4.7".to_string(),
+                        description: Some("Advanced GLM model".to_string()),
+                    },
+                    ProviderModel {
+                        id: "glm-4-flash".to_string(),
+                        name: "GLM-4 Flash".to_string(),
+                        description: Some("Fast and cost-effective".to_string()),
                     },
                 ],
             },
